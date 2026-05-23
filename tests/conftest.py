@@ -43,7 +43,7 @@ class MockProvider(DataProvider):
         return make_ohlcv(nb_bars, freq_minutes={"M1": 1, "M5": 5, "M15": 15, "M30": 30, "H1": 60}.get(timeframe, 15))
 
     def compute_indicator(self, df, indicator, **params):
-        return super()._fallback_indicator(df, indicator.upper(), **params)
+        return super()._compute_fallback(df, indicator.upper(), **params)
 
 
 @pytest.fixture

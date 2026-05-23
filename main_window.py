@@ -1,13 +1,14 @@
 """
-Main window: modern dark UI, multi-TF panels, before/after filter toggle.
+Main window: modern dark UI, multi-TF panels, parallel data loading, fast filter.
 """
 from __future__ import annotations
 
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer
-from PyQt6.QtGui import QColor, QFont, QIcon, QPalette
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QPalette
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -232,6 +233,71 @@ def apply_theme(app: QApplication) -> None:
     app.setStyleSheet(STYLESHEET)
 
 
+
+# ── Background workers ────────────────────────────────────────────────────────
+
+class DataFetchWorker(QThread):
+    """
+    Fetches OHLCV for all requested timeframes in parallel
+    (one MT5/mock call per thread) then emits the result dict.
+    """
+    data_ready = pyqtSignal(dict)   # {tf: pd.DataFrame}
+
+    def __init__(
+        self, provider, symbol: str, tfs: List[str],
+        nb_bars: int, force: bool, parent=None,
+    ):
+        super().__init__(parent)
+        self._provider = provider
+        self._symbol   = symbol
+        self._tfs      = tfs
+        self._nb_bars  = nb_bars
+        self._force    = force
+
+    def run(self) -> None:
+        loaded: Dict[str, object] = {}
+        n_workers = min(len(self._tfs), 8)
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            futures = {
+                ex.submit(
+                    self._provider.get_ohlcv,
+                    self._symbol, tf, self._nb_bars, self._force,
+                ): tf
+                for tf in self._tfs
+            }
+            for fut in as_completed(futures):
+                tf = futures[fut]
+                try:
+                    loaded[tf] = fut.result()
+                except Exception:
+                    pass
+        self.data_ready.emit(loaded)
+
+
+class FilterWorker(QThread):
+    """
+    Computes filter segments for all timeframes in the background.
+    Emits one signal per TF as soon as it's ready.
+    """
+    segments_ready = pyqtSignal(str, list)  # (tf, List[FilterSegment])
+
+    def __init__(self, engine, data: Dict, tfs: List[str], parent=None):
+        super().__init__(parent)
+        self._engine = engine
+        self._data   = data
+        self._tfs    = tfs
+
+    def run(self) -> None:
+        for tf in self._tfs:
+            if tf not in self._data:
+                continue
+            try:
+                segs = self._engine.get_segments(self._data, tf)
+                self.segments_ready.emit(tf, segs)
+            except Exception:
+                self.segments_ready.emit(tf, [])
+
+
 # ── TF Selector ───────────────────────────────────────────────────────────────
 
 class TFSelector(QWidget):
@@ -369,9 +435,9 @@ class MainWindow(QMainWindow):
         tb.addWidget(VLine())
 
         # Refresh + auto
-        btn_refresh = QPushButton("⟳  Refresh")
-        btn_refresh.clicked.connect(self._manual_refresh)
-        tb.addWidget(btn_refresh)
+        self._btn_refresh = QPushButton("⟳  Refresh")
+        self._btn_refresh.clicked.connect(self._manual_refresh)
+        tb.addWidget(self._btn_refresh)
 
         lbl_auto = QLabel("  Auto")
         lbl_auto.setStyleSheet(f"color:{TEXT2}; font-size:8pt;")
@@ -488,34 +554,71 @@ class MainWindow(QMainWindow):
     # ── Data ─────────────────────────────────────────────────────────────────
 
     def _manual_refresh(self) -> None:
-        self._fetch_and_render(force=True)
+        self._start_fetch(force=True)
 
     def _auto_refresh(self) -> None:
-        self._fetch_and_render(force=False)
+        self._start_fetch(force=False)
 
-    def _fetch_and_render(self, force: bool = False) -> None:
-        symbol = self._symbol
-        nb     = self._nb_bars
-        loaded: Dict[str, object] = {}
+    # ── Async fetch ───────────────────────────────────────────────────────────
 
-        for tf in list(self._panels.keys()):
-            try:
-                df = self._provider.get_ohlcv(symbol, tf, nb, force_refresh=force)
-                loaded[tf] = df
-            except Exception:
-                pass
+    def _start_fetch(self, force: bool = False) -> None:
+        """Launch parallel OHLCV fetch; UI stays responsive."""
+        tfs = list(self._panels.keys())
+        if not tfs:
+            return
 
+        # Prevent double-launch
+        if hasattr(self, "_fetch_worker") and self._fetch_worker.isRunning():
+            return
+
+        self._btn_refresh.setEnabled(False)
+        self._btn_refresh.setText("⟳ Loading…")
+        self._status_sym.setText(f"Fetching {len(tfs)} timeframe(s)…")
+
+        self._fetch_worker = DataFetchWorker(
+            self._provider, self._symbol, tfs, self._nb_bars, force, parent=self
+        )
+        self._fetch_worker.data_ready.connect(self._on_data_ready)
+        self._fetch_worker.start()
+
+    def _on_data_ready(self, loaded: dict) -> None:
+        """Called on main thread once all OHLCV is ready."""
         self._data = loaded
 
+        # Render candles immediately
         for tf, panel in self._panels.items():
-            if tf not in loaded:
-                continue
-            panel.set_data(loaded[tf])
-            self._apply_zones_to_panel(tf, panel)
+            if tf in loaded:
+                panel.set_data(loaded[tf])
 
-        self._status_sym.setText(f"{symbol}   {nb} bars")
+        self._status_sym.setText(
+            f"{self._symbol}   {self._nb_bars:,} bars   ×{len(loaded)} TF"
+        )
+        self._btn_refresh.setEnabled(True)
+        self._btn_refresh.setText("⟳  Refresh")
+
+        # Launch filter computation in background only if zones are active
+        if self._show_zones and self._engine.filters:
+            self._start_filter_worker()
+
+    # ── Async filter ──────────────────────────────────────────────────────────
+
+    def _start_filter_worker(self) -> None:
+        if hasattr(self, "_filter_worker") and self._filter_worker.isRunning():
+            self._filter_worker.quit()
+
+        self._filter_worker = FilterWorker(
+            self._engine, self._data, list(self._panels.keys()), parent=self
+        )
+        self._filter_worker.segments_ready.connect(self._on_segments_ready)
+        self._filter_worker.start()
+
+    def _on_segments_ready(self, tf: str, segs: list) -> None:
+        """Apply zone segments as each TF finishes (incremental update)."""
+        if tf in self._panels:
+            self._panels[tf].set_filter_segments(segs, show=True)
 
     def _apply_zones_to_panel(self, tf: str, panel: ChartPanel) -> None:
+        """Synchronous zone apply (used right after Apply Filter click)."""
         if self._show_zones and self._data:
             try:
                 segs = self._engine.get_segments(self._data, tf)
@@ -549,8 +652,12 @@ class MainWindow(QMainWindow):
     def _on_filter_applied(self) -> None:
         """Called when user clicks Apply Filter in the builder."""
         self._show_zones = True
-        for tf, panel in self._panels.items():
-            self._apply_zones_to_panel(tf, panel)
+        if self._data:
+            # Run filter computation in background → zones appear TF-by-TF
+            self._start_filter_worker()
+        else:
+            # No data yet — fetch first (filter will run after)
+            self._start_fetch(force=True)
 
     def _on_filters_changed(self) -> None:
         # Filter list changed but not yet applied — keep current display
