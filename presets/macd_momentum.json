@@ -1,0 +1,11 @@
+{
+  "name": "MACD Bullish Momentum",
+  "description": "MACD histogram positive on H1 — bullish momentum",
+  "filters": [
+    {
+      "name": "MACD Hist > 0",
+      "expression": "MACD_HIST(H1,12,26,9) > 0",
+      "enabled": true
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "name": "Close Above MA50",
+  "description": "Price closing above SMA50 on H1 — bullish bias zone",
+  "filters": [
+    {
+      "name": "Close > SMA50 H1",
+      "expression": "CLOSE(H1) > SMA(H1,50)",
+      "enabled": true
+    }
+  ]
+}

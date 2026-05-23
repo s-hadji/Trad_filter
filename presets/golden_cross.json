@@ -1,0 +1,11 @@
+{
+  "name": "Golden Cross",
+  "description": "EMA20 above SMA50 on H1 — bullish trend filter",
+  "filters": [
+    {
+      "name": "EMA20 above SMA50",
+      "expression": "EMA(H1,20) > SMA(H1,50)",
+      "enabled": true
+    }
+  ]
+}

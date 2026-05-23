@@ -1,0 +1,11 @@
+{
+  "name": "RSI Overbought",
+  "description": "RSI(14) above 70 on M15 — potential short entry zone",
+  "filters": [
+    {
+      "name": "RSI Overbought M15",
+      "expression": "RSI(M15,14) > 70",
+      "enabled": true
+    }
+  ]
+}

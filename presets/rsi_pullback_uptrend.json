@@ -1,0 +1,16 @@
+{
+  "name": "RSI Pullback in Uptrend",
+  "description": "H1 trend bullish (close > EMA20) AND M15 RSI pulled back to 30-50",
+  "filters": [
+    {
+      "name": "H1 Bullish Trend",
+      "expression": "CLOSE(H1) > EMA(H1,20)",
+      "enabled": true
+    },
+    {
+      "name": "M15 RSI Pullback",
+      "expression": "RSI(M15,14) > 30 AND RSI(M15,14) < 50",
+      "enabled": true
+    }
+  ]
+}
