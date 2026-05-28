@@ -1,5 +1,6 @@
 """
 Main window: modern dark UI, multi-TF panels, parallel data loading, fast filter.
+GPU acceleration via cuDF when CUDA is available (gpu_support.py).
 """
 from __future__ import annotations
 
@@ -7,17 +8,21 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+import pandas as pd
+
+from PyQt6.QtCore import QDateTime, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPalette
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDateTimeEdit,
     QDockWidget,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -32,6 +37,7 @@ from chart_widget import ChartPanel
 from data_provider import DataProvider, TF_ORDER
 from filter_builder_ui import FilterBuilderPanel
 from filter_engine import FilterEngine
+from gpu_support import GPU_STATE, gpu_init, hardware_report
 
 # ── Palette ──────────────────────────────────────────────────────────────────
 BG0      = "#0d0d1a"   # deepest background
@@ -240,31 +246,50 @@ class DataFetchWorker(QThread):
     """
     Fetches OHLCV for all requested timeframes in parallel
     (one MT5/mock call per thread) then emits the result dict.
+
+    Supports two modes:
+    - **Bar count**: ``from_date=None`` → calls ``provider.get_ohlcv(symbol, tf, nb_bars)``
+    - **Date range**: ``from_date`` and ``to_date`` set → calls ``provider.get_ohlcv_range(…)``
     """
     data_ready = pyqtSignal(dict)   # {tf: pd.DataFrame}
 
     def __init__(
         self, provider, symbol: str, tfs: List[str],
-        nb_bars: int, force: bool, parent=None,
+        nb_bars: int = 500, force: bool = False,
+        from_date: Optional[pd.Timestamp] = None,
+        to_date:   Optional[pd.Timestamp] = None,
+        parent=None,
     ):
         super().__init__(parent)
-        self._provider = provider
-        self._symbol   = symbol
-        self._tfs      = tfs
-        self._nb_bars  = nb_bars
-        self._force    = force
+        self._provider   = provider
+        self._symbol     = symbol
+        self._tfs        = tfs
+        self._nb_bars    = nb_bars
+        self._force      = force
+        self._from_date  = from_date
+        self._to_date    = to_date
 
     def run(self) -> None:
         loaded: Dict[str, object] = {}
+        use_range = self._from_date is not None and self._to_date is not None
         n_workers = min(len(self._tfs), 8)
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
-            futures = {
-                ex.submit(
-                    self._provider.get_ohlcv,
-                    self._symbol, tf, self._nb_bars, self._force,
-                ): tf
-                for tf in self._tfs
-            }
+            if use_range:
+                futures = {
+                    ex.submit(
+                        self._provider.get_ohlcv_range,
+                        self._symbol, tf, self._from_date, self._to_date, self._force,
+                    ): tf
+                    for tf in self._tfs
+                }
+            else:
+                futures = {
+                    ex.submit(
+                        self._provider.get_ohlcv,
+                        self._symbol, tf, self._nb_bars, self._force,
+                    ): tf
+                    for tf in self._tfs
+                }
             for fut in as_completed(futures):
                 tf = futures[fut]
                 try:
@@ -354,12 +379,16 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("MT5 Chart Analyzer")
         self.resize(1680, 960)
 
+        # ── GPU init (before anything else so status bar reflects result) ────
+        gpu_init()
+
         self._provider = DataProvider()
         self._engine   = FilterEngine(self._provider)
 
         self._symbol        = "EURUSD"
         self._nb_bars       = 300
-        self._show_zones = False   # zones hidden until filter applied
+        self._show_zones    = False   # zones hidden until filter applied
+        self._use_date_range = False  # toolbar toggle
         self._panels: Dict[str, ChartPanel] = {}
         self._data:   Dict[str, object]     = {}
 
@@ -406,9 +435,9 @@ class MainWindow(QMainWindow):
         tb.addWidget(VLine())
 
         # Bar count — editable spinbox (100 → 50 000)
-        lbl_bars = QLabel("  Bars")
-        lbl_bars.setStyleSheet(f"color:{TEXT2}; font-size:8pt;")
-        tb.addWidget(lbl_bars)
+        self._lbl_bars = QLabel("  Bars")
+        self._lbl_bars.setStyleSheet(f"color:{TEXT2}; font-size:8pt;")
+        tb.addWidget(self._lbl_bars)
 
         self._bars_spin = QSpinBox()
         self._bars_spin.setRange(100, 50_000)
@@ -431,6 +460,49 @@ class MainWindow(QMainWindow):
         self._bars_quick.setToolTip("Quick-select a common bar count")
         self._bars_quick.currentTextChanged.connect(self._on_quick_bars)
         tb.addWidget(self._bars_quick)
+
+        tb.addWidget(VLine())
+
+        # ── Date-range picker ──────────────────────────────────────────────
+        self._date_range_chk = QCheckBox("📅 Date range")
+        self._date_range_chk.setToolTip(
+            "Switch between 'last N bars' mode and a fixed date range.\n"
+            "When checked the From/To calendar pickers are used instead."
+        )
+        self._date_range_chk.toggled.connect(self._on_date_range_toggled)
+        tb.addWidget(self._date_range_chk)
+
+        lbl_from = QLabel("From")
+        lbl_from.setStyleSheet(f"color:{TEXT2}; font-size:8pt;")
+        lbl_from.setVisible(False)
+        tb.addWidget(lbl_from)
+        self._lbl_from = lbl_from
+
+        self._from_dt = QDateTimeEdit()
+        self._from_dt.setCalendarPopup(True)
+        self._from_dt.setDisplayFormat("yyyy-MM-dd HH:mm")
+        self._from_dt.setDateTime(
+            QDateTime.currentDateTime().addMonths(-3)
+        )
+        self._from_dt.setFixedWidth(148)
+        self._from_dt.setVisible(False)
+        self._from_dt.dateTimeChanged.connect(self._on_date_range_changed)
+        tb.addWidget(self._from_dt)
+
+        lbl_to = QLabel("To")
+        lbl_to.setStyleSheet(f"color:{TEXT2}; font-size:8pt;")
+        lbl_to.setVisible(False)
+        tb.addWidget(lbl_to)
+        self._lbl_to = lbl_to
+
+        self._to_dt = QDateTimeEdit()
+        self._to_dt.setCalendarPopup(True)
+        self._to_dt.setDisplayFormat("yyyy-MM-dd HH:mm")
+        self._to_dt.setDateTime(QDateTime.currentDateTime())
+        self._to_dt.setFixedWidth(148)
+        self._to_dt.setVisible(False)
+        self._to_dt.dateTimeChanged.connect(self._on_date_range_changed)
+        tb.addWidget(self._to_dt)
 
         tb.addWidget(VLine())
 
@@ -500,6 +572,7 @@ class MainWindow(QMainWindow):
         sb = QStatusBar(self)
         self.setStatusBar(sb)
 
+        # MT5 connection status
         self._dot = StatusDot()
         self._status_conn = QLabel("MT5: Disconnected")
         self._status_conn.setStyleSheet(f"color:{DANGER}; font-weight:600;")
@@ -508,6 +581,28 @@ class MainWindow(QMainWindow):
         sb.addWidget(self._dot)
         sb.addWidget(self._status_conn)
         sb.addPermanentWidget(self._status_sym)
+
+        # ── GPU status ──────────────────────────────────────────
+        self._gpu_dot = QWidget()
+        self._gpu_dot.setFixedSize(10, 10)
+
+        if GPU_STATE["enabled"]:
+            gpu_color = SUCCESS
+            dev = GPU_STATE["device"]
+            mem = GPU_STATE["memory_gb"]
+            gpu_text = f"GPU: {dev}" + (f"  {mem} GB" if mem else "")
+        else:
+            gpu_color = "#6b7280"   # neutral grey → CPU only
+            gpu_text  = "GPU: CPU"
+
+        self._gpu_dot.setStyleSheet(f"border-radius:5px; background:{gpu_color};")
+
+        self._gpu_lbl = QLabel(gpu_text)
+        self._gpu_lbl.setStyleSheet(f"color:{TEXT2}; font-size:8pt; padding-left:2px;")
+        self._gpu_lbl.setToolTip(hardware_report())
+
+        sb.addPermanentWidget(self._gpu_dot)
+        sb.addPermanentWidget(self._gpu_lbl)
 
     # ── MT5 ──────────────────────────────────────────────────────────────────
 
@@ -571,12 +666,30 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_fetch_worker") and self._fetch_worker.isRunning():
             return
 
+        # Validate date range before launching
+        from_date: Optional[pd.Timestamp] = None
+        to_date:   Optional[pd.Timestamp] = None
+        if self._use_date_range:
+            from_dt_q = self._from_dt.dateTime()
+            to_dt_q   = self._to_dt.dateTime()
+            if from_dt_q >= to_dt_q:
+                QMessageBox.warning(
+                    self, "Invalid date range",
+                    "'From' must be earlier than 'To'."
+                )
+                return
+            from_date = pd.Timestamp(from_dt_q.toPyDateTime())
+            to_date   = pd.Timestamp(to_dt_q.toPyDateTime())
+
         self._btn_refresh.setEnabled(False)
         self._btn_refresh.setText("⟳ Loading…")
         self._status_sym.setText(f"Fetching {len(tfs)} timeframe(s)…")
 
         self._fetch_worker = DataFetchWorker(
-            self._provider, self._symbol, tfs, self._nb_bars, force, parent=self
+            self._provider, self._symbol, tfs,
+            nb_bars=self._nb_bars, force=force,
+            from_date=from_date, to_date=to_date,
+            parent=self,
         )
         self._fetch_worker.data_ready.connect(self._on_data_ready)
         self._fetch_worker.start()
@@ -590,9 +703,20 @@ class MainWindow(QMainWindow):
             if tf in loaded:
                 panel.set_data(loaded[tf])
 
-        self._status_sym.setText(
-            f"{self._symbol}   {self._nb_bars:,} bars   ×{len(loaded)} TF"
-        )
+        if self._use_date_range:
+            from_str = self._from_dt.dateTime().toString("yyyy-MM-dd")
+            to_str   = self._to_dt.dateTime().toString("yyyy-MM-dd")
+            # show actual bar count from first loaded TF
+            first_df = next(iter(loaded.values()), None)
+            n_bars   = len(first_df) if first_df is not None else 0
+            self._status_sym.setText(
+                f"{self._symbol}  {from_str} → {to_str}  ({n_bars:,} bars)  ×{len(loaded)} TF"
+            )
+        else:
+            self._status_sym.setText(
+                f"{self._symbol}   {self._nb_bars:,} bars   ×{len(loaded)} TF"
+            )
+
         self._btn_refresh.setEnabled(True)
         self._btn_refresh.setText("⟳  Refresh")
 
@@ -629,6 +753,33 @@ class MainWindow(QMainWindow):
             panel.set_filter_segments([], show=False)
 
     # ── Slots ────────────────────────────────────────────────────────────────
+
+    def _on_date_range_toggled(self, checked: bool) -> None:
+        """Show/hide date pickers; show/hide bars spinbox."""
+        self._use_date_range = checked
+
+        # Bars controls ↔ date pickers
+        self._lbl_bars.setVisible(not checked)
+        self._bars_spin.setVisible(not checked)
+        self._bars_quick.setVisible(not checked)
+        self._lbl_from.setVisible(checked)
+        self._from_dt.setVisible(checked)
+        self._lbl_to.setVisible(checked)
+        self._to_dt.setVisible(checked)
+
+        # Auto-refresh doesn't make sense for fixed date ranges
+        if checked:
+            self._auto_combo.setCurrentText("Off")
+            self._auto_combo.setEnabled(False)
+        else:
+            self._auto_combo.setEnabled(True)
+
+        self._manual_refresh()
+
+    def _on_date_range_changed(self) -> None:
+        """Called when either QDateTimeEdit value changes."""
+        if self._use_date_range:
+            self._manual_refresh()
 
     def _on_symbol_changed(self) -> None:
         self._symbol = self._symbol_edit.text().strip().upper()

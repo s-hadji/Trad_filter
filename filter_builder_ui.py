@@ -347,7 +347,7 @@ class FilterBuilderPanel(QWidget):
         self._preview.setPlaceholderText("Build conditions above…")
         bl.addWidget(self._preview)
 
-        # Name + add-to-list
+        # Name + single-click apply
         name_row = QHBoxLayout()
         lbl_n = QLabel("Name")
         lbl_n.setStyleSheet(f"color:{TEXT2}; font-size:8pt;")
@@ -356,11 +356,19 @@ class FilterBuilderPanel(QWidget):
         self._name_in = QLineEdit("My Filter")
         self._name_in.setFixedHeight(28)
         name_row.addWidget(self._name_in)
-        btn_to_list = QPushButton("→  Add to List")
-        btn_to_list.setFixedHeight(28)
-        btn_to_list.clicked.connect(self._add_to_list)
-        name_row.addWidget(btn_to_list)
         bl.addLayout(name_row)
+
+        # ── Single-click Apply CTA (inside builder card) ───────
+        self._apply_btn = QPushButton("▶  Apply")
+        self._apply_btn.setProperty("primary", True)
+        self._apply_btn.setFixedHeight(40)
+        self._apply_btn.setEnabled(False)
+        self._apply_btn.setToolTip(
+            "Validate the expression, add it to the filter list and\n"
+            "immediately apply zones to all chart panels."
+        )
+        self._apply_btn.clicked.connect(self._apply)
+        bl.addWidget(self._apply_btn)
 
         root.addWidget(builder)
 
@@ -379,7 +387,7 @@ class FilterBuilderPanel(QWidget):
         )
         self._badges_l.addWidget(self._empty_lbl)
 
-        # Clear all — always visible, grey when empty
+        # Clear all — always visible
         self._clear_btn = QPushButton("🗑  Clear All Filters")
         self._clear_btn.setFixedHeight(30)
         self._clear_btn.setProperty("danger", True)
@@ -387,14 +395,6 @@ class FilterBuilderPanel(QWidget):
         al.addWidget(self._clear_btn)
 
         root.addWidget(active)
-
-        # ── Apply (primary CTA) ────────────────────────────────
-        self._apply_btn = QPushButton("▶  Apply Filter")
-        self._apply_btn.setProperty("primary", True)
-        self._apply_btn.setFixedHeight(44)
-        self._apply_btn.setEnabled(False)
-        self._apply_btn.clicked.connect(self._apply)
-        root.addWidget(self._apply_btn)
 
         # ── Presets ────────────────────────────────────────────
         preset = QGroupBox("Presets")
@@ -442,34 +442,18 @@ class FilterBuilderPanel(QWidget):
     def _update_preview(self) -> None:
         if not self._rows:
             self._preview.setText("")
+            self._apply_btn.setEnabled(False)
             return
         parts = []
         for i, r in enumerate(self._rows):
             if i > 0:
                 parts.append(r.logic())
             parts.append(r.to_expression_part())
-        self._preview.setText(" ".join(parts))
+        expr = " ".join(parts)
+        self._preview.setText(expr)
+        self._apply_btn.setEnabled(bool(expr.strip()))
 
     # ── Filter list ────────────────────────────────────────────────────────────
-
-    def _add_to_list(self) -> None:
-        expr = self._preview.text().strip()
-        if not expr:
-            return
-        name = self._name_in.text().strip() or f"Filter {self._counter + 1}"
-        try:
-            parse_filter(expr)
-        except Exception as e:
-            QMessageBox.warning(self, "Invalid expression", str(e))
-            return
-
-        self._engine.remove_filter(name)
-        self._engine.add_filter(name, expr)
-        self._counter += 1
-        self._name_in.setText(f"Filter {self._counter + 1}")
-        self._refresh_badges()
-        self._apply_btn.setEnabled(True)
-        self.filters_changed.emit()
 
     def _refresh_badges(self) -> None:
         # Clear existing badges
@@ -504,21 +488,49 @@ class FilterBuilderPanel(QWidget):
         self._refresh_badges()
         self.filters_changed.emit()
 
-    # ── Apply ──────────────────────────────────────────────────────────────────
+    # ── Apply (validate + register + render — one click) ──────────────────────
 
     def _apply(self) -> None:
-        if not self._engine.filters:
+        """
+        Single-step action:
+        1. Validate the current expression in the preview.
+        2. Register (or replace) it in the engine under the chosen name.
+        3. Emit filter_applied so MainWindow renders zones immediately.
+        4. Show a brief ✓ confirmation on the button.
+        5. Advance the default name counter so the next filter gets a fresh name.
+        """
+        expr = self._preview.text().strip()
+        if not expr:
             return
+        name = self._name_in.text().strip() or f"Filter {self._counter + 1}"
+        try:
+            parse_filter(expr)   # syntax check only
+        except Exception as e:
+            QMessageBox.warning(self, "Invalid expression", str(e))
+            return
+
+        # Register in engine (replace if same name)
+        self._engine.remove_filter(name)
+        self._engine.add_filter(name, expr)
+        self._counter += 1
+
+        # Prepare a fresh name for the next filter
+        self._name_in.setText(f"Filter {self._counter + 1}")
+
+        self._refresh_badges()
+        self.filters_changed.emit()
         self.filter_applied.emit()
-        self._apply_btn.setText("✓  Filter Applied")
+
+        # Visual confirmation
+        self._apply_btn.setText("✓  Applied!")
         self._apply_btn.setStyleSheet(
             f"QPushButton {{ background:{SUCCESS}; border:none; color:#fff; "
             f"font-weight:700; font-size:9.5pt; border-radius:5px; padding:7px 18px; }}"
         )
-        QTimer.singleShot(1800, self._reset_apply_btn)
+        QTimer.singleShot(1600, self._reset_apply_btn)
 
     def _reset_apply_btn(self) -> None:
-        self._apply_btn.setText("▶  Apply Filter")
+        self._apply_btn.setText("▶  Apply")
         self._apply_btn.setStyleSheet("")
 
     # ── Presets ────────────────────────────────────────────────────────────────
