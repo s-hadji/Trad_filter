@@ -309,7 +309,244 @@ if __name__ == "__main__":
     else:
         print("\n(Set ANTHROPIC_API_KEY to run a live summary.)")
 xxx
+"""
+diff_summary.py
+===============
+Summarize a markdown diff into a concise, structured description of the
+document modifications, using a LangChain ``ChatOpenAI`` client pointed at a
+custom OpenAI-compatible endpoint.
 
+Pipeline position
+------------------
+    fromlines, tolines
+        |-> ModernHtmlDiff.make_markdown(...)        # markdown diff
+              |-> DiffSummarizer(...).summarize(md)  # -> DiffSummary (validated)
+
+The summarizer classifies each edit into operator-friendly categories such as
+"reference modified on object X", "information added", "information replaced",
+so a human can grasp *what kind* of change happened at a glance.
+
+Dependencies: langchain-openai >= 0.2, pydantic >= 2
+"""
+
+from __future__ import annotations
+
+from enum import Enum
+
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
+
+
+# ---------------------------------------------------------------------------
+# Structured output schema
+# ---------------------------------------------------------------------------
+
+class ModificationType(str, Enum):
+    """The kind of edit, in document/content terms an operator understands."""
+
+    REFERENCE_CHANGE = "reference_change"   # a reference/identifier was modified
+    INFO_ADDED = "info_added"               # new information inserted
+    INFO_REMOVED = "info_removed"           # information deleted
+    INFO_REPLACED = "info_replaced"         # information swapped for new content
+    VALUE_CHANGE = "value_change"           # a value/parameter was adjusted
+    REWORDING = "rewording"                 # phrasing changed, meaning kept
+    STRUCTURE_CHANGE = "structure_change"   # ordering/layout/section moved
+
+
+class Modification(BaseModel):
+    """A single modification described for a human operator."""
+
+    type: ModificationType = Field(
+        description="Category of this modification."
+    )
+    target: str = Field(
+        description="What the change applies to: the object, field, section, "
+        "or reference affected. Keep it short and concrete."
+    )
+    description: str = Field(
+        description="One short sentence stating what changed. "
+        "Example: 'Reference on object Foo changed from A to B'. "
+        "No filler, no markdown."
+    )
+
+
+class DiffSummary(BaseModel):
+    """A complete, structured summary of all modifications in a diff."""
+
+    overview: str = Field(
+        description="One sentence summarizing the overall intent of the "
+        "changes (max ~15 words)."
+    )
+    modifications: list[Modification] = Field(
+        description="All meaningful modifications, ordered most significant "
+        "first. Merge trivial/cosmetic edits; omit pure formatting noise."
+    )
+
+
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+
+_SYSTEM_PROMPT = (
+    "You summarize document diffs for a human operator. You receive a markdown "
+    "diff and return a structured summary describing the modifications.\n\n"
+    "Describe each change in plain operator terms, for example:\n"
+    "  - 'Reference on object X modified'\n"
+    "  - 'Information added in section Y'\n"
+    "  - 'Information replaced: old value -> new value'\n\n"
+    "Rules:\n"
+    "- Be concise. No greetings, no explanations, no markdown in field values.\n"
+    "- One modification entry per distinct logical change.\n"
+    "- Skip pure formatting/whitespace changes.\n"
+    "- 'description' states what changed and, when useful, the before -> after."
+)
+
+
+# ---------------------------------------------------------------------------
+# Summarizer
+# ---------------------------------------------------------------------------
+
+class DiffSummarizer:
+    """
+    Wraps a custom ``ChatOpenAI`` model with structured output to turn a
+    markdown diff into a validated :class:`DiffSummary`.
+
+    Parameters
+    ----------
+    api_key : str
+        API key for the OpenAI-compatible endpoint.
+    base_url : str
+        Base URL of the endpoint (e.g. "https://my-llm.internal/v1").
+    model : str
+        Model name to request.
+    temperature : float
+        Sampling temperature. Defaults to 0 for stable, deterministic summaries.
+    max_tokens : int | None
+        Optional cap on response length.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        model: str,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+    ) -> None:
+        llm = ChatOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        # Bind the Pydantic schema so the model returns a validated DiffSummary.
+        self._chain = llm.with_structured_output(DiffSummary)
+
+    def summarize(
+        self,
+        diff_markdown: str,
+        fromdesc: str = "original",
+        todesc: str = "modified",
+    ) -> DiffSummary:
+        """
+        Summarize a markdown diff.
+
+        Parameters
+        ----------
+        diff_markdown : str
+            Output of ``ModernHtmlDiff.make_markdown(...)``.
+        fromdesc, todesc : str
+            Labels for the two versions, surfaced to the model for context.
+
+        Returns
+        -------
+        DiffSummary
+            Parsed and validated by Pydantic.
+        """
+        user_message = (
+            f"Diff between `{fromdesc}` and `{todesc}`. "
+            f"Summarize the modifications.\n\n{diff_markdown}"
+        )
+        return self._chain.invoke(
+            [
+                ("system", _SYSTEM_PROMPT),
+                ("human", user_message),
+            ]
+        )
+
+
+# ---------------------------------------------------------------------------
+# Optional: render a DiffSummary as a compact operator-facing text block
+# ---------------------------------------------------------------------------
+
+_TYPE_LABEL = {
+    ModificationType.REFERENCE_CHANGE: "Reference changed",
+    ModificationType.INFO_ADDED: "Info added",
+    ModificationType.INFO_REMOVED: "Info removed",
+    ModificationType.INFO_REPLACED: "Info replaced",
+    ModificationType.VALUE_CHANGE: "Value changed",
+    ModificationType.REWORDING: "Reworded",
+    ModificationType.STRUCTURE_CHANGE: "Structure changed",
+}
+
+
+def render_summary_text(summary: DiffSummary) -> str:
+    """Render a DiffSummary as a terse plain-text block for a terminal/log."""
+    lines = [f"> {summary.overview}", ""]
+    for m in summary.modifications:
+        label = _TYPE_LABEL.get(m.type, m.type.value)
+        lines.append(f"- [{label}] {m.target}: {m.description}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Convenience: diff -> markdown -> summary in one call
+# ---------------------------------------------------------------------------
+
+def summarize_change(
+    fromlines: list[str],
+    tolines: list[str],
+    summarizer: DiffSummarizer,
+    fromdesc: str = "original",
+    todesc: str = "modified",
+    *,
+    filter_trivial: bool = True,
+) -> tuple[str, DiffSummary]:
+    """
+    One-shot helper: build the markdown diff AND its structured summary.
+
+    Returns ``(markdown, summary)`` so the caller can render the visual diff
+    and the operator summary together.
+    """
+    from modern_diff import ModernHtmlDiff
+
+    differ = ModernHtmlDiff(filter_trivial=filter_trivial)
+    markdown = differ.make_markdown(fromlines, tolines, fromdesc, todesc)
+    summary = summarizer.summarize(markdown, fromdesc, todesc)
+    return markdown, summary
+
+
+# ---------------------------------------------------------------------------
+# Usage example
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    summarizer = DiffSummarizer(
+        api_key="YOUR_API_KEY",
+        base_url="https://your-endpoint/v1",
+        model="your-model-name",
+    )
+
+    before = ["Owner: Alice", "Status: draft", "Budget: 1000"]
+    after = ["Owner: Bob", "Status: draft", "Budget: 1500", "Reviewer: Carol"]
+
+    markdown, summary = summarize_change(
+        before, after, summarizer,
+        fromdesc="record_v1", todesc="record_v2",
+    )
+    print(render_summary_text(summary))
+xxxx
 """
 modern_diff.py
 ==============
