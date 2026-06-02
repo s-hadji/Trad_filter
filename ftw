@@ -1,6 +1,96 @@
 """
 diff_summary.py
 ===============
+One markdown diff in, one structured summary of modifications out.
+Single LLM call, minimal prompt, no chatter.
+
+    md = ModernHtmlDiff().make_markdown(before, after)
+    summary = DiffSummarizer(api_key, base_url, model).summarize(md)
+
+Dependencies: langchain-openai >= 0.2, pydantic >= 2
+"""
+
+from __future__ import annotations
+
+from enum import Enum
+
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
+
+
+class ModificationType(str, Enum):
+    REFERENCE_CHANGE = "reference_change"
+    INFO_ADDED = "info_added"
+    INFO_REMOVED = "info_removed"
+    INFO_REPLACED = "info_replaced"
+    VALUE_CHANGE = "value_change"
+    REWORDING = "rewording"
+    STRUCTURE_CHANGE = "structure_change"
+
+
+class Modification(BaseModel):
+    type: ModificationType
+    target: str = Field(description="Object / field / section affected.")
+    description: str = Field(description="What changed, before -> after if useful.")
+
+
+class DiffSummary(BaseModel):
+    overview: str = Field(description="One short sentence on overall intent.")
+    modifications: list[Modification]
+
+
+# Instructions live in the schema field descriptions above; the prompt only
+# states the task once, so the model never echoes the rules back.
+_PROMPT = "Summarize the modifications in this diff:\n\n{md}"
+
+
+class DiffSummarizer:
+    """Custom ChatOpenAI endpoint bound to the DiffSummary schema."""
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        model: str,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+    ) -> None:
+        self._chain = ChatOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        ).with_structured_output(DiffSummary)
+
+    def summarize(self, diff_markdown: str) -> DiffSummary:
+        """One call: markdown diff -> validated DiffSummary."""
+        return self._chain.invoke(_PROMPT.format(md=diff_markdown))
+
+
+if __name__ == "__main__":
+    from modern_diff import ModernHtmlDiff
+
+    before = ["Owner: Alice", "Status: draft", "Budget: 1000"]
+    after = ["Owner: Bob", "Status: draft", "Budget: 1500", "Reviewer: Carol"]
+
+    md = ModernHtmlDiff().make_markdown(before, after, "record_v1", "record_v2")
+
+    summarizer = DiffSummarizer(
+        api_key="YOUR_API_KEY",
+        base_url="https://your-endpoint/v1",
+        model="your-model-name",
+    )
+    summary = summarizer.summarize(md)
+
+    print(summary.overview)
+    for m in summary.modifications:
+        print(f"- [{m.type.value}] {m.target}: {m.description}")
+
+
+"""
+diff_summary.py
+===============
 Turn a `ModernHtmlDiff.make_markdown(...)` output into a terse, operator-facing
 summary of changes, using the Anthropic API with a strict Pydantic schema.
 
