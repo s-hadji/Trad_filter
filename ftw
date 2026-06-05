@@ -1,4 +1,344 @@
 """
+diff_pipeline.py
+================
+Glue layer on top of `modern_diff` + `diff_summary`.
+
+It does three things:
+
+1. Token-aware summarization
+   If a markdown diff is too large for the model's context window, it is split
+   on change-region boundaries (never mid-block), each part is summarized in
+   its own call, and the partial summaries are merged back into one. The merged
+   result records that a split happened.
+
+2. Corpus processing
+   Walk a ``DMCIntersectionDiffDict`` ({code: {"HTML": ..., "MD": ...}}), feed
+   each code's "MD" to the LLM, and collect one summary per code.
+
+3. Grouping by modification type
+   Reorganize all per-code summaries into a dictionary keyed by modification
+   type, holding the codes involved and the content (LLM descriptions) per code.
+
+Dependencies: tiktoken (optional), plus the local modern_diff / diff_summary.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Callable, Iterable, Mapping
+
+from diff_summary import (
+    DiffSummarizer,
+    DiffSummary,
+    Modification,
+    ModificationType,
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Token counting
+# ─────────────────────────────────────────────────────────────────────────────
+
+TokenCounter = Callable[[str], int]
+
+
+def make_token_counter(encoding: str = "cl100k_base") -> TokenCounter:
+    """
+    Return a function that counts tokens in a string.
+
+    Uses tiktoken when available; otherwise falls back to a ~4-chars-per-token
+    heuristic (a safe-ish upper bound for budgeting).
+    """
+    try:
+        import tiktoken
+
+        enc = tiktoken.get_encoding(encoding)
+        return lambda text: len(enc.encode(text))
+    except Exception:  # noqa: BLE001 - tiktoken missing or encoding unknown
+        return lambda text: (len(text) + 3) // 4
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Splitting a markdown diff on change-region boundaries
+# ─────────────────────────────────────────────────────────────────────────────
+
+_REGION_RE = re.compile(r"(?=^### )", re.MULTILINE)
+
+
+def split_markdown(
+    diff_markdown: str,
+    max_tokens: int,
+    count_tokens: TokenCounter,
+) -> list[str]:
+    """
+    Split *diff_markdown* into chunks that each fit within *max_tokens*.
+
+    The split happens only between ``### Change N`` regions produced by
+    ``ModernHtmlDiff.make_markdown``. The leading header (``## Diff`` +
+    ``**Summary**``) is repeated at the top of every chunk so each part stays
+    self-describing.
+
+    A single region larger than *max_tokens* is emitted on its own (it cannot
+    be split further without breaking a diff block).
+    """
+    if count_tokens(diff_markdown) <= max_tokens:
+        return [diff_markdown]
+
+    first = diff_markdown.find("### ")
+    if first == -1:
+        return [diff_markdown]  # no regions to split on
+
+    header = diff_markdown[:first]
+    body = diff_markdown[first:]
+    regions = [r for r in _REGION_RE.split(body) if r.strip()]
+
+    chunks: list[str] = []
+    current = header
+    for region in regions:
+        candidate = current + region
+        if count_tokens(candidate) > max_tokens and current != header:
+            chunks.append(current)
+            current = header + region
+        else:
+            current = candidate
+    if current.strip():
+        chunks.append(current)
+
+    return chunks
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Merging partial summaries back into one
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _dedup_modifications(mods: Iterable[Modification]) -> list[Modification]:
+    """Drop exact duplicates while preserving order."""
+    seen: set[tuple[str, str, str]] = set()
+    out: list[Modification] = []
+    for m in mods:
+        key = (m.type.value, m.target.strip().lower(), m.description.strip().lower())
+        if key not in seen:
+            seen.add(key)
+            out.append(m)
+    return out
+
+
+def merge_summaries(parts: list[DiffSummary]) -> DiffSummary:
+    """
+    Deterministically merge several partial :class:`DiffSummary` into one.
+
+    Modifications from all parts are concatenated and de-duplicated. The
+    overview lines are joined into a single sentence. No extra LLM call is made,
+    so this never risks the context window.
+    """
+    if len(parts) == 1:
+        return parts[0]
+
+    all_mods = _dedup_modifications(
+        m for p in parts for m in p.modifications
+    )
+    overviews = [p.overview.strip().rstrip(".") for p in parts if p.overview.strip()]
+    overview = "; ".join(overviews) if overviews else "Multiple modifications."
+
+    return DiffSummary(overview=overview, modifications=all_mods)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Token-aware summarizer
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class SummaryResult:
+    """A summary plus metadata about how it was produced."""
+
+    summary: DiffSummary
+    was_split: bool = False
+    n_parts: int = 1
+
+
+class TokenAwareSummarizer:
+    """
+    Wraps a :class:`DiffSummarizer` and transparently handles oversized diffs
+    by splitting on region boundaries, summarizing each part once, and merging.
+
+    Parameters
+    ----------
+    summarizer : DiffSummarizer
+        The underlying LLM-backed summarizer.
+    max_input_tokens : int
+        Token budget for the diff portion of a single call. Set this below the
+        model's context window, leaving room for the prompt and the response.
+    count_tokens : TokenCounter | None
+        Token counter. Defaults to a tiktoken-based counter.
+    """
+
+    def __init__(
+        self,
+        summarizer: DiffSummarizer,
+        max_input_tokens: int,
+        count_tokens: TokenCounter | None = None,
+    ) -> None:
+        self._summarizer = summarizer
+        self._max = max_input_tokens
+        self._count = count_tokens or make_token_counter()
+
+    def summarize(self, diff_markdown: str) -> SummaryResult:
+        chunks = split_markdown(diff_markdown, self._max, self._count)
+
+        if len(chunks) == 1:
+            return SummaryResult(self._summarizer.summarize(chunks[0]))
+
+        total = len(chunks)
+        partials = [
+            self._summarizer.summarize(
+                chunk,
+                note=f"This is part {i}/{total} of a diff that was split to fit "
+                f"the context window. Summarize only the changes shown here.",
+            )
+            for i, chunk in enumerate(chunks, 1)
+        ]
+        merged = merge_summaries(partials)
+        return SummaryResult(merged, was_split=True, n_parts=total)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Corpus processing over a DMCIntersectionDiffDict
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Type alias for clarity: {code: {"HTML": str, "MD": str}}
+DMCIntersectionDiffDict = Mapping[str, Mapping[str, str]]
+
+
+def summarize_corpus(
+    diff_dict: DMCIntersectionDiffDict,
+    summarizer: TokenAwareSummarizer,
+    md_key: str = "MD",
+) -> dict[str, SummaryResult]:
+    """
+    Summarize every code in *diff_dict* using its markdown diff.
+
+    Returns ``{code: SummaryResult}``. Codes whose entry has no markdown are
+    skipped.
+    """
+    results: dict[str, SummaryResult] = {}
+    for code, payload in diff_dict.items():
+        md = payload.get(md_key)
+        if not md or not md.strip():
+            continue
+        results[code] = summarizer.summarize(md)
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Grouping by modification type
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class TypeGroup:
+    """All modifications of one type, across the whole corpus."""
+
+    codes: list[str] = field(default_factory=list)        # codes touched
+    content_by_code: dict[str, list[str]] = field(default_factory=dict)  # code -> descriptions
+
+    def to_dict(self) -> dict[str, object]:
+        return {"codes": self.codes, "content_by_code": self.content_by_code}
+
+
+def group_by_modification_type(
+    per_code: Mapping[str, SummaryResult],
+) -> dict[ModificationType, TypeGroup]:
+    """
+    Reorganize per-code summaries into ``{modification_type: TypeGroup}``.
+
+    For each modification type, the result holds the set of codes that contain
+    that type and, per code, the list of content descriptions (the LLM summary).
+    """
+    grouped: dict[ModificationType, TypeGroup] = {}
+
+    for code, result in per_code.items():
+        for mod in result.summary.modifications:
+            group = grouped.setdefault(mod.type, TypeGroup())
+            if code not in group.content_by_code:
+                group.codes.append(code)
+                group.content_by_code[code] = []
+            entry = f"{mod.target}: {mod.description}" if mod.target else mod.description
+            group.content_by_code[code].append(entry)
+
+    return grouped
+
+
+def grouped_to_dict(
+    grouped: Mapping[ModificationType, TypeGroup],
+) -> dict[str, dict[str, object]]:
+    """Convert the grouped structure into a plain JSON-serializable dict."""
+    return {mtype.value: group.to_dict() for mtype, group in grouped.items()}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# End-to-end entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def process_dmc_intersection(
+    diff_dict: DMCIntersectionDiffDict,
+    summarizer: TokenAwareSummarizer,
+    md_key: str = "MD",
+) -> tuple[dict[str, SummaryResult], dict[ModificationType, TypeGroup]]:
+    """
+    Full pipeline: summarize each code's diff, then group by modification type.
+
+    Returns
+    -------
+    (per_code, grouped)
+        per_code : {code: SummaryResult}
+        grouped  : {ModificationType: TypeGroup}
+    """
+    per_code = summarize_corpus(diff_dict, summarizer, md_key=md_key)
+    grouped = group_by_modification_type(per_code)
+    return per_code, grouped
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Usage example
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import json
+
+    from modern_diff import ModernHtmlDiff
+
+    differ = ModernHtmlDiff()
+
+    # Build a small DMCIntersectionDiffDict for illustration.
+    diff_dict: dict[str, dict[str, str]] = {}
+    for code, (before, after) in {
+        "DOC_A": (["Owner: Alice", "Budget: 1000"], ["Owner: Bob", "Budget: 1500"]),
+        "DOC_B": (["Ref: X-1", "Note: draft"], ["Ref: X-2", "Note: draft", "Tag: urgent"]),
+    }.items():
+        diff_dict[code] = {
+            "HTML": differ.make_file(before, after, code + "_v1", code + "_v2"),
+            "MD": differ.make_markdown(before, after, code + "_v1", code + "_v2"),
+        }
+
+    summarizer = TokenAwareSummarizer(
+        DiffSummarizer(
+            api_key="YOUR_API_KEY",
+            base_url="https://your-endpoint/v1",
+            model="your-model-name",
+        ),
+        max_input_tokens=6000,
+    )
+
+    per_code, grouped = process_dmc_intersection(diff_dict, summarizer)
+
+    for code, res in per_code.items():
+        tag = f" (split into {res.n_parts})" if res.was_split else ""
+        print(f"{code}{tag}: {res.summary.overview}")
+
+    print(json.dumps(grouped_to_dict(grouped), indent=2, ensure_ascii=False))
+...
+
+"""
 diff_summary.py
 ===============
 One markdown diff in, one structured summary of modifications out.
