@@ -1,3 +1,95 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+
+# --- 1. Simulation de tes données ---
+np.random.seed(42)
+emb = np.random.rand(300, 128)
+labels = np.random.choice(["Groupe A", "Groupe B", "Groupe C"], size=300)
+
+# --- 2. Réduction de dimension ---
+# PCA
+pca = PCA(n_components=2)
+emb_pca = pca.fit_transform(emb)
+
+# t-SNE
+tsne = TSNE(n_components=2, perplexity=30, random_state=42, n_iter=1000)
+emb_tsne = tsne.fit_transform(emb)
+
+# --- 3. Création du Plot avec Matplotlib ---
+
+# Configuration du style général (Seaborn rend Matplotlib beaucoup plus beau)
+sns.set_theme(style="whitegrid")
+palette = sns.color_palette("muted", len(np.unique(labels)))
+
+# Création de la figure (1 ligne, 2 colonnes)
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+
+# --- Graphique 1 : PCA ---
+sns.scatterplot(
+    x=emb_pca[:, 0],
+    y=emb_pca[:, 1],
+    hue=labels,
+    palette=palette,
+    alpha=0.8,
+    s=60,  # Taille des points
+    ax=ax1,
+)
+ax1.set_title("PCA (Réduction Linéaire)", fontsize=14, fontweight="bold", pad=15)
+ax1.set_xlabel("Composante Principale 1", fontsize=11)
+ax1.set_ylabel("Composante Principale 2", fontsize=11)
+ax1.get_legend().remove()  # On enlève la légende locale pour en faire une globale
+
+# --- Graphique 2 : t-SNE ---
+sns.scatterplot(
+    x=emb_tsne[:, 0],
+    y=emb_tsne[:, 1],
+    hue=labels,
+    palette=palette,
+    alpha=0.8,
+    s=60,
+    ax=ax2,
+)
+ax2.set_title(
+    "t-SNE (Réduction Non-Linéaire)", fontsize=14, fontweight="bold", pad=15
+)
+ax2.set_xlabel("Dimension t-SNE 1", fontsize=11)
+ax2.set_ylabel("Dimension t-SNE 2", fontsize=11)
+ax2.get_legend().remove()
+
+# --- 4. Ajustements de la Figure globale ---
+
+# Ajout d'une légende unique et bien placée tout à droite
+handles, fig_labels = ax1.get_legend_handles_labels()
+fig.legend(
+    handles,
+    fig_labels,
+    title="Classes",
+    loc="center right",
+    bbox_to_anchor=(1.1, 0.5),
+    frameon=True,
+)
+
+# Titre principal de la figure
+fig.suptitle(
+    "Comparaison des méthodes de réduction de dimension",
+    fontsize=16,
+    fontweight="bold",
+    y=1.02,
+)
+
+# Ajustement automatique des espaces pour éviter les chevauchements
+plt.tight_layout()
+
+# Affichage ou sauvegarde
+# plt.savefig('embeddings_reduction.png', dpi=300, bbox_inches='tight') # Pour sauvegarder en HD
+plt.show()
+
+
+
+
 
 import numpy as np
 import plotly.express as px
