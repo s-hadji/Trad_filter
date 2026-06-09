@@ -1,3 +1,98 @@
+
+import numpy as np
+import plotly.express as px
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+
+# --- 1. Simulation de tes données ---
+# On imagine que 'emb' est ton tableau numpy (ex: 300 embeddings de dimension 128)
+# On crée aussi des faux labels pour colorer le graphique, c'est plus sympa !
+np.random.seed(42)
+emb = np.random.rand(300, 128)
+labels = np.random.choice(
+    ["Groupe A", "Groupe B", "Groupe C"], size=300
+)  # Optionnel
+metadata = [f"Doc n°{i}" for i in range(300)]  # Texte au survol
+
+# --- 2. Réduction de dimension ---
+
+# A. Version Linéaire : PCA (2 composants)
+pca = PCA(n_components=2)
+emb_pca = pca.fit_transform(emb)
+
+# B. Version Non-Linéaire : t-SNE (2 composants)
+# Note : perplexity doit être inférieure au nombre d'individus
+tsne = TSNE(n_components=2, perplexity=30, random_state=42, n_iter=1000)
+emb_tsne = tsne.fit_transform(emb)
+
+
+# --- 3. Création du "Joli Plot" interactif ---
+
+# On crée une figure avec 2 sous-graphiques (1 ligne, 2 colonnes)
+fig = make_subplots(
+    rows=1,
+    cols=2,
+    subplot_titles=(
+        "PCA (Réduction Linéaire)",
+        "t-SNE (Réduction Non-Linéaire)",
+    ),
+)
+
+# Couleurs pour que les deux graphiques soient synchronisés
+unique_labels = list(set(labels))
+colors = px.colors.qualitative.Plotly
+
+for i, label in enumerate(unique_labels):
+    mask = labels == label
+
+    # Ajout du scatter PCA
+    fig.add_trace(
+        go.Scatter(
+            x=emb_pca[mask, 0],
+            y=emb_pca[mask, 1],
+            mode="markers",
+            name=label,
+            marker=dict(color=colors[i], size=8),
+            hovertext=[metadata[j] for j, m in enumerate(mask) if m],
+            legendgroup=label,  # Lie la légende entre les deux plots
+        ),
+        row=1,
+        col=1,
+    )
+
+    # Ajout du scatter t-SNE
+    fig.add_trace(
+        go.Scatter(
+            x=emb_tsne[mask, 0],
+            y=emb_tsne[mask, 1],
+            mode="markers",
+            name=label,
+            marker=dict(color=colors[i], size=8),
+            hovertext=[metadata[j] for j, m in enumerate(mask) if m],
+            legendgroup=label,
+            showlegend=False,  # Évite les doublons dans la légende
+        ),
+        row=1,
+        col=2,
+    )
+
+# --- 4. Tuning du design ---
+fig.update_layout(
+    title_text="Visualisation des Embeddings",
+    title_x=0.5,  # Centre le titre
+    template="plotly_white",  # Fond blanc ultra propre
+    width=1100,
+    height=500,
+    hovermode="closest",
+)
+
+# Afficher le plot (s'ouvre dans ton navigateur ou ton notebook)
+fig.show()
+
+
+
 """
 modern_diff.py
 ==============
