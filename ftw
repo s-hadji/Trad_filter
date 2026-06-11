@@ -1,3 +1,125 @@
+    # ─────────────────────────────────────────────────────────────────────────
+    # Extraction des règles atomiques au niveau des mots (Copie-colle dans ta classe)
+    # ─────────────────────────────────────────────────────────────────────────
+    def get_clean_rules(
+        self, fromlines: Sequence[str], tolines: Sequence[str]
+    ) -> list[dict]:
+        """Analyse le texte et extrait une liste de dictionnaires représentant
+        les changements sémantiques exacts au niveau des mots complets.
+        
+        Bénéficie automatiquement de tes filtres filter_trivial et normalize_content.
+        """
+        a = [l.rstrip("\n") for l in fromlines]
+        b = [l.rstrip("\n") for l in tolines]
+        blocks = self._build_blocks(a, b)
+
+        extracted_rules = []
+
+        for bl in blocks:
+            if bl.tag == "equal":
+                continue
+
+            # On reconstruit les lignes complètes du bloc pour l'analyse intra-ligne
+            line_a = " ".join(bl.a_lines)
+            line_b = " ".join(bl.b_lines)
+
+            # Appel de la logique d'expansion maximale connectée
+            line_rules = self._process_intraline_expansion(line_a, line_b)
+
+            # Enrichissement avec le numéro de ligne global d'origine du fichier
+            for rule in line_rules:
+                rule["file_line_a"] = bl.a_start
+                rule["file_line_b"] = bl.b_start
+                extracted_rules.append(rule)
+
+        return extracted_rules
+
+    @staticmethod
+    def _process_intraline_expansion(a: str, b: str) -> list[dict]:
+        """Sous-méthode exécutant l'algorithme d'expansion découplée,
+        de fusion par points communs et de franchissement d'espaces (crossing).
+        """
+        sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+        raw_mods = [op for op in sm.get_opcodes() if op[0] != "equal"]
+
+        if not raw_mods:
+            # Gestion du cas limite où la ligne entière est modifiée sans correspondance
+            return [
+                {
+                    "type": "replace",
+                    "before": a,
+                    "after": b,
+                    "range_a": (0, len(a)),
+                    "range_b": (0, len(b)),
+                }
+            ]
+
+        expanded_intervals = []
+        for tag, i1, i2, j1, j2 in raw_mods:
+            # 1. Expansion asymétrique jusqu'aux frontières des mots (gère les insertions)
+            while i1 > 0 and a[i1 - 1] != " ":
+                i1 -= 1
+            while j1 > 0 and b[j1 - 1] != " ":
+                j1 -= 1
+            while i2 < len(a) and a[i2] != " ":
+                i2 += 1
+            while j2 < len(b) and b[j2] != " ":
+                j2 += 1
+            expanded_intervals.append([i1, i2, j1, j2])
+
+        # 2. Fusion par intersections / raccordements
+        expanded_intervals.sort(key=lambda x: x[0])
+        merged_intervals = []
+        curr = expanded_intervals[0]
+
+        for next_int in expanded_intervals[1:]:
+            if next_int[0] <= curr[1] or next_int[2] <= curr[3]:
+                curr[1] = max(curr[1], next_int[1])
+                curr[3] = max(curr[3], next_int[3])
+            else:
+                merged_intervals.append(curr)
+                curr = next_int
+        merged_intervals.append(curr)
+
+        # 3. Traversée des espaces (Crossing)
+        final_intervals = []
+        curr = merged_intervals[0]
+
+        for next_int in merged_intervals[1:]:
+            between_a = a[curr[1] : next_int[0]]
+            between_b = b[curr[3] : next_int[2]]
+
+            if (not between_a or between_a.isspace()) and (
+                not between_b or between_b.isspace()
+            ):
+                curr[1] = next_int[1]
+                curr[3] = next_int[3]
+            else:
+                final_intervals.append(curr)
+                curr = next_int
+        final_intervals.append(curr)
+
+        # 4. Nettoyage et formatage
+        rules = []
+        for i1, i2, j1, j2 in final_intervals:
+            txt_a = a[i1:i2]
+            txt_b = b[j1:j2]
+
+            # Ignore les résidus de fusions constitués uniquement d'espaces purs
+            if (not txt_a or txt_a.isspace()) and (not txt_b or txt_b.isspace()):
+                continue
+
+            rules.append(
+                {
+                    "type": "replace",
+                    "before": txt_a,
+                    "after": txt_b,
+                    "range_a": (i1, i2),
+                    "range_b": (j1, j2),
+                }
+            )
+        return rules
+
 
 import matplotlib.pyplot as plt
 import numpy as np
