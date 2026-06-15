@@ -740,23 +740,14 @@ class ModernHtmlDiff(difflib.HtmlDiff):
             if bl.tag == "equal":
                 continue  # nothing to do for unchanged blocks
 
-            # Pair lines from each side; fill with "" when sides differ in length
-            n = max(len(bl.a_lines), len(bl.b_lines))
-            a_ln = bl.a_start - 1  # will be incremented before use
-            b_ln = bl.b_start - 1
+            for line_a, line_b, rel_ai, rel_bi in                     self._pair_block_lines(bl.a_lines, bl.b_lines):
 
-            for i in range(n):
-                line_a = bl.a_lines[i] if i < len(bl.a_lines) else ""
-                line_b = bl.b_lines[i] if i < len(bl.b_lines) else ""
+                # Compute absolute 1-based line numbers from block start + index.
+                # None on one side means pure insertion/deletion.
+                a_ln = bl.a_start + rel_ai if rel_ai is not None else bl.a_start
+                b_ln = bl.b_start + rel_bi if rel_bi is not None else bl.b_start
 
-                if line_a:
-                    a_ln += 1
-                if line_b:
-                    b_ln += 1
-
-                # ── Fast skip: identical lines inside a replace block ────────
-                # Can happen when filter_trivial collapsed part of the block.
-                if line_a == line_b:
+                if line_a == line_b:   # identical → skip
                     continue
 
                 for rule in self._word_level_rules(line_a, line_b, protect):
@@ -765,6 +756,149 @@ class ModernHtmlDiff(difflib.HtmlDiff):
                     rules.append(rule)
 
         return rules
+
+    @staticmethod
+    def _pair_block_lines(
+        a_lines: list[str],
+        b_lines: list[str],
+    ) -> list[tuple[str, str, int | None, int | None]]:
+        """
+        Find the best (a_line, b_line) pairings inside a replace block.
+
+        Returns a list of ``(a_line, b_line, a_idx, b_idx)`` where:
+
+        * ``a_idx`` / ``b_idx`` are 0-based indices in the original arrays.
+        * ``None`` on one side means a pure insertion or deletion.
+
+        Two-level strategy
+        ------------------
+        **Level 1 — exact anchors (SequenceMatcher on line strings)**
+          Lines that are strictly identical are found first and used as
+          anchors.  This splits the block into smaller sub-blocks, each of
+          which is locally coherent.
+
+        **Level 2 — similarity pairing (greedy ratio matching)**
+          Inside each remaining replace sub-block, lines are paired by the
+          best ``SequenceMatcher.ratio()`` score rather than by position.
+          This correctly pairs "Note: draft" with "Note: révisé" even when
+          a new line ("Tag: urgent") was inserted between them, which would
+          have shifted every positional pairing by one.
+
+          Pairs with a ratio below ``min_ratio`` (default 0.2) are not
+          forced — the line is instead emitted as a pure insertion/deletion.
+        """
+        if not a_lines:
+            return [("", b, None, bi) for bi, b in enumerate(b_lines)]
+        if not b_lines:
+            return [(a, "", ai, None) for ai, a in enumerate(a_lines)]
+
+        pairs: list[tuple[str, str, int | None, int | None]] = []
+        sm = difflib.SequenceMatcher(None, a_lines, b_lines, autojunk=False)
+
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal":
+                for k, (a, b) in enumerate(zip(a_lines[i1:i2], b_lines[j1:j2])):
+                    pairs.append((a, b, i1 + k, j1 + k))
+
+            elif tag == "delete":
+                for k, a in enumerate(a_lines[i1:i2]):
+                    pairs.append((a, "", i1 + k, None))
+
+            elif tag == "insert":
+                for k, b in enumerate(b_lines[j1:j2]):
+                    pairs.append(("", b, None, j1 + k))
+
+            elif tag == "replace":
+                sub_a = a_lines[i1:i2]
+                sub_b = b_lines[j1:j2]
+                for a_line, b_line, rel_ai, rel_bi in                         ModernHtmlDiff._similarity_pairs(sub_a, sub_b):
+                    ai = (i1 + rel_ai) if rel_ai is not None else None
+                    bi = (j1 + rel_bi) if rel_bi is not None else None
+                    pairs.append((a_line, b_line, ai, bi))
+
+        return pairs
+
+    @staticmethod
+    def _similarity_pairs(
+        a_chunk: list[str],
+        b_chunk: list[str],
+        min_ratio: float = 0.2,
+    ) -> list[tuple[str, str, int | None, int | None]]:
+        """
+        Pair lines from *a_chunk* and *b_chunk* by best similarity ratio.
+
+        Algorithm
+        ---------
+        1. Build the full (len_a × len_b) ratio matrix — one
+           ``SequenceMatcher`` per cell.  Blocks are typically small
+           (< 10 lines) so this is fast in practice.
+        2. Greedy: repeatedly pick the (ai, bi) cell with the highest ratio
+           and emit that pair, then mark both indices as used.
+        3. Stop pairing when the best remaining ratio drops below
+           *min_ratio*; remaining lines on each side become orphans
+           (pure deletions / insertions).
+        4. Re-sort the output to preserve the original relative order of
+           each side (A-side order first, then B-side orphan insertions).
+        """
+        if not a_chunk:
+            return [("", b, None, bi) for bi, b in enumerate(b_chunk)]
+        if not b_chunk:
+            return [(a, "", ai, None) for ai, a in enumerate(a_chunk)]
+
+        # ── Step 1: ratio matrix ─────────────────────────────────────────────
+        ratios = [
+            [
+                difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
+                for b in b_chunk
+            ]
+            for a in a_chunk
+        ]
+
+        # ── Step 2: greedy best-match ────────────────────────────────────────
+        a_used: set[int] = set()
+        b_used: set[int] = set()
+        matches: list[tuple[int, int]] = []   # (ai, bi)
+
+        while len(a_used) < len(a_chunk) and len(b_used) < len(b_chunk):
+            best_r, best_ai, best_bi = -1.0, -1, -1
+            for ai in range(len(a_chunk)):
+                if ai in a_used:
+                    continue
+                for bi in range(len(b_chunk)):
+                    if bi in b_used:
+                        continue
+                    if ratios[ai][bi] > best_r:
+                        best_r = ratios[ai][bi]
+                        best_ai, best_bi = ai, bi
+
+            if best_r < min_ratio:
+                break   # remaining lines are too different → orphans
+
+            matches.append((best_ai, best_bi))
+            a_used.add(best_ai)
+            b_used.add(best_bi)
+
+        # ── Step 3: build ordered output ─────────────────────────────────────
+        # Preserve A-side order; B-orphans are appended at the end.
+        b_matched: dict[int, int] = {bi: ai for ai, bi in matches}
+        a_to_b:   dict[int, int] = {ai: bi for ai, bi in matches}
+
+        result: list[tuple[str, str, int | None, int | None]] = []
+        b_emitted: set[int] = set()
+
+        for ai in range(len(a_chunk)):
+            if ai in a_to_b:
+                bi = a_to_b[ai]
+                result.append((a_chunk[ai], b_chunk[bi], ai, bi))
+                b_emitted.add(bi)
+            else:
+                result.append((a_chunk[ai], "", ai, None))   # a-orphan → delete
+
+        for bi in range(len(b_chunk)):
+            if bi not in b_emitted:
+                result.append(("", b_chunk[bi], None, bi))   # b-orphan → insert
+
+        return result
 
     @staticmethod
     def _word_level_rules(a: str, b: str, protect: list[str] | None = None) -> list[dict]:
