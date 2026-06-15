@@ -1,3 +1,58 @@
+
+import pandas as pd
+import string
+
+# Fonction magique pour nettoyer le texte avant comparaison
+def normaliser_texte(texte):
+    if not isinstance(texte, str):
+        return ""
+    # 1. Tout en minuscules
+    texte_clean = texte.lower()
+    # 2. On enlève les guillemets et la ponctuation basique
+    # On garde les lettres et chiffres (on supprime ', ", ., etc.)
+    traducteur = str.maketrans('', '', string.punctuation + "«»'\"’")
+    texte_clean = texte_clean.translate(traducteur)
+    # 3. On nettoie les espaces multiples ou en début/fin
+    return " ".join(texte_clean.split())
+
+# --- VOTRE TRAITEMENT ---
+
+# 1. Remplissage des NaN habituel
+df_clean = df.fillna({'before': '', 'after': '', 'type': ''})
+
+# 2. FILTRE ANTI-BRUIT : On élimine les lignes "fausses modifications"
+# On ne garde la ligne que si le texte nettoyé est DIFFERENT, 
+# OU si ce n'est pas un 'replace' (les inserts et deletes purs restent inchangés)
+masque_vraie_modif = (
+    (df_clean['type'] != 'replace') | 
+    (df_clean['before'].apply(normaliser_texte) != df_clean['after'].apply(normaliser_texte))
+)
+df_real_changes = df_clean[masque_vraie_modif]
+
+# 3. Condensation maximale (le groupby actuel)
+df_condense = df_real_changes.groupby(['type', 'before', 'after'], as_index=False).agg({
+    'DM_code': lambda x: sorted(list(set(x)))
+})
+
+# 4. Affichage du rapport épuré
+print("=== RAPPORT DES VRAIES MODIFICATIONS DETECTEES ===\n")
+
+for index, row in df_condense.iterrows():
+    op_type = row['type']
+    before_val = row['before']
+    after_val = row['after']
+    dm_loc = ", ".join(row['DM_code'])
+    
+    if op_type == 'replace':
+        print(f"- L'élément '{before_val}' a été remplacé par '{after_val}' dans le(s) DM : {dm_loc}.")
+    elif op_type == 'delete':
+        print(f"- L'élément '{before_val}' a été supprimé dans le(s) DM : {dm_loc}.")
+    elif op_type == 'insert':
+        print(f"- L'élément '{after_val}' a été inséré dans le(s) DM : {dm_loc}.")
+
+
+
+
 import pandas as pd
 
 # 1. Nettoyage initial des valeurs manquantes (pour que le groupby fonctionne sans exclure les cellules vides)
