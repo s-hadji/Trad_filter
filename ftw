@@ -1,3 +1,39 @@
+import pandas as pd
+
+# 1. Nettoyage initial des valeurs manquantes (pour que le groupby fonctionne sans exclure les cellules vides)
+df_clean = df.fillna({'before': '', 'after': '', 'type': ''})
+
+# 2. Condensation maximale
+# On groupe par le trio (type, before, after) et on rassemble les DM_code uniques dans une liste triée
+df_condense = df_clean.groupby(['type', 'before', 'after'], as_index=False).agg({
+    'DM_code': lambda x: sorted(list(set(x)))
+})
+
+# 3. Boucle textuelle pour lister et afficher clairement chaque modification
+print("=== RAPPORT DES MODIFICATIONS DETECTEES ===\n")
+
+for index, row in df_condense.iterrows():
+    op_type = row['type']
+    before_val = row['before']
+    after_val = row['after']
+    # On transforme la liste des codes en texte lisible (ex: "CodeA, CodeB")
+    dm_loc = ", ".join(row['DM_code'])
+    
+    # Structure de phrase conditionnelle selon le type d'opcode
+    if op_type == 'replace':
+        phrase = f"- L'élément '{before_val}' a été remplacé par '{after_val}' dans le(s) DM : {dm_loc}."
+    elif op_type == 'delete':
+        phrase = f"- L'élément '{before_val}' a été supprimé dans le(s) DM : {dm_loc}."
+    elif op_type == 'insert':
+        phrase = f"- L'élément '{after_val}' a été inséré dans le(s) DM : {dm_loc}."
+    else:
+        # Sécurité au cas où vous auriez d'autres types d'opcodes cachés
+        phrase = f"- Action [{op_type}] détectée de '{before_val}' vers '{after_val}' dans le(s) DM : {dm_loc}."
+        
+    print(phrase)
+
+
+
 """
 modern_diff.py
 ==============
