@@ -1,4 +1,55 @@
 
+
+import re
+import unicodedata
+
+def nettoyer_texte_expert(texte : str) -> str:
+    """
+    Pipeline complet de prétraitement et normalisation de texte en français.
+    Gère les bugs de clavier, répétitions, lettres isolées et la typographie.
+    """
+    if not texte:
+        return ""
+
+    # 1. Normalisation Unicode (Règle les conflits Mac/Windows, espaces insécables \xa0, etc.)
+    texte = unicodedata.normalize('NFKC', texte)
+    
+    # 2. Standardisation des caractères spéciaux (Apostrophes, guillemets, tirets)
+    texte = re.sub(r"[’‘`´]", "'", texte)
+    texte = re.sub(r"[«»“”]", '"', texte)
+    texte = re.sub(r"[–—]", "-", texte)
+    
+    # 3. Réduction des répétitions abusives (Clavier bloqué ou excès d'enthousiasme)
+    texte = re.sub(r"(\w)\1{2,}", r"\1\1", texte)  # "Merciiii" -> "Merci" (max 2 lettres)
+    texte = re.sub(r"([!?.]){2,}", r"\1", texte)    # "Quoi !!??" -> "Quoi !"
+    
+    # 4. Suppression des lettres isolées (Ta regex optimisée)
+    # Protège les l', d', j', etc., grâce au lookahead (?!\w|')
+    texte = re.sub(r"\b[A-Za-zÀ-ÿ](?!\w|')", "", texte)
+    
+    # 5. Correction des espaces autour de la ponctuation
+    texte = re.sub(r"\s+([,.;?!)])", r"\1", texte) # Supprime l'espace AVANT une virgule, un point, etc.
+    texte = re.sub(r"(\()\s+", r"\1", texte)       # Supprime l'espace APRÈS une parenthèse ouvrante
+    
+    # 6. Nettoyage final des espaces multiples et des bordures
+    texte = re.sub(r"\s+", " ", texte).strip()
+    
+    return texte
+
+
+# --- ZONE DE TEST ---
+if __name__ == "__main__":
+    # Une phrase bien "sale" accumulant tous les problèmes possibles
+    phrase_brute = "  C’est une   bizarre d’ idée... J'ai reçu  un l’arbre  géniaaaal  !!! C'est à a , ( ou presque ) non ?  "
+    
+    phrase_propre = nettoyer_texte_expert(phrase_brute)
+    
+    print("❌ AVANT :", repr(phrase_brute))
+    print("" + "—"*40)
+    print("✅ APRÈS :", repr(phrase_propre))
+
+
+
 import pandas as pd
 import string
 
