@@ -1,3 +1,102 @@
+from typing import Any, Sequence
+
+
+def get_clean_rules(
+    self,
+    fromlines: Sequence[str],
+    tolines: Sequence[str],
+    protect: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    a_lines = [l.rstrip("\n") for l in fromlines]
+    b_lines = [l.rstrip("\n") for l in tolines]
+    blocks = self._build_blocks(a_lines, b_lines)
+    protect = protect or []
+
+    rules: list[dict[str, Any]] = []
+
+    # Accumulateurs pour regrouper les blocs modifiés consécutifs
+    curr_a_lines: list[str] = []
+    curr_b_lines: list[str] = []
+    curr_a_start_ln: int | None = None
+    curr_b_start_ln: int | None = None
+
+    def process_modified_chunk():
+        """Fonction interne pour traiter et diff le paquet de lignes modifiées accumulées."""
+        nonlocal curr_a_lines, curr_b_lines, curr_a_start_ln, curr_b_start_ln
+
+        # Si l'accumulateur est vide (ex: deux blocs 'equal' à la suite), on passe
+        if not curr_a_lines and not curr_b_lines:
+            return
+
+        # --- Traitement du côté A (Source) ---
+        intervals_a = []
+        offset_a = 0
+        for idx, line in enumerate(curr_a_lines):
+            # On enregistre (index_début, index_fin, numéro_de_ligne_réel)
+            intervals_a.append(
+                (offset_a, offset_a + len(line), curr_a_start_ln + idx)
+            )
+            offset_a += len(line) + 1  # +1 pour l'espace de jointure
+        concat_a = " ".join(curr_a_lines)
+
+        # --- Traitement du côté B (Cible) ---
+        intervals_b = []
+        offset_b = 0
+        for idx, line in enumerate(curr_b_lines):
+            intervals_b.append(
+                (offset_b, offset_b + len(line), curr_b_start_ln + idx)
+            )
+            offset_b += len(line) + 1  # +1 pour l'espace de jointure
+        concat_b = " ".join(curr_b_lines)
+
+        def find_line_number(offset: int, intervals: list, default_ln: int) -> int:
+            """Retrouve la ligne d'origine dans le document à partir de l'offset du bloc concaténé."""
+            if not intervals:
+                return default_ln
+            if offset >= intervals[-1][1]:
+                return intervals[-1][2]
+            for start, end, ln in intervals:
+                if start <= offset <= end + 1:
+                    return ln
+            return default_ln
+
+        # Lancement du differ de mots sur les deux chaînes globales de la zone modifiée
+        for rule in self._word_level_rules(concat_a, concat_b, protect):
+            char_start_a = rule["range_a"][0]
+            char_start_b = rule["range_b"][0]
+
+            # Remap les offsets globaux vers les vraies lignes d'origine
+            rule["file_line_a"] = find_line_number(
+                char_start_a, intervals_a, curr_a_start_ln
+            )
+            rule["file_line_b"] = find_line_number(
+                char_start_b, intervals_b, curr_b_start_ln
+            )
+            rules.append(rule)
+
+        # Reset des accumulateurs pour le prochain groupe de modifications
+        curr_a_lines, curr_b_lines = [], []
+        curr_a_start_ln, curr_b_start_ln = None, None
+
+    # --- Boucle principale sur les blocs ---
+    for bl in blocks:
+        if bl.tag == "equal":
+            # On croise une ancre identique : on vide et on traite d'abord l'accumulateur de modifs
+            process_modified_chunk()
+        else:
+            # On accumule les lignes des blocs modifiés (replace, delete, insert)
+            if curr_a_start_ln is None:
+                curr_a_start_ln = bl.a_start
+            if curr_b_start_ln is None:
+                curr_b_start_ln = bl.b_start
+
+            curr_a_lines.extend(bl.a_lines)
+            curr_b_lines.extend(bl.b_lines)
+
+    # Ne pas oublier de vider le dernier groupe si le fichier finit par une modification
+    process_modified_chunk()
+
+    return rules
 
 
 import re
