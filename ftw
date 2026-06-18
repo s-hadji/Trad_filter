@@ -1,4 +1,37 @@
+import difflib
+import re
 from typing import Any, Sequence
+
+
+def protected_positions(self, text: str, patterns: list[str]) -> set[int]:
+    """Retourne les index des espaces protégés (qui ne doivent pas être découpés)."""
+    if not patterns:
+        return set()
+    combined_regex = re.compile("|".join(f"(?:{pat})" for pat in patterns))
+    blocked: set[int] = set()
+    for m in combined_regex.finditer(text):
+        start = m.start()
+        for idx, char in enumerate(m.group(0)):
+            if char == " ":
+                blocked.add(start + idx)
+    return blocked
+
+
+def split_words(self, text: str, blocked: set[int]) -> tuple[list[str], list[int]]:
+    """Découpe proprement en mots selon les espaces non bloqués."""
+    words, offsets = [], []
+    i, length = 0, len(text)
+    while i < length:
+        if text[i] == " " and i not in blocked:
+            i += 1  # Séparateur normal -> on passe
+        else:
+            j = i
+            while j < length and (text[j] != " " or j in blocked):
+                j += 1
+            words.append(text[i:j])
+            offsets.append(i)
+            i = j
+    return words, offsets
 
 
 def get_clean_rules(
@@ -7,10 +40,14 @@ def get_clean_rules(
     tolines: Sequence[str],
     protect: list[str] | None = None,
 ) -> list[dict[str, Any]]:
+    """Compare ligne à ligne, isole les blocs modifiés, les concatène par groupe
+
+    et génère des règles de diff précises au niveau des mots.
+    """
     a_lines = [l.rstrip("\n") for l in fromlines]
     b_lines = [l.rstrip("\n") for l in tolines]
     blocks = self._build_blocks(a_lines, b_lines)
-    protect = protect or []
+    patterns = protect or []
 
     rules: list[dict[str, Any]] = []
 
@@ -21,82 +58,203 @@ def get_clean_rules(
     curr_b_start_ln: int | None = None
 
     def process_modified_chunk():
-        """Fonction interne pour traiter et diff le paquet de lignes modifiées accumulées."""
+        """Sous-fonction : traite l'amas de lignes modifiées accumulées."""
         nonlocal curr_a_lines, curr_b_lines, curr_a_start_ln, curr_b_start_ln
 
-        # Si l'accumulateur est vide (ex: deux blocs 'equal' à la suite), on passe
         if not curr_a_lines and not curr_b_lines:
             return
 
-        # --- Traitement du côté A (Source) ---
+        # 1. Concaténation propre pour le diff global de la zone modifiée
+        concat_a = " ".join(curr_a_lines)
+        concat_b = " ".join(curr_b_lines)
+
+        # 2. Cartographie des index globaux vers le couple original (Ligne, Offset_Local)
         intervals_a = []
         offset_a = 0
         for idx, line in enumerate(curr_a_lines):
-            # On enregistre (index_début, index_fin, numéro_de_ligne_réel)
             intervals_a.append(
                 (offset_a, offset_a + len(line), curr_a_start_ln + idx)
             )
             offset_a += len(line) + 1  # +1 pour l'espace de jointure
-        concat_a = " ".join(curr_a_lines)
 
-        # --- Traitement du côté B (Cible) ---
         intervals_b = []
         offset_b = 0
         for idx, line in enumerate(curr_b_lines):
             intervals_b.append(
                 (offset_b, offset_b + len(line), curr_b_start_ln + idx)
             )
-            offset_b += len(line) + 1  # +1 pour l'espace de jointure
-        concat_b = " ".join(curr_b_lines)
+            offset_b += len(line) + 1
 
-        def find_line_number(offset: int, intervals: list, default_ln: int) -> int:
-            """Retrouve la ligne d'origine dans le document à partir de l'offset du bloc concaténé."""
+        def map_global_to_local(
+            gl_pos: int, intervals: list, default_ln: int
+        ) -> tuple[int, int]:
+            """Retrouve la vraie ligne et le vrai offset de caractère dans le fichier original."""
+            for start_gl, end_gl, line_num in intervals:
+                if start_gl <= gl_pos <= end_gl:
+                    return line_num, gl_pos - start_gl
+                if gl_pos == end_gl + 1:  # Tombe pile sur l'espace de jointure
+                    return line_num, end_gl - start_gl
             if not intervals:
-                return default_ln
-            if offset >= intervals[-1][1]:
-                return intervals[-1][2]
-            for start, end, ln in intervals:
-                if start <= offset <= end + 1:
-                    return ln
-            return default_ln
+                return default_ln, 0
+            if gl_pos < intervals[0][0]:
+                return intervals[0][2], 0
+            return intervals[-1][2], intervals[-1][1] - intervals[-1][0]
 
-        # Lancement du differ de mots sur les deux chaînes globales de la zone modifiée
-        for rule in self._word_level_rules(concat_a, concat_b, protect):
-            char_start_a = rule["range_a"][0]
-            char_start_b = rule["range_b"][0]
+        # 3. Tokenisation de la zone globale
+        blocked_a = self.protected_positions(concat_a, patterns)
+        blocked_b = self.protected_positions(concat_b, patterns)
 
-            # Remap les offsets globaux vers les vraies lignes d'origine
-            rule["file_line_a"] = find_line_number(
-                char_start_a, intervals_a, curr_a_start_ln
+        a_words, a_off = self.split_words(concat_a, blocked_a)
+        b_words, b_off = self.split_words(concat_b, blocked_b)
+
+        # Gestion des cas extrêmes (lignes vides ou pur ajout/suppression)
+        if not a_words and not b_words:
+            return
+        if not a_words:
+            ln_b, off_b = map_global_to_local(0, intervals_b, curr_b_start_ln)
+            rules.append(
+                {
+                    "type": "insert",
+                    "before": "",
+                    "after": concat_b.strip(),
+                    "range_a": (0, 0),
+                    "range_b": (off_b, len(concat_b)),
+                    "file_line_a": curr_a_start_ln,
+                    "file_line_b": ln_b,
+                }
             )
-            rule["file_line_b"] = find_line_number(
-                char_start_b, intervals_b, curr_b_start_ln
+            return
+        if not b_words:
+            ln_a, off_a = map_global_to_local(0, intervals_a, curr_a_start_ln)
+            rules.append(
+                {
+                    "type": "delete",
+                    "before": concat_a.strip(),
+                    "after": "",
+                    "range_a": (off_a, len(concat_a)),
+                    "range_b": (0, 0),
+                    "file_line_a": ln_a,
+                    "file_line_b": curr_b_start_ln,
+                }
             )
-            rules.append(rule)
+            return
 
-        # Reset des accumulateurs pour le prochain groupe de modifications
+        # 4. Exécution du SequenceMatcher au niveau des mots sur le bloc fusionné
+        sm = difflib.SequenceMatcher(None, a_words, b_words, autojunk=False)
+        opcodes = sm.get_opcodes()
+
+        # 5. Fusion des opcodes de modification consécutifs
+        merged: list[tuple] = []
+        for tag, i1, i2, j1, j2 in opcodes:
+            if tag == "equal":
+                merged.append((tag, i1, i2, j1, j2))
+                continue
+            if merged and merged[-1][0] != "equal":
+                pt, pi1, _, pj1, _ = merged[-1]
+                merged[-1] = ("replace", pi1, i2, pj1, j2)
+            else:
+                merged.append((tag, i1, i2, j1, j2))
+
+        # 6. Génération des règles finales remappées
+        for tag, i1, i2, j1, j2 in merged:
+            if tag == "equal":
+                continue
+
+            before = " ".join(a_words[i1:i2])
+            after = " ".join(b_words[j1:j2])
+
+            if before == after:
+                continue
+
+            # Calcul initial des index globaux basés sur les offsets réels de split_words
+            a_start = a_off[i1] if i1 < len(a_off) else len(concat_a)
+            a_end = a_off[i2 - 1] + len(a_words[i2 - 1]) if i2 > 0 else a_start
+            b_start = b_off[j1] if j1 < len(b_off) else len(concat_b)
+            b_end = b_off[j2 - 1] + len(b_words[j2 - 1]) if j2 > 0 else b_start
+
+            kind = (
+                "replace"
+                if before and after
+                else ("delete" if before else "insert")
+            )
+
+            # Nettoyage des caractères non-alphanumériques identiques aux extrémités
+            if kind == "replace":
+                orig_len_before = len(before)
+                orig_len_after = len(after)
+
+                s = 0
+                while (
+                    s < len(before)
+                    and s < len(after)
+                    and before[s] == after[s]
+                    and not before[s].isalnum()
+                ):
+                    s += 1
+                ea, eb = len(before), len(after)
+                while (
+                    ea > s
+                    and eb > s
+                    and before[ea - 1] == after[eb - 1]
+                    and not before[ea - 1].isalnum()
+                ):
+                    ea -= 1
+                    eb -= 1
+
+                before = before[s:ea]
+                after = after[s:eb]
+
+                # Ajustement mathématique propre des offsets globaux
+                a_start += s
+                b_start += s
+                a_end -= orig_len_before - ea
+                b_end -= orig_len_after - eb
+
+                if not before and not after:
+                    continue
+
+            # Traduction des index globaux vers les coordonnées réelles par ligne
+            line_a_start, local_a_start = map_global_to_local(
+                a_start, intervals_a, curr_a_start_ln
+            )
+            _, local_a_end = map_global_to_local(a_end, intervals_a, curr_a_start_ln)
+
+            line_b_start, local_b_start = map_global_to_local(
+                b_start, intervals_b, curr_b_start_ln
+            )
+            _, local_b_end = map_global_to_local(b_end, intervals_b, curr_b_start_ln)
+
+            rules.append(
+                {
+                    "type": kind,
+                    "before": before,
+                    "after": after,
+                    "range_a": (local_a_start, local_a_end),
+                    "range_b": (local_b_start, local_b_end),
+                    "file_line_a": line_a_start,
+                    "file_line_b": line_b_start,
+                }
+            )
+
+        # Reset des accumulateurs pour la prochaine séquence modifiée
         curr_a_lines, curr_b_lines = [], []
         curr_a_start_ln, curr_b_start_ln = None, None
 
-    # --- Boucle principale sur les blocs ---
+    # --- Boucle principale sur l'analyse de blocs de lignes ---
     for bl in blocks:
         if bl.tag == "equal":
-            # On croise une ancre identique : on vide et on traite d'abord l'accumulateur de modifs
-            process_modified_chunk()
+            process_modified_chunk()  # Rencontre d'une ancre : on traite ce qui a changé avant
         else:
-            # On accumule les lignes des blocs modifiés (replace, delete, insert)
             if curr_a_start_ln is None:
                 curr_a_start_ln = bl.a_start
             if curr_b_start_ln is None:
                 curr_b_start_ln = bl.b_start
-
             curr_a_lines.extend(bl.a_lines)
             curr_b_lines.extend(bl.b_lines)
 
-    # Ne pas oublier de vider le dernier groupe si le fichier finit par une modification
-    process_modified_chunk()
-
+    process_modified_chunk()  # Traitement du reliquat si le fichier finit sur une modif
     return rules
+
 
 
 import re
