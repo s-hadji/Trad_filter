@@ -8,6 +8,55 @@ def extraire_bloc_maintenance(texte_source):
     kw_milieu_2 = "Procédure"
     kw_fin = "Tâches de fin"
     
+    # 2. Isolation de la zone avec [\s\S]*? (qui capture AUSSI les retours à la ligne \n)
+    # On ajoute re.IGNORECASE au cas où une majuscule aurait sauté
+    pattern_zone = rf"({kw_debut}[\s\S]*?{kw_fin}\s*:\s*[^\\\n]*)"
+    match_zone = re.search(pattern_zone, texte_source, re.IGNORECASE)
+    
+    if not match_zone:
+        print("❌ Étape 1 échouée : Impossible d'isoler la zone entre le début et la fin.")
+        return {"sous_chaine": None, "extractions": None}
+        
+    sous_chaine = match_zone.group(1)
+    
+    # 3. Validation de sécurité (insensible à la casse)
+    mots_cles = [kw_debut, kw_milieu_1, kw_milieu_2, kw_fin]
+    if not all(kw.lower() in sous_chaine.lower() for kw in mots_cles):
+        print("❌ Étape 2 échouée : Tous les mots-clés ne sont pas dans la zone.")
+        print(f"Zone capturée pour vérification : {repr(sous_chaine)}")
+        return {"sous_chaine": sous_chaine, "extractions": None}
+        
+    # 4. Extraction des temps (plus permissive sur les espaces)
+    res_prelim = re.search(rf"{kw_milieu_1}\s*:\s*([^,\\\n]*)", sous_chaine, re.IGNORECASE)
+    res_proc = re.search(rf"{kw_milieu_2}\s*:\s*([^,\\\n]*)", sous_chaine, re.IGNORECASE)
+    res_fin = re.search(rf"{kw_fin}\s*:\s*([^,\\\n]*)", sous_chaine, re.IGNORECASE)
+    
+    def nettoyer_valeur(match_obj):
+        if match_obj and match_obj.group(1).strip():
+            return match_obj.group(1).strip()
+        return None
+
+    # 5. Renvoi du dictionnaire final
+    print("✅ Extraction réussie avec succès !")
+    return {
+        "sous_chaine": sous_chaine,
+        "extractions": {
+            kw_milieu_1: nettoyer_valeur(res_prelim),
+            kw_milieu_2: nettoyer_valeur(res_proc),
+            kw_fin: nettoyer_valeur(res_fin)
+        }
+    }
+
+
+import re
+
+def extraire_bloc_maintenance(texte_source):
+    # 1. Définition des mots-clés
+    kw_debut = "Durée de la tâche de maintenance"
+    kw_milieu_1 = "Tâches préliminaires"
+    kw_milieu_2 = "Procédure"
+    kw_fin = "Tâches de fin"
+    
     # Structure de retour par défaut (si échec)
     resultat_defaut = {
         "sous_chaine": None,
