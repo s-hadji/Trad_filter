@@ -1,3 +1,60 @@
+
+import re
+
+def extraire_bloc_maintenance(texte_source):
+    # 1. Définition des mots-clés
+    kw_debut = "Durée de la tâche de maintenance"
+    kw_milieu_1 = "Tâches préliminaires"
+    kw_milieu_2 = "Procédure"
+    kw_fin = "Tâches de fin"
+    
+    # Structure de retour par défaut (si échec)
+    resultat_defaut = {
+        "sous_chaine": None,
+        "extractions": {
+            kw_milieu_1: None,
+            kw_milieu_2: None,
+            kw_fin: None
+        }
+    }
+    
+    # 2. Isolation de la sous-chaîne cible
+    pattern_zone = rf"({kw_debut}.*?{kw_fin}:[^\\\n]*)"
+    match_zone = re.search(pattern_zone, texte_source)
+    
+    if not match_zone:
+        return resultat_defaut  # Zone introuvable
+        
+    sous_chaine = match_zone.group(1)
+    
+    # 3. Validation de sécurité : tous les mots-clés doivent y être
+    mots_cles = [kw_debut, kw_milieu_1, kw_milieu_2, kw_fin]
+    if not all(kw in sous_chaine for kw in mots_cles):
+        return resultat_defaut  # Mots-clés manquants ou éparpillés ailleurs
+        
+    # 4. Extraction des temps (avec gestion du None si le pattern rate ou est vide)
+    res_prelim = re.search(rf"{kw_milieu_1}\s*:\s*([^,]*)\s*", sous_chaine)
+    res_proc = re.search(rf"{kw_milieu_2}\s*:\s*([^,]*)\s*", sous_chaine)
+    res_fin = re.search(rf"{kw_fin}\s*:\s*([^,\\\n]*)\s*", sous_chaine)
+    
+    def nettoyer_valeur(match_obj):
+        if match_obj and match_obj.group(1).strip():
+            return match_obj.group(1).strip()
+        return None
+
+    # 5. Construction du dictionnaire final
+    return {
+        "sous_chaine": sous_chaine,
+        "extractions": {
+            kw_milieu_1: nettoyer_valeur(res_prelim),
+            kw_milieu_2: nettoyer_valeur(res_proc),
+            kw_fin: nettoyer_valeur(res_fin)
+        }
+    }
+
+
+
+
 import difflib
 import re
 from typing import Any, Sequence
