@@ -1,3 +1,44 @@
+import pandas as pd
+from thefuzz import fuzz
+
+# 1. Création d'un dataset d'exemple avec des fautes et des variantes
+data = {
+    'nom_entreprise': ['Apple Inc.', 'Apple', 'Google LLC', 'Google', 'Gogle', 'Microsoft Corp', 'Micro-soft', 'Amazon', 'Amazon.com']
+}
+df = pd.DataFrame(data)
+
+# 2. Fonction de regroupement flou
+def regrouper_par_similarite(colonne, seuil=70):
+    # On travaille uniquement sur les valeurs uniques pour économiser les calculs
+    valeurs_uniques = list(colonne.dropna().unique())
+    dictionnaire_groupes = {}
+
+    while valeurs_uniques:
+        # On prend la première valeur comme "Nom de référence" du groupe
+        reference = valeurs_uniques.pop(0)
+        dictionnaire_groupes[reference] = reference
+        
+        proches = []
+        for valeur in valeurs_uniques:
+            # token_sort_ratio ignore l'ordre des mots, les majuscules et la ponctuation
+            score = fuzz.token_sort_ratio(reference, valeur)
+            
+            if score >= seuil:
+                proches.append(valeur)
+        
+        # On associe les éléments proches au nom de référence
+        for proche in proches:
+            dictionnaire_groupes[proche] = reference
+            valeurs_uniques.remove(proche) # On les retire pour ne pas les retraiter
+            
+    # On applique le dictionnaire de correspondance sur toute la colonne initiale
+    return colonne.map(dictionnaire_groupes)
+
+# 3. Application de la fonction (Seuil à 70%)
+df['groupe_nettoye'] = regrouper_par_similarite(df['nom_entreprise'], seuil=70)
+
+# 4. Affichage du résultat regroupé
+print(df.sort_values(by='groupe_nettoye'))
 
 import re
 
