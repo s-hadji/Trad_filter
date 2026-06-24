@@ -1,44 +1,89 @@
 import pandas as pd
-from thefuzz import fuzz
 
-# 1. Création d'un dataset d'exemple avec des fautes et des variantes
-data = {
-    'nom_entreprise': ['Apple Inc.', 'Apple', 'Google LLC', 'Google', 'Gogle', 'Microsoft Corp', 'Micro-soft', 'Amazon', 'Amazon.com']
-}
-df = pd.DataFrame(data)
-
-# 2. Fonction de regroupement flou
-def regrouper_par_similarite(colonne, seuil=70):
-    # On travaille uniquement sur les valeurs uniques pour économiser les calculs
-    valeurs_uniques = list(colonne.dropna().unique())
-    dictionnaire_groupes = {}
-
-    while valeurs_uniques:
-        # On prend la première valeur comme "Nom de référence" du groupe
-        reference = valeurs_uniques.pop(0)
-        dictionnaire_groupes[reference] = reference
+def condenser_valeurs_after(series_after):
+    """
+    Prend une liste de chaînes 'after' et détecte automatiquement la partie 
+    commune (prefixe/suffixe) pour ne lister que les éléments uniques qui changent.
+    """
+    valeurs = sorted(list(set(series_after.astype(str))))
+    if not valeurs:
+        return ""
+    if len(valeurs) == 1:
+        return valeurs[0]
         
-        proches = []
-        for valeur in valeurs_uniques:
-            # token_sort_ratio ignore l'ordre des mots, les majuscules et la ponctuation
-            score = fuzz.token_sort_ratio(reference, valeur)
+    # 1. Trouver le plus long préfixe commun
+    prefixe = ""
+    taille_min = min(len(s) for s in valeurs)
+    for i in range(taille_min):
+        char = valeurs[0][i]
+        if all(s[i] == char for s in valeurs):
+            prefixe += char
+        else:
+            break
             
-            if score >= seuil:
-                proches.append(valeur)
+    # 2. Trouver le plus long suffixe commun
+    suffixe = ""
+    for i in range(1, taille_min - len(prefixe) + 1):
+        char = valeurs[0][-i]
+        if all(s[-i] == char for s in valeurs):
+            suffixe = char + suffixe
+        else:
+            break
+            
+    # 3. Extraire uniquement la partie qui change (la variable unique)
+    elements_uniques = []
+    len_pre = len(prefixe)
+    len_suf = len(suffixe)
+    
+    for s in valeurs:
+        fin_idx = len(s) - len_suf if len_suf > 0 else len(s)
+        variable = s[len_pre:fin_idx].strip()
+        if variable:
+            elements_uniques.append(variable)
+            
+    if elements_uniques:
+        # Tri intelligent : numérique si ce sont des chiffres, sinon alphabétique
+        try:
+            elements_uniques = sorted(list(set(elements_uniques)), key=lambda x: int(x))
+        except ValueError:
+            elements_uniques = sorted(list(set(elements_uniques)))
+            
+        # Si on a trouvé un pattern commun (ex: "wing (rep. " et ")")
+        if prefixe or suffixe:
+            return f"{prefixe}{', '.join(elements_uniques)}{suffixe}"
+        else:
+            # Si aucun point commun (ex: deux mots totalement différents), on les liste simplement
+            return " / ".join(valeurs)
+            
+    return prefixe + suffixe
+
+# --- APPLICATION SUR TON DATAFRAME ---
+
+# On groupe uniquement par 'type' et 'before' 
+# (ce qui nous permet de fusionner les différents 'after' d'un même élément)
+df_condense = df.groupby(['type', 'before'], as_index=False).agg({
+    'after': lambda x: condenser_valeurs_after(x),
+    'DM_code': lambda x: sorted(list(set(x)))
+}).sort_values('before')
+
+print("RAPPORT DES MODIFICATIONS AUTOMATIQUEMENT CONDENSÉ\n")
+
+for index, row in df_condense.iterrows():
+    op_type = row['type']
+    before_val = row['before']
+    after_val = row['after']
+    dm_loc = ", ".join(row['DM_code'])
+    
+    if op_type == 'replace':
+        phrase = f"- un élément '{before_val}' a été remplacé par '{after_val}' dans le(s) DM : {dm_loc}."
+    elif op_type == 'delete':
+        phrase = f"- un élément '{before_val}' a été supprimé dans le(s) DM : {dm_loc}."
+    elif op_type == 'insert':
+        phrase = f"- un élément '{after_val}' a été inséré dans le(s) DM : {dm_loc}."
+    else:
+        phrase = f"- Action [{op_type}] détectée de '{before_val}' vers '{after_val}' dans le(s) DM : {dm_loc}."
         
-        # On associe les éléments proches au nom de référence
-        for proche in proches:
-            dictionnaire_groupes[proche] = reference
-            valeurs_uniques.remove(proche) # On les retire pour ne pas les retraiter
-            
-    # On applique le dictionnaire de correspondance sur toute la colonne initiale
-    return colonne.map(dictionnaire_groupes)
-
-# 3. Application de la fonction (Seuil à 70%)
-df['groupe_nettoye'] = regrouper_par_similarite(df['nom_entreprise'], seuil=70)
-
-# 4. Affichage du résultat regroupé
-print(df.sort_values(by='groupe_nettoye'))
+    print(phrase)
 
 import re
 
