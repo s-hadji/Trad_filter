@@ -1,5 +1,24 @@
 import pandas as pd
 
+# Exemple de DataFrame calqué sur tes données
+df_clean = pd.DataFrame({
+    'before': ["wing)voir", "EG-G-72", "support"],
+    'type': ["replace", "replace", "delete"]
+})
+
+# Ta regex avec les 3 groupes de capture
+pattern = r"([a-zA-Z0-9]+)([)-])([a-zA-Z0-9]+)"
+
+# Application du remplacement avec l'espace inséré
+df_clean['before'] = df_clean['before'].str.replace(pattern, r"\1\2 \3", regex=True)
+
+print(df_clean)
+
+
+
+
+import pandas as pd
+
 def condenser_valeurs_after(series_after):
     """
     Prend une liste de chaînes 'after' et détecte automatiquement la partie 
