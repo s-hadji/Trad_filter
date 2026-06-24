@@ -1,4 +1,38 @@
 
+
+import re
+import pandas as pd
+
+def nettoyage_texte_complet(texte):
+    if not isinstance(texte, str):
+        return texte
+        
+    # Étape 1 : Séparer les mots collés (ex: wingVoir -> wing Voir)
+    texte = re.sub(r'([a-z])([A-Z])', r'\1 \2', texte)
+    
+    # Étape 2 : Supprimer les parenthèses fermantes orphelines (ex: wing) -> wing)
+    texte = re.sub(r'(?<!\([^()]*)\)', '', texte)
+    
+    # Étape 3 : Supprimer les parenthèses ouvrantes orphelines (ex: (wing -> wing)
+    texte = re.sub(r'\((?![^()]*\))', '', texte)
+    
+    return texte.strip()
+
+# --- EXEMPLE SUR UN DATAFRAME ---
+df_test = pd.DataFrame({
+    'before': ["wing)voir", "(support", "ailePrincipale", "yoke(rep. 1)"]
+})
+
+# Application directe sur la colonne
+df_test['before_clean'] = df_test['before'].apply(nettoyage_texte_complet)
+
+print(df_test)
+
+
+
+
+
+
 import re
 
 text = "wing)voir"
