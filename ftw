@@ -1,51 +1,77 @@
 
 
+
 import re
 import unicodedata
 
+def corriger_parentheses_orphelines(texte):
+    """Supprime proprement les parenthèses non appairées sans utiliser de look-behind variable."""
+    # Passe 1 : On supprime les ')' en trop de gauche à droite
+    etape1 = []
+    ouvertes = 0
+    for char in texte:
+        if char == '(':
+            ouvertes += 1
+            etape1.append(char)
+        elif char == ')':
+            if ouvertes > 0:
+                ouvertes -= 1
+                etape1.append(char)
+            # Si ouvertes == 0, on ignore simplement la ')' orpheline
+        else:
+            etape1.append(char)
+            
+    # Passe 2 : On supprime les '(' en trop de droite à gauche
+    resultat_final = []
+    fermees = 0
+    for char in reversed(etape1):
+        if char == ')':
+            fermees += 1
+            resultat_final.append(char)
+        elif char == '(':
+            if fermees > 0:
+                fermees -= 1
+                resultat_final.append(char)
+            # Si fermees == 0, on ignore la '(' orpheline
+        else:
+            resultat_final.append(char)
+            
+    return "".join(reversed(resultat_final))
+
 
 def nettoyer_texte(texte, ensemble_symboles=r")-"):
-    """Nettoie une chaîne de caractères en profondeur (Clean ASCII, normalisation,
-
-    séparation des mots collés, gestion des symboles et parenthèses).
-    """
+    """Nettoie, harmonise et standardise une chaîne de caractères."""
     if not isinstance(texte, str):
         return texte
 
-    # --- ÉTAPE 1 : CLEAN ASCII & NORMALISATION UNICODE ---
-    # Normalisation standard (NFKC) pour homogénéiser les caractères équivalents
-    texte = unicodedata.normalize("NFKC", texte)
+    # --- ÉTAPE 1 : DIAGNOSTIC (OPTIONNEL) ---
+    anomalies = analyser_anomalies(texte)
+    if anomalies:
+        # Tu peux remplacer ce print par un système de log si besoin
+        print(f"[INFO] Anomalies détectées avant nettoyage : {anomalies}")
 
-    # Suppression du ZWSP (Zero Width Space) et du BOM (Byte Order Mark)
+    # --- ÉTAPE 2 : NETTOYAGE DES CARACTÈRES INVISIBLES EN BRUT ---
     texte = texte.replace("\u200b", "").replace("\ufeff", "")
-
-    # Remplacement du NBSP (Non-Breaking Space / \xa0) par un espace standard
     texte = texte.replace("\u00a0", " ").replace("\xa0", " ")
 
-    # --- ÉTAPE 2 : SÉPARATION DES MOTS COLLÉS (CamelCase) ---
-    # Exemple : "ailePrincipale" -> "aile Principale"
-    texte = re.sub(r"([a-z])([A-Z])", r"\1 \2", texte)
+    # --- ÉTAPE 3 : NORMALISATION STANDARD ---
+    texte = unicodedata.normalize("NFKC", text)
 
-    # --- ÉTAPE 3 : HARMONISATION DES SYMBOLES (Espace après symbole) ---
-    # Insère un espace si un symbole de l'ensemble est pris en sandwich sans espace
-    # Exemple : "wing)voir" -> "wing) voir"
+    # --- ÉTAPE 4 : SÉPARATION DES MOTS COLLÉS (CamelCase) ---
+    texte = re.sub(r'([a-z])([A-Z])', r'\1 \2', texte)
+
+    # --- ÉTAPE 5 : HARMONISATION DES SYMBOLES PRIS EN SANDWICH ---
+    # Correction de la regex pour avoir exactement les 3 groupes nécessaires
     pattern_symbole = rf"([a-zA-Z0-9]+)([{ensemble_symboles}])([a-zA-Z0-9]+)"
     texte = re.sub(pattern_symbole, r"\1\2 \3", texte)
 
-    # --- ÉTAPE 4 : CORRECTION DES PARENTHÈSES ORPHELINES ---
-    # Supprime les ')' qui n'ont pas de '(' correspondante avant
-    texte = re.sub(r"(?<!\([^()]*)\)", "", texte)
-    # Supprime les '(' qui n'ont pas de ')' correspondante après
-    texte = re.sub(r"\((?![^()]*\))", "", texte)
+    # --- ÉTAPE 6 : CORRECTION DES PARENTHÈSES (Via notre algo sûr) ---
+    texte = corriger_parentheses_orphelines(texte)
 
-    # --- ÉTAPE 5 : HARMONISATION DES ESPACES ---
-    # Remplace les multi-espaces, tabulations ou retours à la ligne par un seul espace
-    texte = re.sub(r"\s+", " ", texte)
+    # --- ÉTAPE 7 : HARMONISATION DES ESPACES ---
+    texte = re.sub(r'\s+', ' ', texte)
 
-    # Retrait des espaces inutiles au tout début et à la fin
     return texte.strip()
-
-
 
 
 
