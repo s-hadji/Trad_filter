@@ -1,6 +1,57 @@
 
 
 import re
+import unicodedata
+
+
+def nettoyer_texte(texte, ensemble_symboles=r")-"):
+    """Nettoie une chaîne de caractères en profondeur (Clean ASCII, normalisation,
+
+    séparation des mots collés, gestion des symboles et parenthèses).
+    """
+    if not isinstance(texte, str):
+        return texte
+
+    # --- ÉTAPE 1 : CLEAN ASCII & NORMALISATION UNICODE ---
+    # Normalisation standard (NFKC) pour homogénéiser les caractères équivalents
+    texte = unicodedata.normalize("NFKC", texte)
+
+    # Suppression du ZWSP (Zero Width Space) et du BOM (Byte Order Mark)
+    texte = texte.replace("\u200b", "").replace("\ufeff", "")
+
+    # Remplacement du NBSP (Non-Breaking Space / \xa0) par un espace standard
+    texte = texte.replace("\u00a0", " ").replace("\xa0", " ")
+
+    # --- ÉTAPE 2 : SÉPARATION DES MOTS COLLÉS (CamelCase) ---
+    # Exemple : "ailePrincipale" -> "aile Principale"
+    texte = re.sub(r"([a-z])([A-Z])", r"\1 \2", texte)
+
+    # --- ÉTAPE 3 : HARMONISATION DES SYMBOLES (Espace après symbole) ---
+    # Insère un espace si un symbole de l'ensemble est pris en sandwich sans espace
+    # Exemple : "wing)voir" -> "wing) voir"
+    pattern_symbole = rf"([a-zA-Z0-9]+)([{ensemble_symboles}])([a-zA-Z0-9]+)"
+    texte = re.sub(pattern_symbole, r"\1\2 \3", texte)
+
+    # --- ÉTAPE 4 : CORRECTION DES PARENTHÈSES ORPHELINES ---
+    # Supprime les ')' qui n'ont pas de '(' correspondante avant
+    texte = re.sub(r"(?<!\([^()]*)\)", "", texte)
+    # Supprime les '(' qui n'ont pas de ')' correspondante après
+    texte = re.sub(r"\((?![^()]*\))", "", texte)
+
+    # --- ÉTAPE 5 : HARMONISATION DES ESPACES ---
+    # Remplace les multi-espaces, tabulations ou retours à la ligne par un seul espace
+    texte = re.sub(r"\s+", " ", texte)
+
+    # Retrait des espaces inutiles au tout début et à la fin
+    return texte.strip()
+
+
+
+
+
+
+
+import re
 import pandas as pd
 
 def nettoyage_texte_complet(texte):
