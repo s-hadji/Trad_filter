@@ -1,4 +1,25 @@
 
+import unicodedata
+
+def analyser_anomalies(texte):
+    """Analyse le texte et renvoie la liste des problèmes invisibles détectés."""
+    rapport = []
+    
+    if "\u200b" in texte:
+        rapport.append("ZWSP (Zero Width Space - Espace invisible)")
+    if "\xa0" in texte or "\u00a0" in texte:
+        rapport.append("NBSP (Non-Breaking Space - Espace insécable)")
+    if "\ufeff" in texte:
+        rapport.append("BOM (Byte Order Mark - Caractère invisible d'encodage)")
+        
+    # Détection plus large via les catégories Unicode
+    for char in texte:
+        cat = unicodedata.category(char)
+        # Cf = Format (invisible), Cc = Control (retours chariots bizarres, etc.)
+        if cat == "Cf" and char != "\u200b":
+            rapport.append(f"Caractère de format masqué : {repr(char)}")
+            
+    return list(set(rapport)) # Renvoie les anomalies uniques trouvées
 
 
 import re
