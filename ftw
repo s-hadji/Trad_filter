@@ -1,3 +1,21 @@
+
+import re
+
+text = "wing)voir"
+
+#  Groupe 1       Groupe 2     Groupe 3
+#     👇            👇            👇
+pattern = r"([a-zA-Z0-9]+)([)-])([a-zA-Z0-9]+)"
+
+# Ici \3 fonctionnera parfaitement maintenant
+text_modifie = re.sub(pattern, r"\1\2 \3", text)
+
+print(text_modifie)
+# Résultat : wing) voir
+
+
+
+
 import pandas as pd
 
 # Exemple de DataFrame calqué sur tes données
