@@ -1,4 +1,172 @@
 
+import os
+import json
+import pandas as pd
+from typing import List
+from pydantic import BaseModel, Field
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+
+# =====================================================================
+# 1. CONFIGURATION ET DONNÉES DE TEST
+# =====================================================================
+
+# Assurez-vous que votre clé API est définie (décommentez si nécessaire)
+# os.environ["OPENAI_API_KEY"] = "sk-..."
+
+# Simulation d'un DataFrame de modifications pour tester le script
+data = {
+    'type': ['replace', 'replace', 'delete', 'insert', 'replace'],
+    'before': ['wing (rep. 1)', 'wing (rep. 1)', 'old_valve', '', 'sensor_v1'],
+    'after': ['wing (rep. 2)', 'wing (rep. 3)', '', 'new_pump_4', 'sensor_v2'],
+    'DM_code': ['DM-001', 'DM-002', 'DM-003', 'DM-004', 'DM-001']
+}
+df = pd.DataFrame(data)
+
+# =====================================================================
+# 2. VOTRE FONCTION DE CONDENSATION PANDAS
+# =====================================================================
+
+def condenser_valeurs_after(series_after):
+    """
+    Prend une liste de chaînes 'after' et détecte automatiquement la partie 
+    commune (prefixe/suffixe) pour ne lister que les éléments uniques qui changent.
+    """
+    valeurs = sorted(list(set(series_after.astype(str))))
+    if not valeurs:
+        return ""
+    if len(valeurs) == 1:
+        return valeurs[0]
+        
+    # 1. Trouver le plus long préfixe commun
+    prefixe = ""
+    taille_min = min(len(s) for s in valeurs)
+    for i in range(taille_min):
+        char = valeurs[0][i]
+        if all(s[i] == char for s in valeurs):
+            prefixe += char
+        else:
+            break
+            
+    # 2. Trouver le plus long suffixe commun
+    suffixe = ""
+    for i in range(1, taille_min - len(prefixe) + 1):
+        char = valeurs[0][-i]
+        if all(s[-i] == char for s in valeurs):
+            suffixe = char + suffixe
+        else:
+            break
+            
+    # 3. Extraire uniquement la partie qui change (la variable unique)
+    elements_uniques = []
+    len_pre = len(prefixe)
+    len_suf = len(suffixe)
+    
+    for s in valeurs:
+        fin_idx = len(s) - len_suf if len_suf > 0 else len(s)
+        variable = s[len_pre:fin_idx].strip()
+        if variable:
+            elements_uniques.append(variable)
+            
+    if elements_uniques:
+        try:
+            elements_uniques = sorted(list(set(elements_uniques)), key=lambda x: int(x))
+        except ValueError:
+            elements_uniques = sorted(list(set(elements_uniques)))
+            
+        if prefixe or suffixe:
+            return f"{prefixe}{', '.join(elements_uniques)}{suffixe}"
+        else:
+            return " / ".join(valeurs)
+            
+    return prefixe + suffixe
+
+# =====================================================================
+# 3. MODÈLES PYDANTIC POUR LE LLM STRUCTURÉ
+# =====================================================================
+
+class ModificationCommentee(BaseModel):
+    type_action: str = Field(description="Le type d'action : replace, delete, insert, etc.")
+    before: str = Field(description="La valeur d'origine avant modification")
+    after_condensed: str = Field(description="La ou les valeurs condensées après modification")
+    dm_codes: List[str] = Field(description="Liste des codes DM impactés")
+    analyse_metier: str = Field(description="Commentaire explicatif de cette modification sur le plan technique.")
+    criticite: str = Field(description="Niveau de criticité estimé (Faible, Moyen, Élevé)")
+
+class BatchAnalyseModifications(BaseModel):
+    """Conteneur racine pour recevoir le lot de modifications traité par le LLM"""
+    modifications: List[ModificationCommentee] = Field(description="Liste des modifications analysées")
+    resume_global_batch: str = Field(description="Synthèse macro des intentions de ce lot de modifications")
+
+# =====================================================================
+# 4. INITIALISATION DE LA CHAÎNE LANGCHAIN
+# =====================================================================
+
+llm = ChatOpenAI(model="gpt-4o", temperature=0.2)
+llm_structure = llm.with_structured_output(BatchAnalyseModifications)
+
+prompt_template = ChatPromptTemplate.from_messages([
+    ("system", """Vous êtes un expert en ingénierie système et gestion de configuration.
+Votre rôle est d'analyser un lot de modifications de données techniques préalablement condensées.
+Pour chaque ligne, rédigez une analyse métier concise et déterminez le niveau de criticité.
+Vous devez impérativement retourner la structure JSON demandée."""),
+    ("user", "Voici le lot de modifications condensées à analyser :\n\n{donnees_batch}")
+])
+
+chain = prompt_template | llm_structure
+
+# =====================================================================
+# 5. PIPELINE DE TRAITEMENT ET EXÉCUTION EN BATCH
+# =====================================================================
+
+# Étape A : On applique votre logique de condensation Pandas
+df_condense = df.groupby(['type', 'before'], as_index=False).agg({
+    'after': lambda x: condenser_valeurs_after(x),
+    'DM_code': lambda x: sorted(list(set(x)))
+}).sort_values('before')
+
+# Étape B : Transformation du DataFrame en liste de dictionnaires pour le prompt
+lignes_a_traiter = []
+for _, row in df_condense.iterrows():
+    lignes_a_traiter.append({
+        "type_action": row['type'],
+        "before": row['before'],
+        "after_condensed": row['after'],
+        "dm_codes": row['DM_code']
+    })
+
+# Étape C : Découpage en lots (batches) et appel du LLM
+TAILLE_BATCH = 10
+tous_les_resultats_pydantic = []
+
+print("=== DEBUT DE L'ANALYSE DES MODIFICATIONS ===\n")
+
+for i in range(0, len(lignes_a_traiter), TAILLE_BATCH):
+    batch = lignes_a_traiter[i:i + TAILLE_BATCH]
+    print(f"--- Traitement du Batch {(i // TAILLE_BATCH) + 1} ({len(batch)} ligne(s)) ---")
+    
+    # Sérialisation propre pour injection dans le prompt
+    donnees_batch_str = json.dumps(batch, ensure_ascii=False, indent=2)
+    
+    # Appel de l'API OpenAI (Retourne automatiquement un objet BatchAnalyseModifications)
+    resultat_batch = chain.invoke({"donnees_batch": donnees_batch_str})
+    tous_les_resultats_pydantic.append(resultat_batch)
+    
+    # Affichage du rapport généré en temps réel
+    print(f"Résumé global : {resultat_batch.resume_global_batch}\n")
+    for modif in resultat_batch.modifications:
+        print(f"[{modif.criticite.upper()}] Action: {modif.type_action}")
+        print(f"  • Avant : {modif.before if modif.before else '(vide)'}")
+        print(f"  • Après : {modif.after_condensed if modif.after_condensed else '(supprimé)'}")
+        print(f"  • DM Concernés : {', '.join(modif.dm_codes)}")
+        print(f"  • Analyse : {modif.analyse_metier}")
+        print("-" * 40)
+    print("\n")
+
+print("=== ANALYSE TERMINÉE ===")
+
+
+
 import unicodedata
 
 def analyser_anomalies(texte):
