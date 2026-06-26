@@ -2,6 +2,113 @@
 import os
 import json
 import pandas as pd
+from typing import List, Optional
+from pydantic import BaseModel, Field
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+
+# =====================================================================
+# 1. SCHÉMA PYDANTIC RE-PENSÉ (LÉGER ET ROBUSTE)
+# =====================================================================
+
+class AnalyseItem(BaseModel):
+    # On ne demande que l'ID et ce que le LLM doit générer
+    id_modification: str = Field(description="L'identifiant unique fourni dans l'input (ex: mod_0, mod_1...)")
+    analyse_metier: str = Field(description="Commentaire explicatif de cette modification.")
+    criticite: str = Field(description="Niveau de criticité (Faible, Moyen, Élevé)")
+
+class BatchAnalyseModifications(BaseModel):
+    """Le LLM ne renvoie qu'une liste d'analyses liées à des IDs"""
+    resume_global_batch: str = Field(description="Synthèse macro des intentions de ce lot")
+    analyses: List[AnalyseItem] = Field(description="Liste des analyses pour chaque ID")
+
+# =====================================================================
+# 2. CONFIGURATION DE LA CHAÎNE
+# =====================================================================
+
+llm = ChatOpenAI(model="gpt-4o", temperature=0.2)
+# On lie le nouveau schéma léger
+llm_structure = llm.with_structured_output(BatchAnalyseModifications)
+
+prompt_template = ChatPromptTemplate.from_messages([
+    ("system", """Vous êtes un expert en gestion de configuration.
+Pour chaque identifiant de modification fourni, donnez une analyse métier et une criticité.
+Respectez strictement le format de sortie JSON. Ne modifiez pas et n'inventez pas d'identifiants."""),
+    ("user", "Voici les modifications à analyser :\n\n{donnees_batch}")
+])
+
+chain = prompt_template | llm_structure
+
+# =====================================================================
+# 3. PRÉPARATION DES DONNÉES AVEC DES ID
+# =====================================================================
+
+# (Ici ton df_condense obtenu via ta fonction de condensation)
+# Pour l'exemple, on crée un faux df_condense
+df_condense = pd.DataFrame({
+    'type': ['replace', 'delete', 'insert'],
+    'before': ['wing (rep. 1)', 'old_valve', ''],
+    'after': ['wing (rep. 2, 3)', '', 'new_pump_4'],
+    'DM_code': [['DM-001'], ['DM-003'], ['DM-004']]
+})
+
+# On ajoute un ID unique par ligne pour que le LLM puisse s'y retrouver facilement
+df_condense['id_mod'] = [f"mod_{i}" for i in range(len(df_condense))]
+
+# On prépare l'input pour le LLM (sans lui envoyer les structures complexes de listes si pas besoin)
+lignes_pour_llm = []
+for _, row in df_condense.iterrows():
+    lignes_pour_llm.append({
+        "id_modification": row['id_mod'],
+        "action": row['type'],
+        "avant": row['before'] if row['before'] else "(rien / insertion)",
+        "apres": row['after'] if row['after'] else "(suppression)"
+    })
+
+# =====================================================================
+# 4. EXÉCUTION EN BATCHS
+# =====================================================================
+
+TAILLE_BATCH = 50  # Tu peux monter à 50 sans problème maintenant que c'est léger
+liste_de_batches = [lignes_pour_llm[i:i + TAILLE_BATCH] for i in range(0, len(lignes_pour_llm), TAILLE_BATCH)]
+
+inputs_llm = [{"donnees_batch": json.dumps(b, ensure_ascii=False)} for b in liste_de_batches]
+
+print(f"Envoi de {len(liste_de_batches)} batch(s) en parallèle au LLM...")
+recup_analyses = chain.batch(inputs_llm)
+
+# =====================================================================
+# 5. RE-MAPPING DES RÉSULTATS DANS LE DATAFRAME
+# =====================================================================
+
+# On crée des dictionnaires pour stocker les retours du LLM indexés par l'ID
+map_analyses = {}
+map_criticite = {}
+
+for batch_res in recup_analyses:
+    # On peut afficher le résumé global si on veut
+    print(f"Résumé du batch traité : {batch_res.resume_global_batch}")
+    
+    for item in batch_res.analyses:
+        map_analyses[item.id_modification] = item.analyse_metier
+        map_criticite[item.id_modification] = item.criticite
+
+# On applique directement les résultats sur notre DataFrame Pandas de départ !
+df_condense['analyse_metier'] = df_condense['id_mod'].map(map_analyses)
+df_condense['criticite'] = df_condense['id_mod'].map(map_criticite)
+
+# Nettoyage de la colonne ID temporaire si besoin
+df_condense = df_condense.drop(columns=['id_mod'])
+
+print("\n=== COLONNES AJOUTÉES AVEC SUCCÈS ===")
+print(df_condense[['type', 'analyse_metier', 'criticite']])
+
+
+
+
+import os
+import json
+import pandas as pd
 from typing import List
 from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
