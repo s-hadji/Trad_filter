@@ -1,4 +1,229 @@
 
+
+import re
+import difflib
+import unicodedata
+from collections import defaultdict
+# Depuis ta librairie d'arbre (ex: anytree) :
+# from anytree import Node, RenderTree
+
+TOKENS_PARASITES = {'-', '/', '|', '–', '—', '·'}
+ICONES = {"INCHANGE": "✅", "MODIFIE": "✏️ ", "AJOUTE": "➕", "SUPPRIME": "❌", "BRANCHE": "📁"}
+
+def normaliser(ligne):
+    if not ligne:
+        return []
+    ligne = unicodedata.normalize('NFKC', ligne.splitlines()[0])  # titre = 1ère ligne
+    ligne = re.sub(r'\s+', ' ', ligne).strip()
+    return [t for t in ligne.split(' ') if t and t not in TOKENS_PARASITES]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXTRACTION SANS PERTE (Retourne une liste brute de tuples)
+# ══════════════════════════════════════════════════════════════════════════════
+def extraire(dico):
+    return [d for d in dico if d["type"] == "XML_procedure"]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRIE AUTO-ALIGNÉ ET APPARIÉ
+# ══════════════════════════════════════════════════════════════════════════════
+def make_node(name, parent, dm_code=None, feuille=False):
+    n = Node(name, parent=parent)
+    n.dm_code  = dm_code
+    n.feuille  = feuille
+    n.patches  = []          
+    n.statut   = "BRANCHE"
+    return n
+
+def construire_trie(entrees, parent):
+    """
+    entrees: liste de tuples (tokens_restants, dm_code, document_brut, version)
+    """
+    # 1. Gestion des éléments arrivés à destination (plus de tokens de titre à traiter)
+    ici = [e for e in entrees if not e[0]]
+    if ici:
+        # On regroupe par DM_code les procédures qui partagent le même titre exact
+        by_code = defaultdict(list)
+        for _, code, doc, version in ici:
+            by_code[code].append((doc, version))
+            
+        for code, items in by_code.items():
+            v1_items = [doc for doc, version in items if version == "v1"]
+            v2_items = [doc for doc, version in items if version == "v2"]
+            
+            # On aligne séquentiellement les blocs V1 et V2 partageant ce titre et ce code
+            max_len = max(len(v1_items), len(v2_items))
+            for i in range(max_len):
+                d1 = v1_items[i] if i < len(v1_items) else None
+                d2 = v2_items[i] if i < len(v2_items) else None
+                
+                nom_feuille = f"[{code}]" + (f" (partie {i+1})" if max_len > 1 else "")
+                noeud_feuille = make_node(nom_feuille, parent, dm_code=code, feuille=True)
+                
+                # On attache directement les structures V1 et V2 au nœud pour le calcul du diff
+                noeud_feuille.doc_v1 = d1
+                noeud_feuille.doc_v2 = d2
+
+    # 2. Continuer la construction des branches pour les tokens restants
+    restants = [e for e in entrees if e[0]]
+    if not restants:
+        return
+        
+    groupes = defaultdict(list)
+    for tokens, code, doc, version in restants:
+        groupes[tokens[0].lower()].append((tokens, code, doc, version))
+        
+    for _, groupe in sorted(groupes.items()):
+        chemins = [e[0] for e in groupe]
+        min_len = min(len(c) for c in chemins)
+        n_commun = 0
+        for i in range(min_len):
+            if len({c[i].lower() for c in chemins}) == 1:
+                n_commun = i + 1
+            else:
+                break
+                
+        nom_branche = " ".join(chemins[0][:n_commun])
+        noeud_intermediaire = make_node(nom_branche, parent)
+        
+        prochaines_entrees = [
+            (tokens[n_commun:], code, doc, version)
+            for tokens, code, doc, version in groupe
+        ]
+        construire_trie(prochaines_entrees, noeud_intermediaire)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DIFF PAR MOTS (INSENSIBLE AUX SAUTS DE LIGNE)
+# ══════════════════════════════════════════════════════════════════════════════
+def diff_contenu(t1, t2):
+    t1_clean = re.sub(r'\s+', ' ', t1).strip()
+    t2_clean = re.sub(r'\s+', ' ', t2).strip()
+    w1, w2 = t1_clean.split(' '), t2_clean.split(' ')
+    
+    matcher = difflib.SequenceMatcher(None, w1, w2, autojunk=False)
+    return [
+        (" ".join(w1[i1:i2]), " ".join(w2[j1:j2]))
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes()
+        if tag != 'equal'
+    ]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PROPAGATION ET ANALYSE DES DICTIONNAIRES EMBARQUÉS
+# ══════════════════════════════════════════════════════════════════════════════
+def propager_bottom_up(racine):
+    for noeud in reversed(list(racine.descendants)):
+        if noeud.feuille:
+            d1 = getattr(noeud, 'doc_v1', None)
+            d2 = getattr(noeud, 'doc_v2', None)
+
+            if d1 is None:
+                noeud.statut = "AJOUTE"
+            elif d2 is None:
+                noeud.statut = "SUPPRIME"
+            else:
+                t1 = d1["content"]
+                t2 = d2["content"]
+                
+                t1_clean = re.sub(r'\s+', ' ', t1).strip()
+                t2_clean = re.sub(r'\s+', ' ', t2).strip()
+                
+                if t1_clean == t2_clean:
+                    noeud.statut = "INCHANGE"
+                else:
+                    noeud.statut = "MODIFIE"
+                    ratio = difflib.SequenceMatcher(None, t1_clean, t2_clean).ratio()
+                    noeud.ratio = ratio
+                    
+                    ancetres = " > ".join(a.name for a in noeud.ancestors if a.name != racine.name)
+                    for avant, apres in diff_contenu(t1, t2):
+                        noeud.patches.append({
+                            "avant":    avant,
+                            "apres":    apres,
+                            "dm_code":  noeud.dm_code,
+                            "chemin":   ancetres,
+                        })
+        else:
+            for patch in [p for enfant in noeud.children for p in enfant.patches]:
+                noeud.patches.append(patch)
+
+    for noeud in racine.descendants:
+        sig = defaultdict(list)
+        for p in noeud.patches:
+            sig[(p["avant"], p["apres"])].append(p["dm_code"])
+        noeud.patterns = {k: v for k, v in sig.items() if len(v) > 1}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RENDERERS D'AFFICHAGE
+# ══════════════════════════════════════════════════════════════════════════════
+def afficher_arbre_diff(racine):
+    print("╔══════════════════════════════════════════════════════════════╗")
+    print("║                    ARBRE AVEC STATUTS                       ║")
+    print("╚══════════════════════════════════════════════════════════════╝")
+    for pre, _, n in RenderTree(racine):
+        if n.feuille:
+            ratio  = f" {n.ratio:.0%}" if hasattr(n, 'ratio') else ""
+            npatch = f" ({len(n.patches)} modif)" if n.patches else ""
+            print(f"{pre}{ICONES[n.statut]} {n.name}{ratio}{npatch}")
+        else:
+            total = len(n.patches)
+            rep   = len(n.patterns)
+            print(f"{pre}📁 {n.name}  [{total} modif, {rep} patterns répétés]")
+
+def afficher_rapport_bottom_up(racine):
+    print("\n╔══════════════════════════════════════════════════════════════╗")
+    print("║            RAPPORT BOTTOM-UP PAR SOUS-ARBRE                 ║")
+    print("╚══════════════════════════════════════════════════════════════╝")
+    for noeud in racine.descendants:
+        if noeud.feuille or not noeud.patches:
+            continue
+        profondeur = noeud.depth
+        indent     = "  " * profondeur
+        chemin     = " > ".join(a.name for a in noeud.path)
+        print(f"\n{'═'*64}")
+        print(f"{indent}📁 Sous-arbre : {chemin}")
+        print(f"{indent}   {len(noeud.patches)} modification(s) au total")
+        if noeud.patterns:
+            print(f"{indent}   🔁 Patterns répétés dans ce sous-arbre :")
+            for (avant, apres), codes in sorted(noeud.patterns.items(), key=lambda x: -len(x[1])):
+                print(f"{indent}     → {len(codes)}x dans {', '.join(codes)}")
+                print(f"{indent}       AVANT : {avant!r}")
+                print(f"{indent}       APRÈS : {apres!r}")
+        uniques = [p for p in noeud.patches if (p["avant"], p["apres"]) not in noeud.patterns]
+        if uniques:
+            print(f"{indent}   📝 Modifications uniques :")
+            for p in uniques:
+                print(f"{indent}     [{p['dm_code']}] {p['chemin']}")
+                print(f"{indent}       AVANT : {p['avant']!r}")
+                print(f"{indent}       APRÈS : {p['apres']!r}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXECUTION SANS AUCUNE PERTE
+# ══════════════════════════════════════════════════════════════════════════════
+liste_v1 = extraire(dico_v1)
+liste_v2 = extraire(dico_v2)
+
+# On prépare un grand conteneur global pour le Trie
+entrees = []
+
+for d in liste_v1:
+    tokens = normaliser(d["content"])
+    entrees.append((tokens, d["extra_information"]["DM_code"], d, "v1"))
+
+for d in liste_v2:
+    tokens = normaliser(d["content"])
+    entrees.append((tokens, d["extra_information"]["DM_code"], d, "v2"))
+
+# Plus besoin de déduplication arbitraire en amont !
+entrees.sort(key=lambda x: [t.lower() for t in x[0]])
+
+racine = make_node("Racine", parent=None)
+# Le trie va lui-même faire la séparation et l'alignement V1 / V2
+construire_trie(entrees, racine)
+propager_bottom_up(racine)
+
+afficher_arbre_diff(racine)
+afficher_rapport_bottom_up(racine)
+
+
 import re
 import difflib
 import unicodedata
