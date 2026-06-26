@@ -1,4 +1,66 @@
 
+import re
+from rich import print as rprint
+from rich.tree import Tree
+
+class NoeudTrie:
+    """Structure de nœud générique pour arbre de préfixes."""
+    def __init__(self, texte=""):
+        self.texte = texte
+        # Un dictionnaire en Python conserve l'ordre d'insertion. 
+        # Comme on trie au départ, l'arbre sera naturellement trié.
+        self.enfants = {}  
+
+    def inserer(self, tokens):
+        """Insère récursivement une liste de tokens dans l'arbre."""
+        if not tokens:
+            return
+        
+        premier_token = tokens[0]
+        if premier_token not in self.enfants:
+            self.enfants[premier_token] = NoeudTrie(premier_token)
+            
+        # On passe au token suivant
+        self.enfants[premier_token].inserer(tokens[1:])
+
+    def generer_arbre_rich(self, noeud_rich=None):
+        """Convertit récursivement la structure en arbre Rich pour l'affichage."""
+        if noeud_rich is None:
+            noeud_rich = Tree(f"📁 [bold gold3]{self.text_racine}[/bold gold3]")
+            
+        for texte_enfant, noeud_enfant in self.enfants.items():
+            # Style : Bleu gras si le nœud a des enfants (dossier), blanc si c'est une feuille (fichier)
+            style = "[bold cyan]" if noeud_enfant.enfants else "[white]"
+            branche = noeud_rich.add(f"{style}{texte_enfant}[/]")
+            noeud_enfant.generer_arbre_rich(branche)
+            
+        return noeud_rich
+
+
+def construire_arbre_generique(liste_chaines, fonction_decoupage=None):
+    """
+    Fonction maîtresse : Trie les données et construit l'arbre.
+    """
+    # 1. LE TRI : Puissant car il organise les données alphabétiquement avant l'insertion
+    donnees_triees = sorted(liste_chaines)
+    
+    # Configuration du découpage par défaut (découpe par mot sur les espaces, les slashs ou les tirets)
+    if fonction_decoupage is None:
+        fonction_decoupage = lambda texte: [t.strip() for t in re.split(r'[\s\-/]+', texte) if t.strip()]
+        
+    racine = NoeudTrie()
+    racine.text_racine = "Racine des Procédures" # Nom de la racine pour l'affichage
+    
+    # 2. Construction de l'arbre
+    for chaine in donnees_triees:
+        tokens = fonction_decoupage(chaine)
+        racine.inserer(tokens)
+        
+    return racine
+
+
+
+
 import os
 import json
 import pandas as pd
