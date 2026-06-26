@@ -1,3 +1,41 @@
+
+def analyser_noeuds_pre_finaux(racine):
+    """
+    Identifie, compte et liste les nœuds pré-finaux (derniers carrefours avant les feuilles).
+    """
+    noeuds_pre_finaux = []
+
+    # Parcours de l'intégralité de l'arbre
+    for noeud in racine.descendants:
+        # Condition : ce n'est pas une feuille, mais il contient des feuilles
+        if not noeud.feuille and any(enfant.feuille for enfant in noeud.children):
+            noeuds_pre_finaux.append(noeud)
+            
+    # Affichage du résultat sous forme de rapport d'analyse
+    print("\n╔══════════════════════════════════════════════════════════════╗")
+    print(f"║   ANALYSE DES TRONÇONS : {len(noeuds_pre_finaux)} CHEMINS PRÉ-FINAUX TROUVÉS   ║")
+    print("╚══════════════════════════════════════════════════════════════╝")
+    
+    for i, noeud in enumerate(noeuds_pre_finaux, 1):
+        # Reconstruction du chemin textuel complet
+        chemin = " ➔ ".join(a.name for a in noeud.path)
+        
+        # Comptage des feuilles et des sous-branches optionnelles à ce niveau
+        nb_feuilles = sum(1 for c in noeud.children if c.feuille)
+        nb_sous_branches = sum(1 for c in noeud.children if not c.feuille)
+        
+        details = f"{nb_feuilles} feuille(s)"
+        if nb_sous_branches > 0:
+            details += f" et {nb_sous_branches} sous-branche(s) en dérivation"
+            
+        print(f" {i:02d}. 📂 {chemin}")
+        print(f"     └─► Regroupe : {details}")
+        
+    return len(noeuds_pre_finaux)
+
+
+
+
 import re
 import difflib
 import unicodedata
