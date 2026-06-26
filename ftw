@@ -1,3 +1,12 @@
+# ... (Après la construction et la propagation de ton arbre)
+racine = make_node("Procédures", parent=None)
+construire_trie(entrees, racine)
+propager_bottom_up(racine)
+
+# Appel de ton nouvel analyseur de structure
+nb_chemins_finaux = analyser_noeuds_pre_finaux(racine)
+
+
 
 def analyser_noeuds_pre_finaux(racine):
     """
