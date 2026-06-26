@@ -1,3 +1,225 @@
+
+import re
+import difflib
+import unicodedata
+from collections import defaultdict
+# De anytree import Node, RenderTree (ou ta structure d'arbre personnalisée)
+
+TOKENS_PARASITES = {'-', '/', '|', '–', '—', '·'}
+ICONES = {"INCHANGE": "✅", "MODIFIE": "✏️ ", "AJOUTE": "➕", "SUPPRIME": "❌", "BRANCHE": "📁"}
+
+def normaliser(ligne):
+    if not ligne:
+        return []
+    ligne = unicodedata.normalize('NFKC', ligne.splitlines()[0])  # titre = 1ère ligne
+    ligne = re.sub(r'\s+', ' ', ligne).strip()
+    return [t for t in ligne.split(' ') if t and t not in TOKENS_PARASITES]
+
+def extraire(dico):
+    # Utilisation d'une clé composite (DM_code, titre_normalise) pour garantir l'unicité
+    return {
+        (d["extra_information"]["DM_code"], " ".join(normaliser(d["content"]))): d
+        for d in dico if d["type"] == "XML_procedure"
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRIE AVEC SÉCURISATION DES ENFANTS ET CLÉS COMPOSITES
+# ══════════════════════════════════════════════════════════════════════════════
+def make_node(name, parent, dm_code=None, feuille=False, titre_complet=None):
+    n = Node(name, parent=parent)
+    n.dm_code       = dm_code
+    n.feuille       = feuille
+    n.titre_complet = titre_complet  # Permet de retrouver l'élément exact dans le dictionnaire
+    n.patches       = []             
+    n.statut        = "BRANCHE"
+    return n
+
+def construire_trie(entrees, parent):
+    # 1. Gestion des feuilles dont le chemin de tokens est entièrement consommé
+    # (Cas des DM_code différents partageant le même titre exact)
+    for c, code, t_complet in entrees:
+        if not c:
+            make_node(f"[{code}]", parent, dm_code=code, feuille=True, titre_complet=t_complet)
+            
+    # 2. Filtrage pour continuer la construction des branches du Trie
+    entrees = [(c, code, t_complet) for c, code, t_complet in entrees if c]
+    if not entrees:
+        return
+        
+    groupes = {}
+    for c, code, t_complet in entrees:
+        groupes.setdefault(c[0].lower(), []).append((c, code, t_complet))
+        
+    for _, groupe in sorted(groupes.items()):
+        if len(groupe) == 1:
+            tokens, code, t_complet = groupe[0]
+            make_node(" ".join(tokens), parent, dm_code=code, feuille=True, titre_complet=t_complet)
+        else:
+            chemins  = [c for c, _, _ in groupe]
+            min_len  = min(len(c) for c in chemins)
+            n_commun = 0
+            for i in range(min_len):
+                if len({c[i].lower() for c in chemins}) == 1:
+                    n_commun = i + 1
+                else:
+                    break
+            noeud = make_node(" ".join(chemins[0][:n_commun]), parent)
+            construire_trie([(c[n_commun:], code, t_complet) for c, code, t_complet in groupe], noeud)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DIFF PAR MOTS (IGNORE LES SAUTS DE LIGNE)
+# ══════════════════════════════════════════════════════════════════════════════
+def diff_contenu(t1, t2):
+    # Nettoyage global des sauts de ligne et espaces multiples
+    t1_clean = re.sub(r'\s+', ' ', t1).strip()
+    t2_clean = re.sub(r'\s+', ' ', t2).strip()
+    
+    # Découpage par mot pour un diff granulaire et insensible à la mise en page
+    w1, w2 = t1_clean.split(' '), t2_clean.split(' ')
+    
+    matcher = difflib.SequenceMatcher(None, w1, w2, autojunk=False)
+    return [
+        (" ".join(w1[i1:i2]), " ".join(w2[j1:j2]))
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes()
+        if tag != 'equal'
+    ]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PROPAGATION BOTTOM-UP MODIFIÉE
+# ══════════════════════════════════════════════════════════════════════════════
+def propager_bottom_up(racine, idx_v1, idx_v2):
+    for noeud in reversed(list(racine.descendants)):
+        if noeud.feuille:
+            code = noeud.dm_code
+            cle_composite = (code, noeud.titre_complet)
+            
+            in_v1 = cle_composite in idx_v1
+            in_v2 = cle_composite in idx_v2
+
+            if not in_v1:
+                noeud.statut = "AJOUTE"
+            elif not in_v2:
+                noeud.statut = "SUPPRIME"
+            else:
+                t1 = idx_v1[cle_composite]["content"]
+                t2 = idx_v2[cle_composite]["content"]
+                
+                # Normalisation pour ignorer les sauts de ligne lors de l'évaluation globale
+                t1_clean = re.sub(r'\s+', ' ', t1).strip()
+                t2_clean = re.sub(r'\s+', ' ', t2).strip()
+                
+                if t1_clean == t2_clean:
+                    noeud.statut = "INCHANGE"
+                else:
+                    noeud.statut = "MODIFIE"
+                    ratio = difflib.SequenceMatcher(None, t1_clean, t2_clean).ratio()
+                    noeud.ratio  = ratio
+                    
+                    ancetres = " > ".join(a.name for a in noeud.ancestors if a.name != racine.name)
+                    for avant, apres in diff_contenu(t1, t2):
+                        noeud.patches.append({
+                            "avant":    avant,
+                            "apres":    apres,
+                            "dm_code":  code,
+                            "chemin":   ancetres,
+                        })
+        else:
+            # Agrégation classique des descendants
+            for patch in [p for enfant in noeud.children for p in enfant.patches]:
+                noeud.patches.append(patch)
+
+    # Extraction des patterns répétés
+    for noeud in racine.descendants:
+        sig = defaultdict(list)
+        for p in noeud.patches:
+            sig[(p["avant"], p["apres"])].append(p["dm_code"])
+        noeud.patterns = {k: v for k, v in sig.items() if len(v) > 1}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FONCTIONS D'AFFICHAGE (INCHANGÉES)
+# ══════════════════════════════════════════════════════════════════════════════
+def afficher_arbre_diff(racine):
+    print("╔══════════════════════════════════════════════════════════════╗")
+    print("║                    ARBRE AVEC STATUTS                       ║")
+    print("╚══════════════════════════════════════════════════════════════╝")
+    for pre, _, n in RenderTree(racine):
+        if n.feuille:
+            ratio  = f" {n.ratio:.0%}" if hasattr(n, 'ratio') else ""
+            npatch = f" ({len(n.patches)} modif)" if n.patches else ""
+            print(f"{pre}{ICONES[n.statut]} {n.name}  [{n.dm_code}]{ratio}{npatch}")
+        else:
+            total = len(n.patches)
+            rep   = len(n.patterns)
+            print(f"{pre}📁 {n.name}  [{total} modif, {rep} patterns répétés]")
+
+def afficher_rapport_bottom_up(racine):
+    print("\n╔══════════════════════════════════════════════════════════════╗")
+    print("║            RAPPORT BOTTOM-UP PAR SOUS-ARBRE                 ║")
+    print("╚══════════════════════════════════════════════════════════════╝")
+    for noeud in racine.descendants:
+        if noeud.feuille or not noeud.patches:
+            continue
+
+        profondeur = noeud.depth
+        indent     = "  " * profondeur
+        chemin     = " > ".join(a.name for a in noeud.path)
+
+        print(f"\n{'═'*64}")
+        print(f"{indent}📁 Sous-arbre : {chemin}")
+        print(f"{indent}   {len(noeud.patches)} modification(s) au total")
+
+        if noeud.patterns:
+            print(f"{indent}   🔁 Patterns répétés dans ce sous-arbre :")
+            for (avant, apres), codes in sorted(noeud.patterns.items(), key=lambda x: -len(x[1])):
+                print(f"{indent}     → {len(codes)}x dans {', '.join(codes)}")
+                print(f"{indent}       AVANT : {avant!r}")
+                print(f"{indent}       APRÈS : {apres!r}")
+
+        uniques = [p for p in noeud.patches if (p["avant"], p["apres"]) not in noeud.patterns]
+        if uniques:
+            print(f"{indent}   📝 Modifications uniques :")
+            for p in uniques:
+                print(f"{indent}     [{p['dm_code']}] {p['chemin']}")
+                print(f"{indent}       AVANT : {p['avant']!r}")
+                print(f"{indent}       APRÈS : {p['apres']!r}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PIPELINE PRINCIPAL
+# ═══════════════════════════════════════════════════════════════╝
+idx_v1 = extraire(dico_v1)
+idx_v2 = extraire(dico_v2)
+
+# Préparation initiale des entrées avec normalisation
+entrees = sorted(
+    [(normaliser(d["content"]), d["extra_information"]["DM_code"]) for d in dico_v1 + dico_v2
+     if d["type"] == "XML_procedure"],
+    key=lambda x: [t.lower() for t in x[0]]
+)
+
+# Déduplication intelligente par le couple (titre_complet, code)
+seen = set()
+entrees_uniq = []
+for tokens, code in entrees:
+    titre_complet = " ".join(tokens)
+    cle = (titre_complet, code)
+    if cle not in seen:
+        seen.add(cle)
+        # On stocke désormais un triplet pour nourrir correctement le Trie
+        entrees_uniq.append((tokens, code, titre_complet))
+
+entrees_uniq.sort(key=lambda x: [t.lower() for t in x[0]])
+
+# Initialisation et exécution
+racine = make_node("Racine", parent=None)
+construire_trie(entrees_uniq, racine)
+propager_bottom_up(racine, idx_v1, idx_v2)
+
+# Affichage des résultats
+afficher_arbre_diff(racine)
+afficher_rapport_bottom_up(racine)
+
+
+
 TOKENS_PARASITES = {'-', '/', '|', '–', '—', '·'}
 
 def normaliser(ligne):
