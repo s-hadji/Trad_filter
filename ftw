@@ -1,3 +1,192 @@
+TOKENS_PARASITES = {'-', '/', '|', '–', '—', '·'}
+
+def normaliser(ligne):
+    ligne = unicodedata.normalize('NFKC', ligne.splitlines()[0])  # titre = 1ère ligne
+    ligne = re.sub(r'\s+', ' ', ligne).strip()
+    return [t for t in ligne.split(' ') if t and t not in TOKENS_PARASITES]
+
+def extraire(dico):
+    return {
+        d["extra_information"]["DM_code"]: d
+        for d in dico if d["type"] == "XML_procedure"
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRIE avec DM_code sur les feuilles
+# ══════════════════════════════════════════════════════════════════════════════
+def make_node(name, parent, dm_code=None, feuille=False):
+    n = Node(name, parent=parent)
+    n.dm_code  = dm_code
+    n.feuille  = feuille
+    n.patches  = []          # patches (avant,après) de ce nœud et ses descendants
+    n.statut   = "BRANCHE"
+    return n
+
+def construire_trie(entrees, parent):
+    entrees = [(c, code) for c, code in entrees if c]
+    if not entrees:
+        return
+    groupes = {}
+    for c, code in entrees:
+        groupes.setdefault(c[0].lower(), []).append((c, code))
+    for _, groupe in sorted(groupes.items()):
+        if len(groupe) == 1:
+            tokens, code = groupe[0]
+            make_node(" ".join(tokens), parent, dm_code=code, feuille=True)
+        else:
+            chemins  = [c for c, _ in groupe]
+            min_len  = min(len(c) for c in chemins)
+            n_commun = 0
+            for i in range(min_len):
+                if len({c[i].lower() for c in chemins}) == 1:
+                    n_commun = i + 1
+                else:
+                    break
+            noeud = make_node(" ".join(chemins[0][:n_commun]), parent)
+            construire_trie([(c[n_commun:], code) for c, code in groupe], noeud)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DIFF PAR DOCUMENT
+# ══════════════════════════════════════════════════════════════════════════════
+def diff_contenu(t1, t2):
+    l1, l2 = t1.splitlines(), t2.splitlines()
+    matcher = difflib.SequenceMatcher(None, l1, l2, autojunk=False)
+    return [
+        ("\n".join(l1[i1:i2]), "\n".join(l2[j1:j2]))
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes()
+        if tag != 'equal'
+    ]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PROPAGATION BOTTOM-UP
+# Chaque feuille reçoit ses patches, puis on remonte vers la racine
+# en agrégeant : chaque nœud parent accumule tous les patches de ses enfants
+# et détecte les patterns répétés DANS son sous-arbre
+# ══════════════════════════════════════════════════════════════════════════════
+def propager_bottom_up(racine, idx_v1, idx_v2):
+    """
+    Parcours post-order (feuilles → racine).
+    Chaque nœud reçoit :
+      - patches     : liste de {avant, apres, dm_code, chemin_ancetres}
+      - patterns    : {(avant,apres): [dm_codes]} répétitions dans ce sous-arbre
+    """
+    for noeud in reversed(list(racine.descendants)):
+        if noeud.feuille:
+            code = noeud.dm_code
+            in_v1 = code in idx_v1
+            in_v2 = code in idx_v2
+
+            if not in_v1:
+                noeud.statut = "AJOUTE"
+            elif not in_v2:
+                noeud.statut = "SUPPRIME"
+            else:
+                t1 = idx_v1[code]["content"]
+                t2 = idx_v2[code]["content"]
+                if t1 == t2:
+                    noeud.statut = "INCHANGE"
+                else:
+                    noeud.statut = "MODIFIE"
+                    ratio = difflib.SequenceMatcher(None, t1, t2).ratio()
+                    noeud.ratio  = ratio
+                    # Chemin depuis la racine jusqu'à ce nœud (pour le contexte)
+                    ancetres = " > ".join(a.name for a in noeud.ancestors if a.name != racine.name)
+                    for avant, apres in diff_contenu(t1, t2):
+                        noeud.patches.append({
+                            "avant":    avant,
+                            "apres":    apres,
+                            "dm_code":  code,
+                            "chemin":   ancetres,
+                        })
+
+        else:
+            # Nœud intermédiaire : agrège les patches de TOUS ses descendants feuilles
+            for patch in [p for enfant in noeud.children for p in enfant.patches]:
+                noeud.patches.append(patch)
+
+    # Calcul des patterns répétés pour chaque nœud
+    for noeud in racine.descendants:
+        sig = defaultdict(list)  # (avant,apres) → [dm_codes]
+        for p in noeud.patches:
+            sig[(p["avant"], p["apres"])].append(p["dm_code"])
+        noeud.patterns = {k: v for k, v in sig.items() if len(v) > 1}  # répétés seulement
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AFFICHAGE : arbre + résumé bottom-up
+# ══════════════════════════════════════════════════════════════════════════════
+ICONES = {"INCHANGE": "✅", "MODIFIE": "✏️ ", "AJOUTE": "➕", "SUPPRIME": "❌", "BRANCHE": "📁"}
+
+def afficher_arbre_diff(racine):
+    print("╔══════════════════════════════════════════════════════════════╗")
+    print("║                    ARBRE AVEC STATUTS                       ║")
+    print("╚══════════════════════════════════════════════════════════════╝")
+    for pre, _, n in RenderTree(racine):
+        if n.feuille:
+            ratio  = f" {n.ratio:.0%}" if hasattr(n, 'ratio') else ""
+            npatch = f" ({len(n.patches)} modif)" if n.patches else ""
+            print(f"{pre}{ICONES[n.statut]} {n.name}  [{n.dm_code}]{ratio}{npatch}")
+        else:
+            total = len(n.patches)
+            rep   = len(n.patterns)
+            print(f"{pre}📁 {n.name}  [{total} modif, {rep} patterns répétés]")
+
+def afficher_rapport_bottom_up(racine):
+    print("\n╔══════════════════════════════════════════════════════════════╗")
+    print("║            RAPPORT BOTTOM-UP PAR SOUS-ARBRE                 ║")
+    print("╚══════════════════════════════════════════════════════════════╝")
+
+    # On affiche uniquement les nœuds intermédiaires qui ont des patches
+    for noeud in racine.descendants:
+        if noeud.feuille or not noeud.patches:
+            continue
+
+        profondeur = noeud.depth
+        indent     = "  " * profondeur
+        chemin     = " > ".join(a.name for a in noeud.path)
+
+        print(f"\n{'═'*64}")
+        print(f"{indent}📁 Sous-arbre : {chemin}")
+        print(f"{indent}   {len(noeud.patches)} modification(s) au total")
+
+        if noeud.patterns:
+            print(f"{indent}   🔁 Patterns répétés dans ce sous-arbre :")
+            for (avant, apres), codes in sorted(noeud.patterns.items(), key=lambda x: -len(x[1])):
+                print(f"{indent}     → {len(codes)}x dans {', '.join(codes)}")
+                print(f"{indent}       AVANT : {avant!r}")
+                print(f"{indent}       APRÈS : {apres!r}")
+
+        # Modifications uniques (non répétées) dans ce sous-arbre
+        uniques = [p for p in noeud.patches if (p["avant"], p["apres"]) not in noeud.patterns]
+        if uniques:
+            print(f"{indent}   📝 Modifications uniques :")
+            for p in uniques:
+                print(f"{indent}     [{p['dm_code']}] {p['chemin']}")
+                print(f"{indent}       AVANT : {p['avant']!r}")
+                print(f"{indent}       APRÈS : {p['apres']!r}")
+
+# ── Exécution ─────────────────────────────────────────────────────────────────
+idx_v1 = extraire(dico_v1)
+idx_v2 = extraire(dico_v2)
+
+entrees = sorted(
+    [(normaliser(d["content"]), d["extra_information"]["DM_code"]) for d in dico_v1 + dico_v2
+     if d["type"] == "XML_procedure"],
+    key=lambda x: [t.lower() for t in x[0]]
+)
+# Déduplique par dm_code (garde la v1 pour la structure)
+seen = set(); entrees_uniq = []
+for tokens, code in entrees:
+    if code not in seen:
+        seen.add(code); entrees_uniq.append((tokens, code))
+entrees_uniq.sort(key=lambda x: [t.lower() for t in x[0]])
+
+racine = make_node("Racine", parent=None)
+construire_trie(entrees_uniq, racine)
+propager_bottom_up(racine, idx_v1, idx_v2)
+
+afficher_arbre_diff(racine)
+afficher_rapport_bottom_up(racine)
+
 
 
 import re
