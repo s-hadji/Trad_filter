@@ -1,3 +1,4 @@
+
 from itertools import groupby
 import re
 from anytree import Node, RenderTree
@@ -10,37 +11,42 @@ donnees = [
     "Procédure OM - Actuator 576 - Exchange"
 ]
 
-# 1. Découpage ET Tri par préfixe (Le tri de listes en Python est nativement lexicographique)
+# 1. On découpe et on trie au départ (indispensable pour groupby)
 lignes_tokenisees = sorted([
-    [token.strip() for token in re.split(r'[\s\-/]+', ligne) if token.strip()] 
-    for ligne in donnees
+    [t.strip() for t in re.split(r'[\s\-/]+', l) if t.strip()] 
+    for l in donnees
 ])
 
-# 2. Algorithme de regroupement ultra-rapide par itération de préfixe
-def separer_et_grouper(chemins, noeud_parent):
-    # On nettoie les chemins vides (fin de branche)
+# 2. Algorithme à arrêt précoce
+def construire_arbre_intelligent(chemins, noeud_parent):
     chemins_valides = [c for c in chemins if c]
-    
-    # groupby regroupe automatiquement par le premier mot (index 0)
+    if not chemins_valides:
+        return
+        
+    # On groupe par le premier mot disponible
     for mot_cle, groupe in groupby(chemins_valides, lambda x: x[0]):
-        # On crée le nœud anytree attaché au parent
-        nouveau_noeud = Node(mot_cle, parent=noeud_parent)
+        groupe_list = list(groupe)
         
-        # On extrait le reste des mots pour ce groupe (on retire le premier mot consommé)
-        chemins_restants = [chemin[1:] for chemin in groupe]
-        
-        # On passe récursivement au niveau inférieur de l'arbre
-        separer_et_grouper(chemins_restants, nouveau_noeud)
+        # MAGIE : Si le groupe n'a qu'un seul élément, il n'y a plus de bifurcation !
+        # On arrête de couper et on fusionne tout le reste de la phrase.
+        if len(groupe_list) == 1:
+            reste_de_la_phrase = " ".join(groupe_list[0])
+            Node(reste_de_la_phrase, parent=noeud_parent)
+            
+        else:
+            # S'il y a plusieurs phrases qui partagent ce mot, on crée un nœud intermédiaire
+            nouveau_noeud = Node(mot_cle, parent=noeud_parent)
+            # On passe à la suite des mots pour ce groupe
+            chemins_restants = [chemin[1:] for chemin in groupe_list]
+            construire_arbre_intelligent(chemins_restants, nouveau_noeud)
 
 # --- Exécution et Affichage ---
 racine = Node("📁 Racine")
-separer_et_grouper(lignes_tokenisees, racine)
+construire_arbre_intelligent(lignes_tokenisees, racine)
 
-# anytree possède son propre moteur d'affichage de texte ultra-propre
+# Affichage avec anytree
 for prefixe, _, noeud in RenderTree(racine):
     print(f"{prefixe}{noeud.name}")
-
-
 
 
 
