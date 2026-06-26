@@ -1,3 +1,313 @@
+import re
+import difflib
+import unicodedata
+from collections import defaultdict
+# Depuis ta librairie d'arbre (ex: anytree) :
+# from anytree import Node, RenderTree
+
+TOKENS_PARASITES = {'-', '/', '|', '–', '—', '·'}
+ICONES = {"INCHANGE": "✅", "MODIFIE": "✏️ ", "AJOUTE": "➕", "SUPPRIME": "❌", "BRANCHE": "📁"}
+
+def normaliser(ligne):
+    if not ligne:
+        return []
+    ligne = unicodedata.normalize('NFKC', ligne.splitlines()[0])
+    ligne = re.sub(r'\s+', ' ', ligne).strip()
+    return [t for t in ligne.split(' ') if t and t not in TOKENS_PARASITES]
+
+def extraire(dico):
+    return [d for d in dico if d["type"] == "XML_procedure"]
+
+def epurer_texte(t):
+    """ Supprime la ponctuation et les symboles pour l'analyse de l'AVANT """
+    if not t: return ""
+    t_clean = re.sub(r'[\.,\(\)\[\]\{\}!\?;:\*\+\-/\|—–_§•·]', ' ', t)
+    return re.sub(r'\s+', ' ', t_clean).strip()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MOTEUR DE FACTORISATION AVANCÉ VIA ALIGNEMENT DE SÉQUENCES (DIFFLIB)
+# ══════════════════════════════════════════════════════════════════════════════
+def factoriser_textes_difflib(liste_textes):
+    """
+    Prend N chaînes de caractères, extrait l'ossature commune (insensible à la casse)
+    via difflib et fusionne les variabilités locales sous forme de choix en ligne.
+    """
+    if not liste_textes: 
+        return ""
+    if len(liste_textes) == 1: 
+        return liste_textes[0]
+        
+    # 1. Extraction progressive de l'ossature commune (Invariants) en minuscules
+    current_mots = [w.lower() for w in liste_textes[0].split()]
+    for t in liste_textes[1:]:
+        t_mots = [w.lower() for w in t.split()]
+        sm = difflib.SequenceMatcher(None, current_mots, t_mots, autojunk=False)
+        new_mots = []
+        for block in sm.get_matching_blocks():
+            if block.size > 0:
+                new_mots.extend(current_mots[block.a : block.a + block.size])
+        current_mots = new_mots
+        
+    invariants_lower = current_mots
+    
+    # Si aucun mot commun global n'est trouvé, bloc de choix simple global
+    if not invariants_lower:
+        seen = set()
+        unique_raw = []
+        for t in liste_textes:
+            t_clean = t.strip()
+            if t_clean.lower() not in seen:
+                seen.add(t_clean.lower())
+                unique_raw.append(t_clean if t_clean else "Ø")
+        if len(unique_raw) == 1: 
+            return unique_raw[0]
+        return "[ " + " | ".join(f"'{u}'" if u != "Ø" else "Ø" for u in unique_raw) + " ]"
+        
+    # 2. Alignement et découpage de chaque texte autour des invariants
+    tous_segments = []
+    invariants_originaux_reference = None
+    
+    for t in liste_textes:
+        texte_mots = t.split()
+        segments = []
+        matched_orig = []
+        idx_t = 0
+        
+        # Parcours glissant pour capturer les mots avant/entre chaque invariant
+        for inv_low in invariants_lower:
+            sub_segment = []
+            while idx_t < len(texte_mots) and texte_mots[idx_t].lower() != inv_low:
+                sub_segment.append(texte_mots[idx_t])
+                idx_t += 1
+            segments.append(" ".join(sub_segment))
+            
+            if idx_t < len(texte_mots):
+                matched_orig.append(texte_mots[idx_t])
+                idx_t += 1
+            else:
+                matched_orig.append(inv_low)
+                
+        # Reliquat après le dernier invariant
+        segments.append(" ".join(texte_mots[idx_t:]))
+        tous_segments.append(segments)
+        
+        if invariants_originaux_reference is None:
+            # On garde la casse du premier texte pour afficher l'ossature proprement
+            invariants_originaux_reference = matched_orig
+            
+    # 3. Reconstitution de la chaîne factorisée finale
+    resultat_pieces = []
+    num_invariants = len(invariants_lower)
+    
+    for i in range(num_invariants + 1):
+        # Collecte des variantes à la position courante 'i' pour tous les textes
+        choix_intervalle = [tous_segments[j][i] for j in range(len(liste_textes))]
+        
+        # Déduplication stricte non casse-sensitive
+        seen_choix = set()
+        unique_choix = []
+        for c in choix_intervalle:
+            c_clean = c.strip()
+            if c_clean.lower() not in seen_choix:
+                seen_choix.add(c_clean.lower())
+                unique_choix.append(c_clean if c_clean else "Ø")
+                
+        # Rendu du bloc de choix s'il apporte de l'information
+        if len(unique_choix) > 1 or (len(unique_choix) == 1 and unique_choix[0] != "Ø"):
+            if len(unique_choix) == 1:
+                resultat_pieces.append(unique_choix[0])
+            else:
+                bloc_choix = " | ".join(f"'{u}'" if u != "Ø" else "Ø" for u in unique_choix)
+                resultat_pieces.append(f"[ {bloc_choix} ]")
+                
+        # Injection de l'invariant pivot (si pas à la fin)
+        if i < num_invariants:
+            resultat_pieces.append(invariants_originaux_reference[i])
+            
+    chaine_finale = " ".join([p for p in resultat_pieces if p])
+    return re.sub(r'\s+', ' ', chaine_finale).strip()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COMPRESSION DES PATCHES (AVANT SANS SYMBOLE / APRÈS VIA SÉQUENCE DIFFLIB)
+# ══════════════════════════════════════════════════════════════════════════════
+def compresser_patches_sous_arbre(patches):
+    if not patches:
+        return []
+        
+    # --- PASSE 1 : Regroupement par 'AVANT' épuré de ses symboles ---
+    par_avant_clean = defaultdict(list)
+    for p in patches:
+        av_clean = epurer_texte(p["avant"])
+        par_avant_clean[av_clean].append(p)
+        
+    regles_phase1 = []
+    for av_clean, liste_p in par_avant_clean.items():
+        raw_apres_list = [p["apres"] for p in liste_p]
+        tous_codes = sorted(list(set(p["dm_code"] for p in liste_p)))
+        
+        # Utilisation du nouveau moteur de factorisation difflib pour l'après
+        apres_condense = factoriser_textes_difflib(raw_apres_list)
+        
+        # Une règle est structurelle si elle a généré des choix complexes
+        est_structurel = "[" in apres_condense or "|" in apres_condense
+        
+        regles_phase1.append({
+            "avant": av_clean,
+            "apres": apres_condense,
+            "codes": tous_codes,
+            "structurel": est_structurel
+        })
+
+    # --- PASSE 2 : Regroupement par 'APRÈS' (Inverse / Non casse-sensitive) ---
+    simples = [r for r in regles_phase1 if not r["structurel"]]
+    complexes = [r for r in regles_phase1 if r["structurel"]]
+    
+    par_apres_clean_global = defaultdict(list)
+    for r in simples:
+        par_apres_clean_global[r["apres"].strip().lower()].append(r)
+        
+    regles_finales = list(complexes)
+    for ap_clean, liste_r in par_apres_clean_global.items():
+        if len(liste_r) == 1:
+            regles_finales.append(liste_r[0])
+        else:
+            # Multiples AVANT (épurés) pointent vers le même APRÈS sémantique
+            raw_avant_list = [r["avant"] for r in liste_r]
+            tous_codes = sorted(list(set(c for r in liste_r for c in r["codes"])))
+            
+            # On applique la même puissance difflib sur l'AVANT
+            avant_condense = factoriser_textes_difflib(raw_avant_list)
+            ap_display = liste_r[0]["apres"]
+            
+            regles_finales.append({
+                "avant": avant_condense,
+                "apres": ap_display,
+                "codes": tous_codes,
+                "structurel": True
+            })
+                
+    return regles_finales
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GESTION DE L'ARBRE (CONFORME)
+# ══════════════════════════════════════════════════════════════════════════════
+def make_node(name, parent, dm_code=None, feuille=False):
+    n = Node(name, parent=parent)
+    n.dm_code  = dm_code
+    n.feuille  = feuille
+    n.patches  = []          
+    n.statut   = "BRANCHE"
+    return n
+
+def construire_trie(entrees, parent):
+    ici = [e for e in entrees if not e[0]]
+    if ici:
+        by_code = defaultdict(list)
+        for _, code, doc, version in ici:
+            by_code[code].append((doc, version))
+        for code, items in by_code.items():
+            v1_items = [doc for doc, version in items if version == "v1"]
+            v2_items = [doc for doc, version in items if version == "v2"]
+            max_len = max(len(v1_items), len(v2_items))
+            for i in range(max_len):
+                d1 = v1_items[i] if i < len(v1_items) else None
+                d2 = v2_items[i] if i < len(v2_items) else None
+                nom_feuille = f"[{code}]" + (f" (p.{i+1})" if max_len > 1 else "")
+                noeud_feuille = make_node(nom_feuille, parent, dm_code=code, feuille=True)
+                noeud_feuille.doc_v1 = d1
+                noeud_feuille.doc_v2 = d2
+
+    restants = [e for e in entrees if e[0]]
+    if not restants: return
+    groupes = defaultdict(list)
+    for tokens, code, doc, version in restants:
+        groupes[tokens[0].lower()].append((tokens, code, doc, version))
+    for _, groupe in sorted(groupes.items()):
+        chemins = [e[0] for e in groupe]
+        min_len = min(len(c) for c in chemins)
+        n_commun = 0
+        for i in range(min_len):
+            if len({c[i].lower() for c in chemins}) == 1: n_commun = i + 1
+            else: break
+        nom_branche = " ".join(chemins[0][:n_commun])
+        noeud_intermediaire = make_node(nom_branche, parent)
+        construire_trie([(t[n_commun:], c, d, v) for t, c, d, v in groupe], noeud_intermediaire)
+
+def diff_contenu(t1, t2):
+    t1_clean = re.sub(r'\s+', ' ', t1).strip()
+    t2_clean = re.sub(r'\s+', ' ', t2).strip()
+    w1, w2 = t1_clean.split(' '), t2_clean.split(' ')
+    matcher = difflib.SequenceMatcher(None, w1, w2, autojunk=False)
+    return [
+        (" ".join(w1[i1:i2]), " ".join(w2[j1:j2]))
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes() if tag != 'equal'
+    ]
+
+def propager_bottom_up(racine):
+    for noeud in reversed(list(racine.descendants)):
+        if noeud.feuille:
+            d1 = getattr(noeud, 'doc_v1', None)
+            d2 = getattr(noeud, 'doc_v2', None)
+            if d1 is None: noeud.statut = "AJOUTE"
+            elif d2 is None: noeud.statut = "SUPPRIME"
+            else:
+                t1, t2 = d1["content"], d2["content"]
+                if re.sub(r'\s+', ' ', t1).strip() == re.sub(r'\s+', ' ', t2).strip():
+                    noeud.statut = "INCHANGE"
+                else:
+                    noeud.statut = "MODIFIE"
+                    noeud.ratio = difflib.SequenceMatcher(None, re.sub(r'\s+', ' ', t1).strip(), re.sub(r'\s+', ' ', t2).strip()).ratio()
+                    for avant, apres in diff_contenu(t1, t2):
+                        noeud.patches.append({"avant": avant, "apres": apres, "dm_code": noeud.dm_code})
+        else:
+            for patch in [p for enfant in noeud.children for p in enfant.patches]:
+                noeud.patches.append(patch)
+
+def afficher_rapport_factorise(racine):
+    print("\n╔══════════════════════════════════════════════════════════════╗")
+    print("║        RAPPORT MAÎTRE : FACTORISATION PAR SÉQUENCES (LCS)    ║")
+    print("╚══════════════════════════════════════════════════════════════╝")
+    for noeud in racine.descendants:
+        if noeud.feuille or not noeud.patches:
+            continue
+            
+        regles_compressees = compresser_patches_sous_arbre(noeud.patches)
+        if regles_compressees:
+            profondeur = noeud.depth
+            indent = "  " * profondeur
+            chemin = " > ".join(a.name for a in noeud.path)
+            
+            print(f"\n{'═'*75}")
+            print(f"{indent}📁 Sous-arbre : {chemin}")
+            print(f"{indent}   ───────────────────────────────────────────────────────────────────────")
+            
+            for r in regles_compressees:
+                codes_uniques = sorted(list(set(r["codes"])))
+                prefixe_regle = "🔁 [Règle Alignée]" if len(codes_uniques) > 1 else "📝 [Modif. Isolée]"
+                
+                print(f"{indent}   {prefixe_regle} sur : {', '.join(codes_uniques)}")
+                print(f"{indent}     AVANT : {r['avant']!r}")
+                print(f"{indent}     APRÈS : {r['apres']!r}\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXECUTION
+# ══════════════════════════════════════════════════════════════════════════════
+liste_v1 = extraire(dico_v1)
+liste_v2 = extraire(dico_v2)
+
+entrees = []
+for d in liste_v1:
+    entrees.append((normaliser(d["content"]), d["extra_information"]["DM_code"], d, "v1"))
+for d in liste_v2:
+    entrees.append((normaliser(d["content"]), d["extra_information"]["DM_code"], d, "v2"))
+
+entrees.sort(key=lambda x: [t.lower() for t in x[0]])
+
+racine = make_node("Racine", parent=None)
+construire_trie(entrees, racine)
+propager_bottom_up(racine)
+
+afficher_rapport_factorise(racine)
 
 
 
