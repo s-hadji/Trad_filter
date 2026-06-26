@@ -1,3 +1,80 @@
+import re
+import unicodedata
+from anytree import Node, RenderTree
+
+donnees = [
+    "Procédure OM - Power Supply Unit (PSU)",
+    "Procédure GSE - Rear Section/turboengi",
+    "Procédure Missile logistic container",
+    "Procédure GSE - Wheels - Removal/insta",
+    "Procédure OM - Actuator 576 - Exchange"
+]
+
+# Ponctuations isolées qui polluent le trie
+TOKENS_PARASITES = {'-', '/', '|', '–', '—', '·'}
+
+def normaliser(ligne):
+    """
+    Nettoie une ligne avant tokenisation :
+    - NFKC unifie les caractères unicode (espaces larges, tirets spéciaux…)
+    - \s+ capture \n \r \t \xa0 et tous les espaces invisibles → espace simple
+    - Split sur l'espace uniquement
+    - Filtre les tokens vides et les ponctuations isolées parasites
+    """
+    ligne = unicodedata.normalize('NFKC', ligne)
+    ligne = re.sub(r'\s+', ' ', ligne).strip()
+    return [t for t in ligne.split(' ') if t and t not in TOKENS_PARASITES]
+
+def prefixe_commun(chemins):
+    """Nombre de tokens identiques en tête de tous les chemins."""
+    if not chemins:
+        return 0
+    min_len = min(len(c) for c in chemins)
+    for i in range(min_len):
+        if len({c[i].lower() for c in chemins}) > 1:
+            return i
+    return min_len
+
+def construire_trie(chemins, parent):
+    chemins = [c for c in chemins if c]
+    if not chemins:
+        return
+
+    # Feuille unique
+    if len(chemins) == 1:
+        Node(" ".join(chemins[0]), parent=parent)
+        return
+
+    # Préfixe commun → nœud fusionné avant la bifurcation
+    n = prefixe_commun(chemins)
+    if n > 0:
+        noeud = Node(" ".join(chemins[0][:n]), parent=parent)
+        construire_trie([c[n:] for c in chemins], noeud)
+        return
+
+    # Bifurcation : on groupe par 1er token
+    chemins.sort(key=lambda x: x[0].lower())
+    debut = 0
+    while debut < len(chemins):
+        token = chemins[debut][0].lower()
+        fin = debut
+        while fin < len(chemins) and chemins[fin][0].lower() == token:
+            fin += 1
+        groupe = chemins[debut:fin]
+
+        if len(groupe) == 1:
+            Node(" ".join(groupe[0]), parent=parent)
+        else:
+            noeud = Node(groupe[0][0], parent=parent)
+            construire_trie([c[1:] for c in groupe], noeud)
+        debut = fin
+
+lignes = sorted([normaliser(l) for l in donnees], key=lambda x: [t.lower() for t in x])
+racine = Node("📁 Racine")
+construire_trie(lignes, racine)
+
+for pre, _, noeud in RenderTree(racine):
+    print(f"{pre}{noeud.name}")
 
 
 import re
