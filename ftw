@@ -1,3 +1,64 @@
+
+
+import re
+import unicodedata
+from anytree import Node, RenderTree
+
+donnees = [
+    "Procédure OM - Power Supply Unit (PSU)",
+    "Procédure GSE - Rear Section/turboengi",
+    "Procédure Missile logistic container",
+    "Procédure GSE - Wheels - Removal/insta",
+    "Procédure OM - Actuator 576 - Exchange"
+]
+
+TOKENS_PARASITES = {'-', '/', '|', '–', '—', '·'}
+
+def normaliser(ligne):
+    ligne = unicodedata.normalize('NFKC', ligne)
+    ligne = re.sub(r'\s+', ' ', ligne).strip()
+    return [t for t in ligne.split(' ') if t and t not in TOKENS_PARASITES]
+
+def construire_trie(chemins, parent):
+    chemins = [c for c in chemins if c]
+    if not chemins:
+        return
+
+    # Grouper par 1er token
+    groupes = {}
+    for c in chemins:
+        groupes.setdefault(c[0].lower(), []).append(c)
+
+    for _, groupe in sorted(groupes.items()):
+        if len(groupe) == 1:
+            # Pas de bifurcation → feuille directe, tout le chemin dans le nœud
+            Node(" ".join(groupe[0]), parent=parent)
+        else:
+            # Avancer dans le suffixe pour trouver le préfixe commun maximal
+            min_len = min(len(c) for c in groupe)
+            n_commun = 0
+            for i in range(min_len):
+                if len({c[i].lower() for c in groupe}) == 1:
+                    n_commun = i + 1
+                else:
+                    break
+
+            # Nœud = préfixe commun fusionné ("Procédure GSE", "Procédure OM"…)
+            noeud = Node(" ".join(groupe[0][:n_commun]), parent=parent)
+            # Descente récursive sur les suffixes restants
+            construire_trie([c[n_commun:] for c in groupe], noeud)
+
+lignes = sorted([normaliser(l) for l in donnees], key=lambda x: [t.lower() for t in x])
+racine = Node("📁 Racine")
+construire_trie(lignes, racine)
+
+for pre, _, noeud in RenderTree(racine):
+    print(f"{pre}{noeud.name}")
+
+
+
+
+
 import re
 import unicodedata
 from anytree import Node, RenderTree
