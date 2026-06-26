@@ -1,4 +1,75 @@
 
+
+import re
+from anytree import Node, RenderTree
+
+donnees = [
+    "Procédure OM - Power Supply Unit (PSU)",
+    "Procédure GSE - Rear Section/turboengi",
+    "Procédure Missile logistic container",
+    "Procédure GSE - Wheels - Removal/insta",
+    "Procédure OM - Actuator 576 - Exchange"
+]
+
+def tokeniser(ligne):
+    """Découpe une ligne en tokens sur espace, tiret, slash."""
+    return [t for t in re.split(r'[\s\-/]+', ligne.strip()) if t]
+
+def prefixe_commun(chemins):
+    """Retourne la longueur du préfixe commun à tous les chemins."""
+    if not chemins:
+        return 0
+    min_len = min(len(c) for c in chemins)
+    for i in range(min_len):
+        if len({c[i].lower() for c in chemins}) > 1:
+            return i
+    return min_len
+
+def construire_trie(chemins, parent):
+    chemins = [c for c in chemins if c]
+    if not chemins:
+        return
+
+    # Feuille : un seul chemin, on le colle directement
+    if len(chemins) == 1:
+        Node(" ".join(chemins[0]), parent=parent)
+        return
+
+    # Préfixe commun à TOUS → un seul nœud intermédiaire fusionné
+    n = prefixe_commun(chemins)
+    if n > 0:
+        noeud = Node(" ".join(chemins[0][:n]), parent=parent)
+        construire_trie([c[n:] for c in chemins], noeud)
+        return
+
+    # Bifurcation : on groupe par 1er token et on descend
+    chemins.sort(key=lambda x: x[0].lower())
+    debut = 0
+    while debut < len(chemins):
+        token = chemins[debut][0].lower()
+        fin = debut
+        while fin < len(chemins) and chemins[fin][0].lower() == token:
+            fin += 1
+        groupe = chemins[debut:fin]
+
+        if len(groupe) == 1:
+            Node(" ".join(groupe[0]), parent=parent)
+        else:
+            noeud = Node(groupe[0][0], parent=parent)
+            construire_trie([c[1:] for c in groupe], noeud)
+        debut = fin
+
+# --- Exécution ---
+lignes = sorted([tokeniser(l) for l in donnees], key=lambda x: [t.lower() for t in x])
+racine = Node("📁 Racine")
+construire_trie(lignes, racine)
+
+for pre, _, noeud in RenderTree(racine):
+    print(f"{pre}{noeud.name}")
+
+
+
+
 from itertools import groupby
 import re
 from anytree import Node, RenderTree
