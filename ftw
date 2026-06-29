@@ -1,4 +1,3 @@
-
 import re
 import difflib
 import json
@@ -36,9 +35,7 @@ dico_v2 = [
     {
         "type": "XML_procedure",
         "content": "Couper le disjoncteur general de la cabine.((,),", 
-        # Ici on a accumule plein de symboles collés : . ( ( , ) ,
-        # Le tokenizer va tous les isoler un par un. Le filtre verra qu'il n'y a pas
-        # de nouveau mot alphanumérique et ignorera cette modification parasite.
+        # Modif parasite isolee et ignoree
         "extra_information": {"DM_title": "Electricite > Basse Tension", "DM_code": "DM-ELEC-002"}
     },
     {
@@ -108,47 +105,59 @@ def extraire_procedures(jeu_donnees):
 
 
 # =====================================================================
-# MOTEUR DE DIFF PAR TOKENISATION ALPHANUMÉRIQUE / SYMBOLE
+# MOTEUR DE DIFF AVEC TOKENISATION ET FUSION PAR CONTIGUÏTÉ
 # =====================================================================
 
 def extraire_tokens_perfo(texte):
-    """
-    Tokenise finement le texte selon deux regles strictes :
-    1. Les blocs de caracteres alphanumeriques (lettres avec accents + chiffres) sont regroupes.
-    2. Chaque symbole ou caractere de ponctuation individuel devient un token independant.
-    Les espaces blancs servent uniquement de separateurs et sont jetes.
-    """
     if not texte:
         return []
-    # REGEX : [a-zA-Z0-9À-ÿ]+ -> capture un mot complet
-    #         | -> OU
-    #         [^a-zA-Z0-9À-ÿ\s] -> capture n'importe quel caractere unique (hors alphanum et espace)
     pattern = r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]'
     return re.findall(pattern, texte)
 
 
 def calculer_diff_mots(texte_v1, texte_v2):
     """
-    Analyse les differences textuelles a partir du tokenizer ultra-perfo.
-    Si la difference ne contient aucun changement alphanumerique significatif
-    (uniquement du bruit ou du symbole parasite), le patch est supprime.
+    Analyse les diffs, fusionne les modifications contigues (qui se suivent directement)
+    pour eviter la fragmentation, puis applique le filtre anti-parasite.
     """
     mots_v1 = extraire_tokens_perfo(texte_v1)
     mots_v2 = extraire_tokens_perfo(texte_v2)
     
     matcher = difflib.SequenceMatcher(None, mots_v1, mots_v2, autojunk=False)
-    patches_bruts = [
-        (" ".join(mots_v1[i1:i2]), " ".join(mots_v2[j1:j2]))
-        for action, i1, i2, j1, j2 in matcher.get_opcodes() if action != 'equal'
-    ]
+    opcodes = matcher.get_opcodes()
     
+    # 1. Regroupement des opcodes non-'equal' qui sont contigus
+    groupes_patches = []
+    groupe_actuel = []
+    
+    for action, i1, i2, j1, j2 in opcodes:
+        if action != 'equal':
+            groupe_actuel.append((i1, i2, j1, j2))
+        else:
+            if groupe_actuel:
+                groupes_patches.append(groupe_actuel)
+                groupe_actuel = []
+    if groupe_actuel:
+        groupes_patches.append(groupe_actuel)
+        
+    # 2. Reconstruction des chaines "avant" et "apres" fusionnees par continuite
+    patches_bruts = []
+    for groupe in groupes_patches:
+        min_i = groupe[0][0]
+        max_i = groupe[-1][1]
+        min_j = groupe[0][2]
+        max_j = groupe[-1][3]
+        
+        avant = " ".join(mots_v1[min_i:max_i])
+        apres = " ".join(mots_v2[min_j:max_j])
+        patches_bruts.append((avant, apres))
+        
+    # 3. Filtrage final des bruits et parasites sur les blocs consolides
     patches_filtres = []
     for avant, apres in patches_bruts:
-        # Extraction du "coeur" uniquement composé de lettres/chiffres pour comparer le fond
         coeur_avant = re.sub(r'[^a-zA-Z0-9À-ÿ]', '', avant).lower()
         coeur_apres = re.sub(r'[^a-zA-Z0-9À-ÿ]', '', apres).lower()
         
-        # Si le contenu textuel reel est identique, c'est une modification purement parasite
         if coeur_avant == coeur_apres:
             continue
             
@@ -249,7 +258,7 @@ def propager_bottom_up(racine):
 
 
 # =====================================================================
-# SYSTEME DE PLANIFICATION PAR JETONS (TOKENS)
+# REPARTITION ET PLANIFICATION DES REQUETES
 # =====================================================================
 
 def estimer_tokens_arbre(noeud):
@@ -309,10 +318,6 @@ def planifier_appels_llm(racine, budget_max_appels=10, limite_tokens_par_appel=2
     return selection_pivots
 
 
-# =====================================================================
-# CONSTITUTION DU PLANNING LLM
-# =====================================================================
-
 def generer_dictionnaire_planning(noeuds_pivots):
     liste_appels = []
     compteur_appels = 1
@@ -343,7 +348,7 @@ def generer_dictionnaire_planning(noeuds_pivots):
 
 
 # =====================================================================
-# PIPELINE PRINCIPAL
+# PIPELINE GLOBAL
 # =====================================================================
 
 if __name__ == "__main__":
@@ -376,9 +381,6 @@ if __name__ == "__main__":
 
     planning_final = generer_dictionnaire_planning(noeuds_optimales)
     print(json.dumps(planning_final, indent=4, ensure_ascii=False))
-
-
-
 
 
 
