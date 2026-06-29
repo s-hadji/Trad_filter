@@ -1,3 +1,17 @@
+# 1. Génération de l'arbre standard
+racine = make_node("Procédures", parent=None)
+construire_trie(entrees, racine)
+propager_bottom_up(racine)
+
+# 2. Lancement du calcul de poids des tokens
+estimer_tokens_arbre(racine)
+
+# 3. Calcul de la feuille de route pour ton LLM
+# Ici on veut max M=10 appels et max 1500 tokens par paquet
+noeuds_pivots = planifier_appels_llm(racine, M=10, limit_token=1500)
+
+
+
 
 def estimer_tokens_arbre(noeud):
     """
