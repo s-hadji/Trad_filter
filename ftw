@@ -1,3 +1,400 @@
+import re
+import difflib
+import json
+import unicodedata
+from collections import defaultdict
+
+# =====================================================================
+# JEU DE DONNÉES DE TEST (Avec doublons pour tester la fusion des DM)
+# =====================================================================
+
+dico_v1 = [
+    {
+        "type": "XML_procedure",
+        "content": "Ouvrir la vanne de decharge principale doucement.",
+        "extra_information": {"DM_title": "Hydraulique > Vannes > Decharge", "DM_code": "DM-HYD-001"}
+    },
+    {
+        "type": "XML_procedure",
+        "content": "Ouvrir la vanne de decharge principale doucement.", 
+        # Ce document est identique au DM-HYD-001 -> Ils vont fusionner
+        "extra_information": {"DM_title": "Hydraulique > Vannes > Decharge", "DM_code": "DM-HYD-004"}
+    },
+    {
+        "type": "XML_procedure",
+        "content": "Couper le disjoncteur general de la cabine.",
+        "extra_information": {"DM_title": "Electricite > Basse Tension", "DM_code": "DM-ELEC-002"}
+    },
+    {
+        "type": "XML_procedure",
+        "content": "Verifier la pression des pneus de secours.",
+        "extra_information": {"DM_title": "Mecanique > Train de roulement", "DM_code": "DM-MEC-003"}
+    }
+]
+
+dico_v2 = [
+    {
+        "type": "XML_procedure",
+        "content": "Ouvrir la vanne de decharge principale rapidement et verifier le manometre.",
+        "extra_information": {"DM_title": "Hydraulique > Vannes > Decharge", "DM_code": "DM-HYD-001"}
+    },
+    {
+        "type": "XML_procedure",
+        "content": "Ouvrir la vanne de decharge principale rapidement et verifier le manometre.",
+        "extra_information": {"DM_title": "Hydraulique > Vannes > Decharge", "DM_code": "DM-HYD-004"}
+    },
+    {
+        "type": "XML_procedure",
+        "content": "Couper le disjoncteur general de la cabine.,", 
+        # Symbole parasite ignore par le filtre
+        "extra_information": {"DM_title": "Electricite > Basse Tension", "DM_code": "DM-ELEC-002"}
+    },
+    {
+        "type": "XML_procedure",
+        "content": "Verifier la pression des pneus de secours et ajuster a 2.5 bars.",
+        "extra_information": {"DM_title": "Mecanique > Train de roulement", "DM_code": "DM-MEC-003"}
+    }
+]
+
+
+# =====================================================================
+# STRUCTURE DE L'ARBRE
+# =====================================================================
+
+class Node:
+    def __init__(self, name, parent=None):
+        self.name = name
+        self.parent = parent
+        if parent:
+            if not hasattr(parent, 'children'):
+                parent.children = []
+            parent.children.append(self)
+        self.children = []
+        self.dm_code = None
+        self.feuille = False
+        self.patches = []
+        self.statut = "BRANCHE"
+        self.tokens_cumules = 0
+        self.doc_v1 = None
+        self.doc_v2 = None
+
+    @property
+    def descendants(self):
+        nodes = []
+        for child in self.children:
+            nodes.append(child)
+            nodes.extend(child.descendants)
+        return nodes
+
+    @property
+    def path(self):
+        path = []
+        current = self
+        while current:
+            path.insert(0, current)
+            current = current.parent
+        return path
+
+
+# =====================================================================
+# NETTOYAGE ET NORMALISATION
+# =====================================================================
+
+def normaliser_titre(titre):
+    if not titre:
+        return []
+    titre_normalise = unicodedata.normalize('NFKC', titre.splitlines()[0])
+    titre_normalise = re.sub(r'\s+', ' ', titre_normalise).strip()
+    
+    separateurs = {'-', '/', '|', '–', '—', '·', '>', '→', '->'}
+    mots = titre_normalise.split(' ')
+    return [mot for mot in mots if mot and mot not in separateurs]
+
+
+def extraire_procedures(jeu_donnees):
+    return [doc for doc in jeu_donnees if doc.get("type") == "XML_procedure"]
+
+
+# =====================================================================
+# MOTEUR D'OVERLAY ET D'ALIGNEMENT INTERNE (INLINE DIFF)
+# =====================================================================
+
+def generer_overlay_diff(texte_v1, texte_v2):
+    """
+    Fusionne le texte v1 et v2 en un seul flux lineaire condense.
+    Le texte identique est ecrit une seule fois.
+    Le texte modifie est encadre par le symbole distinctif : [ avant -> apres ]
+    """
+    clean_v1 = re.sub(r'\s+', ' ', texte_v1 or "").strip()
+    clean_v2 = re.sub(r'\s+', ' ', texte_v2 or "").strip()
+    
+    mots_v1 = clean_v1.split(' ') if clean_v1 else []
+    mots_v2 = clean_v2.split(' ') if clean_v2 else []
+    
+    if not mots_v1 and mots_v2:
+        return f"[ VIDE -> {' '.join(mots_v2)} ]", True
+    if mots_v1 and not mots_v2:
+        return f"[ {' '.join(mots_v1)} -> VIDE ]", True
+        
+    matcher = difflib.SequenceMatcher(None, mots_v1, mots_v2, autojunk=False)
+    segments_fusionnes = []
+    changement_detecte = False
+    
+    for action, i1, i2, j1, j2 in matcher.get_opcodes():
+        fragment_v1 = " ".join(mots_v1[i1:i2])
+        fragment_v2 = " ".join(mots_v2[j1:j2])
+        
+        if action == 'equal':
+            if fragment_v1:
+                segments_fusionnes.append(fragment_v1)
+        else:
+            # Filtrage du bruit et des symboles parasites
+            coeur_v1 = re.sub(r'[^a-zA-Z0-9À-ÿ]', '', fragment_v1).lower()
+            coeur_v2 = re.sub(r'[^a-zA-Z0-9À-ÿ]', '', fragment_v2).lower()
+            
+            if coeur_v1 == coeur_v2:
+                if fragment_v2:
+                    segments_fusionnes.append(fragment_v2)
+            else:
+                changement_detecte = True
+                str_avant = fragment_v1 if fragment_v1 else "VIDE"
+                str_apres = fragment_v2 if fragment_v2 else "VIDE"
+                segments_fusionnes.append(f"[ {str_avant} -> {str_apres} ]")
+                
+    return " ".join(segments_fusionnes), changement_detecte
+
+
+# =====================================================================
+# CONSTRUCTION ET PROPAGATION LOGIQUE DE L'ARBRE
+# =====================================================================
+
+def initialiser_noeud(nom, parent, dm_code=None, feuille=False):
+    noeud = Node(nom, parent=parent)
+    noeud.dm_code = dm_code
+    noeud.feuille = feuille
+    noeud.patches = []
+    noeud.statut = "BRANCHE"
+    return noeud
+
+
+def construire_trie(entrees, parent):
+    elements_ici = [e for e in entrees if not e[0]]
+    if elements_ici:
+        index_par_code = defaultdict(list)
+        for _, code, doc, version in elements_ici:
+            index_par_code[code].append((doc, version))
+            
+        for code, elements in index_par_code.items():
+            items_v1 = [doc for doc, version in elements if version == "v1"]
+            items_v2 = [doc for doc, version in elements if version == "v2"]
+            taille_max = max(len(items_v1), len(items_v2))
+            
+            for i in range(taille_max):
+                d1 = items_v1[i] if i < len(items_v1) else None
+                d2 = items_v2[i] if i < len(items_v2) else None
+                nom_feuille = f"[{code}]" if taille_max == 1 else f"[{code}] (p.{i+1})"
+                
+                noeud_feuille = initialiser_noeud(nom_feuille, parent, dm_code=code, feuille=True)
+                noeud_feuille.doc_v1 = d1
+                noeud_feuille.doc_v2 = d2
+
+    elements_restants = [e for e in entrees if e[0]]
+    if not elements_restants:
+        return
+        
+    groupes_branches = defaultdict(list)
+    for tokens, code, doc, version in elements_restants:
+        groupes_branches[tokens[0].lower()].append((tokens, code, doc, version))
+        
+    for _, groupe in sorted(groupes_branches.items()):
+        chemins = [e[0] for e in groupe]
+        longueur_minimale = min(len(c) for c in chemins)
+        prefixe_commun_taille = 0
+        
+        for i in range(longueur_minimale):
+            if len({c[i].lower() for c in chemins}) == 1:
+                prefixe_commun_taille = i + 1
+            else:
+                break
+                
+        nom_branche = " ".join(chemins[0][:prefixe_commun_taille])
+        noeud_intermediaire = initialiser_noeud(nom_branche, parent)
+        
+        donnees_enfants = [(t[prefixe_commun_taille:], c, d, v) for t, c, d, v in groupe]
+        construire_trie(donnees_enfants, noeud_intermediaire)
+
+
+def propager_bottom_up(racine):
+    for noeud in reversed(list(racine.descendants)):
+        if noeud.feuille:
+            d1 = getattr(noeud, 'doc_v1', None)
+            d2 = getattr(noeud, 'doc_v2', None)
+            
+            if d1 is None and d2 is not None:
+                noeud.statut = "AJOUTE"
+                overlay, a_change = generer_overlay_diff(None, d2["content"])
+                noeud.patches.append({"overlay": overlay, "dm_code": noeud.dm_code})
+            elif d2 is None and d1 is not None:
+                noeud.statut = "SUPPRIME"
+                overlay, a_change = generer_overlay_diff(d1["content"], None)
+                noeud.patches.append({"overlay": overlay, "dm_code": noeud.dm_code})
+            elif d1 is not None and d2 is not None:
+                overlay, a_change = generer_overlay_diff(d1["content"], d2["content"])
+                if not a_change:
+                    noeud.statut = "INCHANGE"
+                else:
+                    noeud.statut = "MODIFIE"
+                    noeud.patches.append({"overlay": overlay, "dm_code": noeud.dm_code})
+        else:
+            for enfant in noeud.children:
+                for patch in enfant.patches:
+                    noeud.patches.append(patch)
+
+
+# =====================================================================
+# CALCUL DU POIDS EN TOKENS SANS DOUBLONS (FACTORISÉ)
+# =====================================================================
+
+def estimer_tokens_arbre(noeud):
+    """
+    Calcule le volume de tokens reel du noeud.
+    Si plusieurs fichiers partagent la meme modification, le texte n'est compte
+    qu'une seule fois grace a la de-duplication des overlays.
+    """
+    overlays_uniques = {p["overlay"] for p in noeud.patches}
+    poids_global = sum(len(ov.split()) for ov in overlays_uniques)
+    noeud.tokens_cumules = poids_global
+    
+    if not noeud.feuille:
+        for enfant in noeud.children:
+            estimer_tokens_arbre(enfant)
+
+
+def planifier_appels_llm(racine, budget_max_appels=10, limite_tokens_par_appel=2000):
+    selection_pivots = [racine]
+    
+    continuer_decoupage = True
+    while continuer_decoupage:
+        continuer_decoupage = False
+        nouvelle_selection = []
+        
+        for noeud in selection_pivots:
+            if noeud.tokens_cumules > limite_tokens_par_appel and not noeud.feuille:
+                nouvelle_selection.extend(noeud.children)
+                continuer_decoupage = True
+            else:
+                nouvelle_selection.append(noeud)
+        selection_pivots = nouvelle_selection
+
+    if len(selection_pivots) > budget_max_appels:
+        return selection_pivots
+
+    while len(selection_pivots) < budget_max_appels:
+        noeuds_divisibles = [n for n in selection_pivots if not n.feuille]
+        if not noeuds_divisibles:
+            break
+            
+        noeud_cible = max(noeuds_divisibles, key=lambda n: n.tokens_cumules)
+        croissance_liste = len(noeud_cible.children) - 1
+        
+        if len(selection_pivots) + croissance_liste <= budget_max_appels:
+            selection_pivots.remove(noeud_cible)
+            selection_pivots.extend(noeud_cible.children)
+        else:
+            noeuds_eligibles = [
+                n for n in noeuds_divisibles 
+                if len(n.children) - 1 <= (budget_max_appels - len(selection_pivots))
+            ]
+            if not noeuds_eligibles:
+                break
+                
+            noeud_compromis = max(noeuds_eligibles, key=lambda n: n.tokens_cumules)
+            selection_pivots.remove(noeud_compromis)
+            selection_pivots.extend(noeud_compromis.children)
+            
+    return selection_pivots
+
+
+# =====================================================================
+# CONSTITUTION DU DICTIONNAIRE FINAL TOTALEMENT CONDENSÉ
+# =====================================================================
+
+def generer_dictionnaire_planning_condense(noeuds_pivots):
+    """
+    Construit le dictionnaire de planification final.
+    Regroupe les codes DM par modification unique (overlay) pour eviter toute redondance.
+    """
+    liste_appels = []
+    compteur_appels = 1
+    
+    for noeud in noeuds_pivots:
+        if noeud.tokens_cumules == 0:
+            continue
+            
+        chemin_groupe = " > ".join(ancetre.name for ancetre in noeud.path)
+        
+        # Inversion de la structure : On groupe les DM codes par texte d'overlay unique
+        alignement_modifs = defaultdict(list)
+        for patch in noeud.patches:
+            alignement_modifs[patch["overlay"]].append(patch["dm_code"])
+            
+        liste_blocs_factorises = []
+        for text_overlay, liste_codes in alignement_modifs.items():
+            liste_blocs_factorises.append({
+                "dm_codes": sorted(liste_codes),
+                "modification_overlay": text_overlay
+            })
+            
+        liste_appels.append({
+            "id_appel": compteur_appels,
+            "groupe": chemin_groupe,
+            "tokens_factorises": noeud.tokens_cumules,
+            "blocs_modifications": liste_blocs_factorises
+        })
+        compteur_appels += 1
+        
+    return {"planification": liste_appels}
+
+
+# =====================================================================
+# PIPELINE D'EXECUTION
+# =====================================================================
+
+if __name__ == "__main__":
+    liste_procs_v1 = extraire_procedures(dico_v1)
+    liste_procs_v2 = extraire_procedures(dico_v2)
+
+    liste_entrees = []
+    for doc in liste_procs_v1:
+        titre_brut = doc.get("extra_information", {}).get("DM_title", "Sans Titre")
+        code_dm = doc.get("extra_information", {}).get("DM_code", "INCONNU")
+        liste_entrees.append((normaliser_titre(titre_brut), code_dm, doc, "v1"))
+
+    for doc in liste_procs_v2:
+        titre_brut = doc.get("extra_information", {}).get("DM_title", "Sans Titre")
+        code_dm = doc.get("extra_information", {}).get("DM_code", "INCONNU")
+        liste_entrees.append((normaliser_titre(titre_brut), code_dm, doc, "v2"))
+
+    liste_entrees.sort(key=lambda x: [t.lower() for t in x[0]])
+
+    racine_arbre = initialiser_noeud("Procedural", parent=None)
+    construire_trie(liste_entrees, racine_arbre)
+    propager_bottom_up(racine_arbre)
+    estimer_tokens_arbre(racine_arbre)
+
+    noeuds_optimales = planifier_appels_llm(
+        racine_arbre, 
+        budget_max_appels=5, 
+        limite_tokens_par_appel=100
+    )
+
+    planning_final = generer_dictionnaire_planning_condense(noeuds_optimales)
+    print(json.dumps(planning_final, indent=4, ensure_ascii=False))
+
+
+
+
+
 
 import re
 import difflib
