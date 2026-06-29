@@ -1,3 +1,103 @@
+
+def estimer_tokens_arbre(noeud):
+    """
+    Calcule récursivement le poids en tokens (mots) de chaque nœud.
+    À exécuter une fois que les patches sont propagés dans l'arbre.
+    """
+    if noeud.feuille:
+        # Estimation du volume : mots dans le bloc AVANT + mots dans le bloc APRÈS
+        poids = 0
+        for p in noeud.patches:
+            poids += len(p["avant"].split()) + len(p["apres"].split())
+        noeud.tokens_cumules = poids
+    else:
+        # Pour une branche, c'est la somme des tokens de tous ses descendants
+        for enfant in noeud.children:
+            estimer_tokens_arbre(enfant)
+        noeud.tokens_cumules = sum(enfant.tokens_cumules for enfant in noeud.children)
+
+
+def planifier_appels_llm(racine, M=10, limit_token=2000):
+    """
+    Trouve la ligne de coupe optimale dans l'arbre pour respecter
+    la limite de tokens par appel et maximiser l'utilisation du budget M.
+    """
+    # On commence avec l'arbre entier (1 seul gros paquet)
+    coupe_actuelle = [racine]
+    
+    # -------------------------------------------------------------------------
+    # PHASE 1 : Forcer le découpage tant qu'un nœud dépasse la limite de tokens
+    # -------------------------------------------------------------------------
+    en_cours = True
+    while en_cours:
+        en_cours = False
+        nouvelle_coupe = []
+        for noeud in coupe_actuelle:
+            if noeud.tokens_cumules > limit_token and not noeud.feuille:
+                # Le nœud est trop lourd, on le remplace par ses enfants
+                nouvelle_coupe.extend(noeud.children)
+                en_cours = True
+            else:
+                nouvelle_coupe.append(noeud)
+        coupe_actuelle = nouvelle_coupe
+
+    # Vérification : si après la phase 1 on dépasse déjà M, le problème est impossible
+    if len(coupe_actuelle) > M:
+        print(f"❌ Impossible de respecter les contraintes : il faut au moins {len(coupe_actuelle)} "
+              f"appels pour ne pas dépasser {limit_token} tokens, mais votre budget M est de {M}.")
+        return coupe_actuelle
+
+    # -------------------------------------------------------------------------
+    # PHASE 2 : Profiter du budget M restant pour soulager les plus gros packages
+    # -------------------------------------------------------------------------
+    while len(coupe_actuelle) < M:
+        # On cherche les nœuds de notre sélection qui peuvent encore être divisés
+        noeuds_divisibles = [n for n in coupe_actuelle if not n.feuille]
+        if not noeuds_divisibles:
+            break # Plus aucun nœud n'est divisible (on a atteint les feuilles)
+            
+        # On cible le nœud le plus lourd pour l'éclater
+        gros_noeud = max(noeuds_divisibles, key=lambda n: n.tokens_cumules)
+        
+        # On calcule combien de nœuds l'éclatement va ajouter au total
+        impact_croissance = len(gros_noeud.children) - 1
+        
+        if len(coupe_actuelle) + impact_croissance <= M:
+            # L'éclatement respecte le budget M, on applique
+            coupe_actuelle.remove(gros_noeud)
+            coupe_actuelle.extend(gros_noeud.children)
+        else:
+            # Si on éclate ce nœud, on dépasse M. On tente de voir s'il y en a un autre plus petit
+            # qui a moins d'enfants et qui pourrait rentrer dans le budget.
+            noeuds_valides = [n for n in noeuds_divisibles if len(n.children) - 1 <= (M - len(coupe_actuelle))]
+            if not noeuds_valides:
+                break # Aucun nœud ne peut être éclaté sans exploser M
+            
+            meilleur_compromis = max(noeuds_valides, key=lambda n: n.tokens_cumules)
+            coupe_actuelle.remove(meilleur_compromis)
+            coupe_actuelle.extend(meilleur_compromis.children)
+            
+    # -------------------------------------------------------------------------
+    # AFFICHAGE DU PLAN DE CHARGEMENT
+    # -------------------------------------------------------------------------
+    print("\n╔══════════════════════════════════════════════════════════════╗")
+    print(f"║     PLAN D'APPELS OPTIMISÉ : {len(coupe_actuelle)} REQUÊTES PLANIFIÉES / {M}     ║")
+    print("╚══════════════════════════════════════════════════════════════╝")
+    
+    for idx, noeud in enumerate(coupe_actuelle, 1):
+        chemin = " > ".join(a.name for a in noeud.path)
+        type_noeud = "📄 Feuille Unique" if noeud.feuille else "📁 Regroupement"
+        print(f" 🚀 Appel #{idx:02d} ({type_noeud})")
+        print(f"    └── Chemin : {chemin}")
+        print(f"    └── Poids  : {noeud.tokens_cumules} tokens (Max autorisé: {limit_token})")
+        
+    return coupe_actuelle
+
+
+
+
+
+
 # ... (Après la construction et la propagation de ton arbre)
 racine = make_node("Procédures", parent=None)
 construire_trie(entrees, racine)
