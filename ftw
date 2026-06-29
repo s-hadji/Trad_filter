@@ -1,3 +1,4 @@
+
 import re
 import difflib
 import json
@@ -5,7 +6,7 @@ import unicodedata
 from collections import defaultdict
 
 # =====================================================================
-# JEU DE DONNÉES DE TEST (Avec doublons pour tester la fusion des DM)
+# JEU DE DONNÉES DE TEST
 # =====================================================================
 
 dico_v1 = [
@@ -13,12 +14,6 @@ dico_v1 = [
         "type": "XML_procedure",
         "content": "Ouvrir la vanne de decharge principale doucement.",
         "extra_information": {"DM_title": "Hydraulique > Vannes > Decharge", "DM_code": "DM-HYD-001"}
-    },
-    {
-        "type": "XML_procedure",
-        "content": "Ouvrir la vanne de decharge principale doucement.", 
-        # Ce document est identique au DM-HYD-001 -> Ils vont fusionner
-        "extra_information": {"DM_title": "Hydraulique > Vannes > Decharge", "DM_code": "DM-HYD-004"}
     },
     {
         "type": "XML_procedure",
@@ -40,13 +35,10 @@ dico_v2 = [
     },
     {
         "type": "XML_procedure",
-        "content": "Ouvrir la vanne de decharge principale rapidement et verifier le manometre.",
-        "extra_information": {"DM_title": "Hydraulique > Vannes > Decharge", "DM_code": "DM-HYD-004"}
-    },
-    {
-        "type": "XML_procedure",
-        "content": "Couper le disjoncteur general de la cabine.,", 
-        # Symbole parasite ignore par le filtre
+        "content": "Couper le disjoncteur general de la cabine.((,),", 
+        # Ici on a accumule plein de symboles collés : . ( ( , ) ,
+        # Le tokenizer va tous les isoler un par un. Le filtre verra qu'il n'y a pas
+        # de nouveau mot alphanumérique et ignorera cette modification parasite.
         "extra_information": {"DM_title": "Electricite > Basse Tension", "DM_code": "DM-ELEC-002"}
     },
     {
@@ -97,7 +89,7 @@ class Node:
 
 
 # =====================================================================
-# NETTOYAGE ET NORMALISATION
+# NETTOYAGE ET NORMALISATION DES TITRES
 # =====================================================================
 
 def normaliser_titre(titre):
@@ -116,56 +108,57 @@ def extraire_procedures(jeu_donnees):
 
 
 # =====================================================================
-# MOTEUR D'OVERLAY ET D'ALIGNEMENT INTERNE (INLINE DIFF)
+# MOTEUR DE DIFF PAR TOKENISATION ALPHANUMÉRIQUE / SYMBOLE
 # =====================================================================
 
-def generer_overlay_diff(texte_v1, texte_v2):
+def extraire_tokens_perfo(texte):
     """
-    Fusionne le texte v1 et v2 en un seul flux lineaire condense.
-    Le texte identique est ecrit une seule fois.
-    Le texte modifie est encadre par le symbole distinctif : [ avant -> apres ]
+    Tokenise finement le texte selon deux regles strictes :
+    1. Les blocs de caracteres alphanumeriques (lettres avec accents + chiffres) sont regroupes.
+    2. Chaque symbole ou caractere de ponctuation individuel devient un token independant.
+    Les espaces blancs servent uniquement de separateurs et sont jetes.
     """
-    clean_v1 = re.sub(r'\s+', ' ', texte_v1 or "").strip()
-    clean_v2 = re.sub(r'\s+', ' ', texte_v2 or "").strip()
+    if not texte:
+        return []
+    # REGEX : [a-zA-Z0-9À-ÿ]+ -> capture un mot complet
+    #         | -> OU
+    #         [^a-zA-Z0-9À-ÿ\s] -> capture n'importe quel caractere unique (hors alphanum et espace)
+    pattern = r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]'
+    return re.findall(pattern, texte)
+
+
+def calculer_diff_mots(texte_v1, texte_v2):
+    """
+    Analyse les differences textuelles a partir du tokenizer ultra-perfo.
+    Si la difference ne contient aucun changement alphanumerique significatif
+    (uniquement du bruit ou du symbole parasite), le patch est supprime.
+    """
+    mots_v1 = extraire_tokens_perfo(texte_v1)
+    mots_v2 = extraire_tokens_perfo(texte_v2)
     
-    mots_v1 = clean_v1.split(' ') if clean_v1 else []
-    mots_v2 = clean_v2.split(' ') if clean_v2 else []
-    
-    if not mots_v1 and mots_v2:
-        return f"[ VIDE -> {' '.join(mots_v2)} ]", True
-    if mots_v1 and not mots_v2:
-        return f"[ {' '.join(mots_v1)} -> VIDE ]", True
-        
     matcher = difflib.SequenceMatcher(None, mots_v1, mots_v2, autojunk=False)
-    segments_fusionnes = []
-    changement_detecte = False
+    patches_bruts = [
+        (" ".join(mots_v1[i1:i2]), " ".join(mots_v2[j1:j2]))
+        for action, i1, i2, j1, j2 in matcher.get_opcodes() if action != 'equal'
+    ]
     
-    for action, i1, i2, j1, j2 in matcher.get_opcodes():
-        fragment_v1 = " ".join(mots_v1[i1:i2])
-        fragment_v2 = " ".join(mots_v2[j1:j2])
+    patches_filtres = []
+    for avant, apres in patches_bruts:
+        # Extraction du "coeur" uniquement composé de lettres/chiffres pour comparer le fond
+        coeur_avant = re.sub(r'[^a-zA-Z0-9À-ÿ]', '', avant).lower()
+        coeur_apres = re.sub(r'[^a-zA-Z0-9À-ÿ]', '', apres).lower()
         
-        if action == 'equal':
-            if fragment_v1:
-                segments_fusionnes.append(fragment_v1)
-        else:
-            # Filtrage du bruit et des symboles parasites
-            coeur_v1 = re.sub(r'[^a-zA-Z0-9À-ÿ]', '', fragment_v1).lower()
-            coeur_v2 = re.sub(r'[^a-zA-Z0-9À-ÿ]', '', fragment_v2).lower()
+        # Si le contenu textuel reel est identique, c'est une modification purement parasite
+        if coeur_avant == coeur_apres:
+            continue
             
-            if coeur_v1 == coeur_v2:
-                if fragment_v2:
-                    segments_fusionnes.append(fragment_v2)
-            else:
-                changement_detecte = True
-                str_avant = fragment_v1 if fragment_v1 else "VIDE"
-                str_apres = fragment_v2 if fragment_v2 else "VIDE"
-                segments_fusionnes.append(f"[ {str_avant} -> {str_apres} ]")
-                
-    return " ".join(segments_fusionnes), changement_detecte
+        patches_filtres.append((avant, apres))
+        
+    return patches_filtres
 
 
 # =====================================================================
-# CONSTRUCTION ET PROPAGATION LOGIQUE DE L'ARBRE
+# CONSTRUCTION DE L'ARBRE ET PROPAGATION
 # =====================================================================
 
 def initialiser_noeud(nom, parent, dm_code=None, feuille=False):
@@ -232,19 +225,23 @@ def propager_bottom_up(racine):
             
             if d1 is None and d2 is not None:
                 noeud.statut = "AJOUTE"
-                overlay, a_change = generer_overlay_diff(None, d2["content"])
-                noeud.patches.append({"overlay": overlay, "dm_code": noeud.dm_code})
+                noeud.patches.append({"avant": "VIDE", "apres": d2["content"], "dm_code": noeud.dm_code})
             elif d2 is None and d1 is not None:
                 noeud.statut = "SUPPRIME"
-                overlay, a_change = generer_overlay_diff(d1["content"], None)
-                noeud.patches.append({"overlay": overlay, "dm_code": noeud.dm_code})
+                noeud.patches.append({"avant": d1["content"], "apres": "VIDE", "dm_code": noeud.dm_code})
             elif d1 is not None and d2 is not None:
-                overlay, a_change = generer_overlay_diff(d1["content"], d2["content"])
-                if not a_change:
+                liste_diffs = calculer_diff_mots(d1["content"], d2["content"])
+                
+                if not liste_diffs:
                     noeud.statut = "INCHANGE"
                 else:
                     noeud.statut = "MODIFIE"
-                    noeud.patches.append({"overlay": overlay, "dm_code": noeud.dm_code})
+                    for avant, apres in liste_diffs:
+                        noeud.patches.append({
+                            "avant": avant,
+                            "apres": apres,
+                            "dm_code": noeud.dm_code
+                        })
         else:
             for enfant in noeud.children:
                 for patch in enfant.patches:
@@ -252,22 +249,19 @@ def propager_bottom_up(racine):
 
 
 # =====================================================================
-# CALCUL DU POIDS EN TOKENS SANS DOUBLONS (FACTORISÉ)
+# SYSTEME DE PLANIFICATION PAR JETONS (TOKENS)
 # =====================================================================
 
 def estimer_tokens_arbre(noeud):
-    """
-    Calcule le volume de tokens reel du noeud.
-    Si plusieurs fichiers partagent la meme modification, le texte n'est compte
-    qu'une seule fois grace a la de-duplication des overlays.
-    """
-    overlays_uniques = {p["overlay"] for p in noeud.patches}
-    poids_global = sum(len(ov.split()) for ov in overlays_uniques)
-    noeud.tokens_cumules = poids_global
-    
-    if not noeud.feuille:
+    if noeud.feuille:
+        poids = 0
+        for patch in noeud.patches:
+            poids += len(patch["avant"].split()) + len(patch["apres"].split())
+        noeud.tokens_cumules = poids
+    else:
         for enfant in noeud.children:
             estimer_tokens_arbre(enfant)
+        noeud.tokens_cumules = sum(enfant.tokens_cumules for enfant in noeud.children)
 
 
 def planifier_appels_llm(racine, budget_max_appels=10, limite_tokens_par_appel=2000):
@@ -316,14 +310,10 @@ def planifier_appels_llm(racine, budget_max_appels=10, limite_tokens_par_appel=2
 
 
 # =====================================================================
-# CONSTITUTION DU DICTIONNAIRE FINAL TOTALEMENT CONDENSÉ
+# CONSTITUTION DU PLANNING LLM
 # =====================================================================
 
-def generer_dictionnaire_planning_condense(noeuds_pivots):
-    """
-    Construit le dictionnaire de planification final.
-    Regroupe les codes DM par modification unique (overlay) pour eviter toute redondance.
-    """
+def generer_dictionnaire_planning(noeuds_pivots):
     liste_appels = []
     compteur_appels = 1
     
@@ -333,23 +323,19 @@ def generer_dictionnaire_planning_condense(noeuds_pivots):
             
         chemin_groupe = " > ".join(ancetre.name for ancetre in noeud.path)
         
-        # Inversion de la structure : On groupe les DM codes par texte d'overlay unique
-        alignement_modifs = defaultdict(list)
+        liste_contenu = []
         for patch in noeud.patches:
-            alignement_modifs[patch["overlay"]].append(patch["dm_code"])
-            
-        liste_blocs_factorises = []
-        for text_overlay, liste_codes in alignement_modifs.items():
-            liste_blocs_factorises.append({
-                "dm_codes": sorted(liste_codes),
-                "modification_overlay": text_overlay
+            liste_contenu.append({
+                "dm_code": patch["dm_code"],
+                "avant": patch["avant"],
+                "apres": patch["apres"]
             })
             
         liste_appels.append({
             "id_appel": compteur_appels,
             "groupe": chemin_groupe,
-            "tokens_factorises": noeud.tokens_cumules,
-            "blocs_modifications": liste_blocs_factorises
+            "tokens": noeud.tokens_cumules,
+            "contenu": liste_contenu
         })
         compteur_appels += 1
         
@@ -357,7 +343,7 @@ def generer_dictionnaire_planning_condense(noeuds_pivots):
 
 
 # =====================================================================
-# PIPELINE D'EXECUTION
+# PIPELINE PRINCIPAL
 # =====================================================================
 
 if __name__ == "__main__":
@@ -388,7 +374,7 @@ if __name__ == "__main__":
         limite_tokens_par_appel=100
     )
 
-    planning_final = generer_dictionnaire_planning_condense(noeuds_optimales)
+    planning_final = generer_dictionnaire_planning(noeuds_optimales)
     print(json.dumps(planning_final, indent=4, ensure_ascii=False))
 
 
