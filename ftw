@@ -46,6 +46,401 @@ class Node:
             current = current.parent
         return path
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FONCTIONS DE NETTOYAGE ET SÉPARATION FINE (TOKENIZER PERFO)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def normaliser(ligne):
+    if not ligne:
+        return []
+    ligne = unicodedata.normalize('NFKC', ligne.splitlines()[0])
+    ligne = re.sub(r'\s+', ' ', ligne).strip()
+    return [t for t in ligne.split(' ') if t and t not in TOKENS_PARASITES]
+
+def extraire(dico):
+    return [d for d in dico if d["type"] == "XML_procedure"]
+
+def extraire_tokens_perfo(texte):
+    if not texte:
+        return []
+    pattern = r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]'
+    return re.findall(pattern, text=texte)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MOTEUR DE DIFF ET FUSION PAR CONTIGUÏTÉ RETRAVAILLÉ
+# ══════════════════════════════════════════════════════════════════════════════
+
+def diff_contenu(t1, t2):
+    mots_v1 = extraire_tokens_perfo(t1)
+    mots_v2 = extraire_tokens_perfo(t2)
+    
+    matcher = difflib.SequenceMatcher(None, mots_v1, mots_v2, autojunk=False)
+    opcodes = matcher.get_opcodes()
+    
+    # SEUIL DE CONTIGUÏTÉ : Si moins de 5 mots identiques séparent deux changements,
+    # on fusionne tout en un seul grand bloc logique.
+    SEUIL_CONTIGUITE = 5
+    blocs_fusionnes = []
+    
+    for action, i1, i2, j1, j2 in opcodes:
+        if action != 'equal':
+            if not blocs_fusionnes:
+                blocs_fusionnes.append([i1, i2, j1, j2])
+            else:
+                dernier = blocs_fusionnes[-1]
+                dist_v1 = i1 - dernier[1]
+                dist_v2 = j1 - dernier[3]
+                
+                if dist_v1 <= SEUIL_CONTIGUITE and dist_v2 <= SEUIL_CONTIGUITE:
+                    # Extension et absorption de la zone intermédiaire
+                    dernier[1] = i2
+                    dernier[3] = j2
+                else:
+                    blocs_fusionnes.append([i1, i2, j1, j2])
+        
+    patches_filtres = []
+    for min_i, max_i, min_j, max_j in blocs_fusionnes:
+        avant = " ".join(mots_v1[min_i:max_i])
+        apres = " ".join(mots_v2[min_j:max_j])
+        
+        coeur_avant = re.sub(r'[^a-zA-Z0-9À-ÿ]', '', avant).lower()
+        coeur_apres = re.sub(r'[^a-zA-Z0-9À-ÿ]', '', apres).lower()
+        if coeur_avant == coeur_apres and coeur_avant != "":
+            continue
+            
+        patches_filtres.append((avant, apres))
+        
+    return patches_filtres
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GESTION ET PROPAGATION DANS L'ARBRE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def construire_trie(entrees, parent):
+    ici = [e for e in entrees if not e[0]]
+    if ici:
+        by_code = defaultdict(list)
+        for _, code, doc, version in ici:
+            by_code[code].append((doc, version))
+        for code, items in by_code.items():
+            v1_items = [doc for doc, version in items if version == "v1"]
+            v2_items = [doc for doc, version in items if version == "v2"]
+            max_len = max(len(v1_items), len(v2_items))
+            for i in range(max_len):
+                d1 = v1_items[i] if i < len(v1_items) else None
+                d2 = v2_items[i] if i < len(v2_items) else None
+                nom_feuille = f"[{code}]" + (f" (p.{i+1})" if max_len > 1 else "")
+                noeud_feuille = Node(nom_feuille, parent=parent)
+                noeud_feuille.dm_code = code
+                noeud_feuille.feuille = True
+                noeud_feuille.doc_v1 = d1
+                noeud_feuille.doc_v2 = d2
+
+    restants = [e for e in entrees if e[0]]
+    if not restants: return
+    groupes = defaultdict(list)
+    for tokens, code, doc, version in restants:
+        groupes[tokens[0].lower()].append((tokens, code, doc, version))
+    for _, groupe in sorted(groupes.items()):
+        chemins = [e[0] for e in groupe]
+        min_len = min(len(c) for c in chemins)
+        n_commun = 0
+        for i in range(min_len):
+            if len({c[i].lower() for c in chemins}) == 1: n_commun = i + 1
+            else: break
+        nom_branche = " ".join(chemins[0][:n_commun])
+        noeud_intermediaire = Node(nom_branche, parent=parent)
+        construire_trie([(t[n_commun:], c, d, v) for t, c, d, v in groupe], noeud_intermediaire)
+
+
+def propager_bottom_up(racine):
+    """Identifie le statut et génère des descriptions claires pour les structures."""
+    for noeud in reversed(list(racine.descendants)):
+        if noeud.feuille:
+            d1 = getattr(noeud, 'doc_v1', None)
+            d2 = getattr(noeud, 'doc_v2', None)
+            
+            # Insertions : Message propre sans saturer de tokens
+            if d1 is None and d2 is not None:
+                noeud.statut = "AJOUTE"
+                noeud.patches.append({
+                    "avant": "[Néant - Nouveau Module Documentaire]", 
+                    "apres": f"Création et insertion complète du module {noeud.dm_code}", 
+                    "dm_code": noeud.dm_code
+                })
+            # Suppressions
+            elif d2 is None and d1 is not None:
+                noeud.statut = "SUPPRIME"
+                noeud.patches.append({
+                    "avant": f"Suppression complète du module {noeud.dm_code}", 
+                    "apres": "[Supprimé du référentiel]", 
+                    "dm_code": noeud.dm_code
+                })
+            elif d1 is not None and d2 is not None:
+                t1, t2 = d1["content"], d2["content"]
+                if re.sub(r'\s+', ' ', t1).strip() == re.sub(r'\s+', ' ', t2).strip():
+                    noeud.statut = "INCHANGE"
+                else:
+                    noeud.statut = "MODIFIE"
+                    for avant, apres in diff_contenu(t1, t2):
+                        noeud.patches.append({"avant": avant, "apres": apres, "dm_code": noeud.dm_code})
+        else:
+            for patch in [p for enfant in noeud.children for p in enfant.patches]:
+                noeud.patches.append(patch)
+
+
+def estimer_tokens_arbre(noeud):
+    modifs_uniques = {(p["avant"], p["apres"]) for p in noeud.patches}
+    noeud.tokens_cumules = sum(len(av.split()) + len(ap.split()) for av, ap in modifs_uniques)
+    if not noeud.feuille:
+        for enfant in noeud.children:
+            estimer_tokens_arbre(enfant)
+
+
+def planifier_appels_llm(racine, budget_max_appels=10, limite_tokens_par_appel=2000):
+    selection_pivots = [racine]
+    continuer = True
+    while continuer:
+        continuer = False
+        nouvelle_selection = []
+        for noeud in selection_pivots:
+            if noeud.tokens_cumules > limite_tokens_par_appel and not noeud.feuille:
+                nouvelle_selection.extend(noeud.children)
+                continuer = True
+            else:
+                nouvelle_selection.append(noeud)
+        selection_pivots = nouvelle_selection
+    return selection_pivots[:budget_max_appels]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COMPACTAGE ET FACTORISATION PAR TRAJECTOIRE STRICTE (LA CORRECTION)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extraire_payload_du_pivot(noeud_pivot):
+    """
+    Regroupe les modules par TRAJECTOIRE EXACTE (Même Avant -> Même Après).
+    Supprime définitivement les notations illisibles de type [ A | B ].
+    """
+    packs_chapitres = []
+    
+    # Récupération des feuilles valides sous le pivot
+    noeuds_feuilles = [noeud_pivot] if noeud_pivot.feuille else [n for n in noeud_pivot.descendants if n.feuille and n.patches]
+    if not noeuds_feuilles and noeud_pivot.patches:
+        noeuds_feuilles = [noeud_pivot]
+
+    # Étape 1 : Classer les patches par Chapitre d'arborescence (Pour situer le "Où")
+    patches_par_chapitre = defaultdict(list)
+    for n in noeuds_feuilles:
+        # Nettoyage du nom de chemin pour ne garder que les dossiers de l'arborescence
+        chemin = " > ".join(a.name for a in n.path if not a.name.startswith("["))
+        for p in n.patches:
+            patches_par_chapitre[chemin].append(p)
+
+    # Étape 2 : Pour chaque chapitre, factoriser uniquement par trajectoire identique
+    for chapitre, liste_patches in patches_par_chapitre.items():
+        trajectoires_identiques = defaultdict(set)
+        
+        for p in liste_patches:
+            cle_trajectoire = (p["avant"].strip(), p["apres"].strip())
+            trajectoires_identiques[cle_trajectoire].add(p["dm_code"])
+            
+        changements_facto = []
+        for (avant, apres), codes_dm in trajectoires_identiques.items():
+            changements_facto.append({
+                "dm_codes": sorted(list(codes_dm)), # Liste claire des modules impactés par cette modif exacte
+                "texte_avant": avant,
+                "texte_apres": apres
+            })
+            
+        if changements_facto:
+            packs_chapitres.append({
+                "chapitre": chapitre,
+                "changements": changements_facto
+            })
+            
+    return packs_chapitres
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SCHÉMAS DE SORTIE STRUCTURÉE (PYDANTIC) ET LLM PIPELINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ModificationDetaillee(BaseModel):
+    descriptions: List[str] = Field(
+        description="Description métier claire de l'évolution (ex: 'Mise à jour du couple de serrage à 45 Nm')."
+    )
+
+class SectionFicheVersion(BaseModel):
+    chapitre: str = Field(description="Dossier ou arborescence concernée.")
+    codes_dm: List[str] = Field(description="Modules ayant subi ce changement exact.")
+    modifications_apportees: ModificationDetaillee = Field(description="Explication descriptive.")
+
+class FicheVersionGlobale(BaseModel):
+    titre_fiche: str = Field(description="Titre de la note d'évolution.")
+    resume_macro: str = Field(description="Synthèse globale de haut niveau.")
+    sections: List[SectionFicheVersion] = Field(description="Liste des blocs de modifications.")
+
+
+def generer_fiche_version_llm(noeud_pivot) -> FicheVersionGlobale:
+    donnees_pack = extraire_payload_du_pivot(noeud_pivot)
+    payload_textuel = json.dumps(donnees_pack, indent=2, ensure_ascii=False)
+    
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
+    llm_structure = llm.with_structured_output(FicheVersionGlobale)
+    
+    prompt_template = ChatPromptTemplate.from_messages([
+        ("system", (
+            "Vous êtes un ingénieur expert en documentation technique aéronautique et industrielle.\n"
+            "Votre rôle est d'expliquer les modifications apportées à des modules de maintenance.\n\n"
+            "Consignes d'analyse :\n"
+            "- Les données fournies contiennent une liste explicite de modules ('dm_codes') associés à "
+            "leur état d'origine ('texte_avant') et leur nouvel état ('texte_apres').\n"
+            "- Expliquez de manière fluide et technique ce qui a changé. Ne parlez jamais de la structure du JSON.\n"
+            "- Soyez factuel, neutre et n'utilisez aucun émoji ou artifice graphique."
+        )),
+        ("user", (
+            "Voici les données claires de notre pack (Pivot : {nom_pivot}) :\n\n"
+            "{input_data}\n\n"
+            "Générez l'analyse des évolutions."
+        ))
+    ])
+    
+    chaine = prompt_template | llm_structure
+    return chaine.invoke({"nom_pivot": noeud_pivot.name, "input_data": payload_textuel})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# JEU DE TEST (DÉMONSTRATION DE LA CLARTÉ)
+# ══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    dico_v1 = [
+        {
+            "type": "XML_procedure", 
+            "content": "Serrer la vanne d'isolement principale. Attendre deux minutes. Ouvrir le clapet.",
+            "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}
+        },
+        {
+            "type": "XML_procedure", 
+            "content": "Serrer la vanne d'isolement principale. Attendre deux minutes. Ouvrir le clapet.",
+            "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-002"}
+        }
+    ]
+
+    dico_v2 = [
+        # DM-001 et DM-002 subissent la même modification contiguë (fusionnée par le nouveau seuil)
+        {
+            "type": "XML_procedure", 
+            "content": "Serrer la vanne d'isolement à 45 Nm. Attendre deux minutes. Vérifier la pression et ouvrir le clapet.",
+            "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}
+        },
+        {
+            "type": "XML_procedure", 
+            "content": "Serrer la vanne d'isolement à 45 Nm. Attendre deux minutes. Vérifier la pression et ouvrir le clapet.",
+            "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-002"}
+        },
+        # Une insertion pure (Nouveau module) : gérée à part de manière ultra-claire
+        {
+            "type": "XML_procedure", 
+            "content": "Procédure complète de sécurité électrique cabine.",
+            "extra_information": {"DM_title": "Electricite > Basse Tension", "DM_code": "DM-ELEC-003"}
+        }
+    ]
+
+    liste_v1 = extraire(dico_v1)
+    liste_v2 = extraire(dico_v2)
+
+    entrees = []
+    for d in list_v1:
+        entrees.append((normaliser(d["extra_information"]["DM_title"]), d["extra_information"]["DM_code"], d, "v1"))
+    for d in list_v2:
+        entrees.append((normaliser(d["extra_information"]["DM_title"]), d["extra_information"]["DM_code"], d, "v2"))
+
+    entrees.sort(key=lambda x: [t.lower() for t in x[0]])
+
+    racine = Node("Procédures", parent=None)
+    construire_trie(entrees, racine)
+    propager_bottom_up(racine)
+    estimer_tokens_arbre(racine)
+    
+    pivots = plan_appels = planifier_appels_llm(racine, budget_max_appels=3, limite_tokens_par_appel=200)
+
+    for index, pivot in enumerate(pivots, 1):
+        if pivot.tokens_cumules == 0: continue
+        try:
+            fiche = generer_fiche_version_llm(pivot)
+            print(f"\n=== NOTE DE VERSION PACK {index} ===")
+            print(f"Macro : {fiche.resume_macro}")
+            for sec in fiche.sections:
+                print(f" Chapitre  : {sec.chapitre}")
+                print(f" Module(s) : {', '.join(sec.codes_dm)}")
+                for desc in sec.modifications_apportees.descriptions:
+                    print(f"   - {desc}")
+            print("=" * 45)
+        except Exception as e:
+            print(f"Erreur Pack {index} : {e}")
+
+
+
+
+
+
+
+
+
+
+import re
+import difflib
+import json
+import unicodedata
+from collections import defaultdict
+from typing import List
+from pydantic import BaseModel, Field
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STRUCTURE DE L'ARBRE (STANDALONE AVEC TOKENS CUMULÉS)
+# ══════════════════════════════════════════════════════════════════════════════
+
+TOKENS_PARASITES = {'-', '/', '|', '–', '—', '·', '>', '→', '->'}
+
+class Node:
+    def __init__(self, name, parent=None):
+        self.name = name
+        self.parent = parent
+        self.children = []
+        if parent:
+            parent.children.append(self)
+        self.dm_code = None
+        self.feuille = False
+        self.patches = []          
+        self.statut = "BRANCHE"
+        self.tokens_cumules = 0  
+        self.doc_v1 = None
+        self.doc_v2 = None
+
+    @property
+    def descendants(self):
+        nodes = []
+        for child in self.children:
+            nodes.append(child)
+            nodes.extend(child.descendants)
+        return nodes
+
+    @property
+    def path(self):
+        path = []
+        current = self
+        while current:
+            path.insert(0, current)
+            current = current.parent
+        return path
+
     @property
     def depth(self):
         return len(self.path) - 1
