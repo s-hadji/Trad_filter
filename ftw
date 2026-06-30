@@ -1,3 +1,263 @@
+import difflib
+import json
+from typing import List
+from pydantic import BaseModel, Field
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. STRUCTURE DE L'ARBRE UNIFIÉ
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Node:
+    def __init__(self, name, parent=None):
+        self.name = name
+        self.parent = parent
+        self.children = {}  # Stockage direct par {nom: Node} pour l'efficacité
+        self.is_leaf = False
+        self.dm_code = None
+        self.v1 = None
+        self.v2 = None
+        self.difference = None  # Contiendra le bloc de diff textuel avec contexte (ou None)
+        self.tokens = 0
+
+    @property
+    def path(self):
+        """Reconstitue la chaîne des nœuds du sommet jusqu'à cette entité."""
+        chemin = []
+        courant = self
+        while courant:
+            chemin.insert(0, courant)
+            courant = courant.parent
+        return chemin
+
+
+def batir_arbre(docs_v1, docs_v2):
+    """Construit un arbre unique en fusionnant l'arborescence de la V1 et de la V2."""
+    racine = Node("Root")
+    
+    for d in docs_v1:
+        courant = racine
+        for etape in d["path"]:
+            courant = courant.children.setdefault(etape, Node(etape, parent=courant))
+        feuille = courant.children.setdefault(d["dm_code"], Node(d["dm_code"], parent=courant))
+        feuille.is_leaf = True
+        feuille.dm_code = d["dm_code"]
+        feuille.v1 = d["content"]
+
+    for d in docs_v2:
+        courant = racine
+        for etape in d["path"]:
+            courant = courant.children.setdefault(etape, Node(etape, parent=courant))
+        feuille = courant.children.setdefault(d["dm_code"], Node(d["dm_code"], parent=courant))
+        feuille.is_leaf = True
+        feuille.dm_code = d["dm_code"]
+        feuille.v2 = d["content"]
+        
+    return racine
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. DIFF DE LIGNES AVEC CONTEXTE ET FILTRES ANTI-BRUIT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generer_diff_et_tokens(noeud):
+    """Compare par ligne avec 1 ligne de contexte et évalue les tokens de modification."""
+    if noeud.is_leaf:
+        t1 = (noeud.v1 or "").strip()
+        t2 = (noeud.v2 or "").strip()
+        
+        if t1 == t2:
+            noeud.difference = None
+            noeud.tokens = 0
+        else:
+            lignes_v1 = t1.splitlines()
+            lignes_v2 = t2.splitlines()
+            
+            # n=1 capture exactement 1 ligne de contexte inchangée avant et après chaque bloc modifié
+            diff_generateur = difflib.unified_diff(lignes_v1, lignes_v2, n=1, lineterm="")
+            liste_diff = list(diff_generateur)
+            
+            if len(liste_diff) > 2:
+                # Nettoyage des lignes d'en-tête système (--- et +++) inutiles au LLM
+                noeud.difference = "\n".join(liste_diff[2:])
+                # Évaluation budgétaire stricte sur la taille réelle du diff + son contexte
+                noeud.tokens = len(noeud.difference.split())
+            else:
+                noeud.difference = None
+                noeud.tokens = 0
+                
+    for enfant in noeud.children.values():
+        generer_diff_et_tokens(enfant)
+
+
+def clean_diff_tree(noeud):
+    """Élimine de l'arbre toutes les branches ou feuilles sans aucune modification."""
+    for nom, enfant in list(noeud.children.items()):
+        clean_diff_tree(enfant)
+        if (enfant.is_leaf and enfant.difference is None) or (not enfant.is_leaf and not enfant.children):
+            del noeud.children[nom]
+
+
+def imposer_poids_branches(noeud):
+    """Remonte récursivement la somme des tokens des feuilles vers les branches parentes."""
+    if noeud.is_leaf:
+        return noeud.tokens
+    noeud.tokens = sum(imposer_poids_branches(e) for e in noeud.children.values())
+    return noeud.tokens
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. PLANIFICATION ET EXTRACTION DU PAYLOAD
+# ══════════════════════════════════════════════════════════════════════════════
+
+def optimiser_appels_llm(racine, M, max_token):
+    """Détermine au maximum M nœuds pivots respectant le plafond max_token."""
+    pivots = [racine]
+    while len(pivots) < M:
+        candidats = [n for n in pivots if n.tokens > max_token and n.children]
+        if not candidats:
+            break
+        pire_noeud = max(candidats, key=lambda n: n.tokens)
+        if len(pivots) - 1 + len(pire_noeud.children) <= M:
+            pivots.remove(pire_noeud)
+            pivots.extend(pire_noeud.children.values())
+        else:
+            break
+    return pivots
+
+
+def extraire_payload_du_pivot(noeud_pivot):
+    """Extrait à plat toutes les feuilles modifiées situées sous un nœud pivot donné."""
+    def collecter_feuilles(n):
+        if n.is_leaf:
+            # Reconstitution textuelle du chapitre d'appartenance
+            chemin_chapitre = " > ".join(p.name for p in n.path[:-1] if p.name != "Root")
+            return [{
+                "chapitre": chemin_chapitre or "Général",
+                "dm_code": n.dm_code,
+                "difference": n.difference
+            }]
+        res = []
+        for child in n.children.values():
+            res.extend(collecter_feuilles(child))
+        return res
+    return collecter_feuilles(noeud_pivot)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. INTERFACES PYDANTIC ET APPEL LLM STRUCTURÉ
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ModificationDMC(BaseModel):
+    dm_code: str = Field(description="Le code d'identification du Data Module impacté.")
+    analyse_technique: str = Field(description="Description métier factuelle et rigoureuse des lignes modifiées visibles dans le diff.")
+
+class SectionChapitre(BaseModel):
+    chapitre: str = Field(description="Le chemin du chapitre cible de la documentation.")
+    analyses_modules: List[ModificationDMC] = Field(description="Analyses détaillées par module pour ce chapitre.")
+
+class FicheVersionGlobale(BaseModel):
+    titre_fiche: str = Field(description="Titre formel et professionnel de la note d'évolution.")
+    synthese_macro: str = Field(description="Résumé de haut niveau expliquant globalement l'orientation technique de ce paquet.")
+    sections: List[SectionChapitre] = Field(description="Ensemble des chapitres documentaires modifiés.")
+
+
+def generer_fiche_version_llm(noeud_pivot) -> FicheVersionGlobale:
+    """Consomme les diffs du pivot et pilote le LLM pour générer une note de version propre."""
+    donnees_pack = extraire_payload_du_pivot(noeud_pivot)
+    payload_textuel = json.dumps(donnees_pack, indent=2, ensure_ascii=False)
+    
+    # Configuration de l'agent OpenAI avec sortie fortement typée
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
+    llm_structure = llm.with_structured_output(FicheVersionGlobale)
+    
+    prompt_template = ChatPromptTemplate.from_messages([
+        ("system", (
+            "Vous êtes un ingénieur expert en documentation aéronautique et de maintenance.\n"
+            "Votre mission consiste à rédiger une note d'évolution technique claire à partir de fragments de diff unifié (unified diff).\n\n"
+            "Consigne d'analyse :\n"
+            "Chaque élément contient un champ 'difference' qui isole les lignes supprimées (-) et ajoutées (+) ainsi qu'une ligne de contexte d'origine.\n"
+            "Analysez la transformation technique subie par le fichier et documentez-la dans le champ 'analyse_technique'.\n\n"
+            "Règles impératives :\n"
+            "- Soyez direct, professionnel et factuel. N'utilisez aucun émoji ou symbole graphique.\n"
+            "- Ne mentionnez pas la structure technique du diff (ex: ne dites pas 'la ligne précédée d'un moins a été retirée').\n"
+            "- Traduisez directement les lignes en impact métier ou de procédure de maintenance."
+        )),
+        ("user", (
+            "Voici les paquets de diff capturés sous le pivot '{nom_pivot}' :\n\n"
+            "{input_data}\n\n"
+            "Générez l'analyse structurée correspondante."
+        ))
+    ])
+    
+    chaine = prompt_template | llm_structure
+    return chaine.invoke({"nom_pivot": noeud_pivot.name, "input_data": payload_textuel})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXÉCUTION DU PIPELINE (DÉMO)
+# ══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    # Simulation de fichiers aéronautiques (V1)
+    mock_v1 = [
+        {
+            "path": ["Hydraulique", "Vannes"], "dm_code": "DMC-01",
+            "content": "Étape 1 : Couper l'alimentation générale.\nÉtape 2 : Serrer l'écrou borgne doucement.\nÉtape 3 : Contrôler les voyants de bord."
+        },
+        {
+            "path": ["Hydraulique", "Vannes"], "dm_code": "DMC-02",
+            "content": "Étape 1 : Couper l'alimentation générale.\nÉtape 2 : Serrer l'écrou borgne doucement.\nÉtape 3 : Contrôler les voyants de bord."
+        }
+    ]
+
+    # Évolutions ciblées (V2) : DMC-01 change de valeur, DMC-02 reste identique
+    mock_v2 = [
+        {
+            "path": ["Hydraulique", "Vannes"], "dm_code": "DMC-01",
+            "content": "Étape 1 : Couper l'alimentation générale.\nÉtape 2 : Serrer l'écrou borgne à un couple de 45 Nm.\nÉtape 3 : Contrôler les voyants de bord."
+        },
+        {
+            "path": ["Hydraulique", "Vannes"], "dm_code": "DMC-02",
+            "content": "Étape 1 : Couper l'alimentation générale.\nÉtape 2 : Serrer l'écrou borgne doucement.\nÉtape 3 : Contrôler les voyants de bord."
+        }
+    ]
+
+    # Executer les étapes successives
+    arbre = batir_arbre(mock_v1, mock_v2)
+    generer_diff_et_tokens(arbre)
+    clean_diff_tree(arbre)          # <--- Élagage radical des éléments inchangés (DMC-02 disparaît)
+    imposer_poids_branches(arbre)   # <--- Calcul final des poids réels basés sur le diff
+    
+    # Découpage adaptatif
+    pivots_optimaux = optimiser_appels_llm(arbre, M=2, max_token=500)
+    
+    # Lancement du traitement LLM sur les pivots d'intérêts
+    for idx, pivot in enumerate(pivots_optimaux, 1):
+        if pivot.tokens == 0:
+            continue
+            
+        try:
+            fiche_finale = generer_fiche_version_llm(pivot)
+            
+            print(f"=== NOTE D'ÉVOLUTION TECHNIQUE (PACK {idx}) ===")
+            print(f"Titre : {fiche_finale.titre_fiche}")
+            print(f"Macro : {fiche_finale.synthese_macro}\n")
+            
+            for sec in fiche_finale.sections:
+                print(f" Chapitre : {sec.chapitre}")
+                for mod in sec.analyses_modules:
+                    print(f"   * Module : {mod.dm_code}")
+                    print(f"     Analyse : {mod.analyse_technique}")
+            print("=" * 45 + "\n")
+            
+        except Exception as e:
+            print(f"Erreur lors du traitement du pack {idx} : {e}")
+
+
+
+
 
 import re
 import difflib
