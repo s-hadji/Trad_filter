@@ -1,3 +1,548 @@
+import re
+import difflib
+import json
+import unicodedata
+from collections import defaultdict
+from typing import List
+from pydantic import BaseModel, Field
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STRUCTURE DE L'ARBRE (STANDALONE AVEC TOKENS CUMULÉS)
+# ══════════════════════════════════════════════════════════════════════════════
+
+TOKENS_PARASITES = {'-', '/', '|', '–', '—', '·', '>', '→', '->'}
+
+class Node:
+    def __init__(self, name, parent=None):
+        self.name = name
+        self.parent = parent
+        self.children = []
+        if parent:
+            parent.children.append(self)
+        self.dm_code = None
+        self.feuille = False
+        self.patches = []          
+        self.statut = "BRANCHE"
+        self.tokens_cumules = 0  
+        self.doc_v1 = None
+        self.doc_v2 = None
+
+    @property
+    def descendants(self):
+        nodes = []
+        for child in self.children:
+            nodes.append(child)
+            nodes.extend(child.descendants)
+        return nodes
+
+    @property
+    def path(self):
+        path = []
+        current = self
+        while current:
+            path.insert(0, current)
+            current = current.parent
+        return path
+
+    @property
+    def depth(self):
+        return len(self.path) - 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FONCTIONS DE NETTOYAGE ET SÉPARATION FINE (TOKENIZER PERFO)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def normaliser(ligne):
+    if not ligne:
+        return []
+    ligne = unicodedata.normalize('NFKC', ligne.splitlines()[0])
+    ligne = re.sub(r'\s+', ' ', ligne).strip()
+    return [t for t in ligne.split(' ') if t and t not in TOKENS_PARASITES]
+
+def extraire(dico):
+    return [d for d in dico if d["type"] == "XML_procedure"]
+
+def epurer_texte(t):
+    if not t: return ""
+    t_clean = re.sub(r'[\.,\(\)\[\]\{\}!\?;:\*\+\-/\|—–_§•·]', ' ', t)
+    return re.sub(r'\s+', ' ', t_clean).strip()
+
+def extraire_tokens_perfo(texte):
+    if not texte:
+        return []
+    pattern = r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]'
+    return re.findall(pattern, text=texte)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MOTEUR DE DIFF ET FUSION PAR CONTIGUÏTÉ RETRAVAILLÉ
+# ══════════════════════════════════════════════════════════════════════════════
+
+def diff_contenu(t1, t2):
+    mots_v1 = extraire_tokens_perfo(t1)
+    mots_v2 = extraire_tokens_perfo(t2)
+    
+    matcher = difflib.SequenceMatcher(None, mots_v1, mots_v2, autojunk=False)
+    opcodes = matcher.get_opcodes()
+    
+    # SEUIL DE CONTIGUÏTÉ : Si moins de 5 mots identiques séparent deux changements,
+    # on les fusionne pour former un seul et unique grand bloc logique.
+    SEUIL_CONTIGUITE = 5
+    blocs_fusionnes = []
+    
+    for action, i1, i2, j1, j2 in opcodes:
+        if action != 'equal':
+            if not blocs_fusionnes:
+                blocs_fusionnes.append([i1, i2, j1, j2])
+            else:
+                dernier = blocs_fusionnes[-1]
+                # Distance entre la fin du dernier bloc et le début du courant
+                dist_v1 = i1 - dernier[1]
+                dist_v2 = j1 - dernier[3]
+                
+                if dist_v1 <= SEUIL_CONTIGUITE and dist_v2 <= SEUIL_CONTIGUITE:
+                    # Extension du bloc précédent (absorption de la zone contiguë)
+                    dernier[1] = i2
+                    dernier[3] = j2
+                else:
+                    blocs_fusionnes.append([i1, i2, j1, j2])
+        else:
+            # Bloc identique, on passe mais il pourra être absorbé au prochain tour si très court
+            pass
+        
+    patches_filtres = []
+    for min_i, max_i, min_j, max_j in blocs_fusionnes:
+        avant = " ".join(mots_v1[min_i:max_i])
+        apres = " ".join(mots_v2[min_j:max_j])
+        
+        coeur_avant = re.sub(r'[^a-zA-Z0-9À-ÿ]', '', avant).lower()
+        coeur_apres = re.sub(r'[^a-zA-Z0-9À-ÿ]', '', apres).lower()
+        if coeur_avant == coeur_apres and coeur_avant != "":
+            continue
+            
+        patches_filtres.append((avant, apres))
+        
+    return patches_filtres
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ARBRE DE FACTORISATION ALIGNÉE VIA DIFFLIB
+# ══════════════════════════════════════════════════════════════════════════════
+
+def factoriser_textes_difflib(liste_textes):
+    if not liste_textes: return ""
+    if len(liste_textes) == 1: return liste_textes[0]
+        
+    current_mots = [w.lower() for w in liste_textes[0].split()]
+    for t in liste_textes[1:]:
+        t_mots = [w.lower() for w in t.split()]
+        sm = difflib.SequenceMatcher(None, current_mots, t_mots, autojunk=False)
+        new_mots = []
+        for block in sm.get_matching_blocks():
+            if block.size > 0:
+                new_mots.extend(current_mots[block.a : block.a + block.size])
+        current_mots = new_mots
+        
+    invariants_lower = current_mots
+    
+    if not invariants_lower:
+        seen = set()
+        unique_raw = []
+        for t in liste_textes:
+            t_clean = t.strip()
+            if t_clean.lower() not in seen:
+                seen.add(t_clean.lower())
+                unique_raw.append(t_clean if t_clean else "Ø")
+        if len(unique_raw) == 1: return unique_raw[0]
+        return "[ " + " | ".join(f"'{u}'" if u != "Ø" else "Ø" for u in unique_raw) + " ]"
+        
+    tous_segments = []
+    invariants_originaux_reference = None
+    
+    for t in liste_textes:
+        texte_mots = t.split()
+        segments = []
+        matched_orig = []
+        idx_t = 0
+        for inv_low in invariants_lower:
+            sub_segment = []
+            while idx_t < len(texte_mots) and texte_mots[idx_t].lower() != inv_low:
+                sub_segment.append(texte_mots[idx_t])
+                idx_t += 1
+            segments.append(" ".join(sub_segment))
+            if idx_t < len(texte_mots):
+                matched_orig.append(texte_mots[idx_t])
+                idx_t += 1
+            else:
+                matched_orig.append(inv_low)
+        segments.append(" ".join(texte_mots[idx_t:]))
+        tous_segments.append(segments)
+        if invariants_originaux_reference is None:
+            invariants_originaux_reference = matched_orig
+            
+    resultat_pieces = []
+    num_invariants = len(invariants_lower)
+    for i in range(num_invariants + 1):
+        choix_intervalle = [tous_segments[j][i] for j in range(len(liste_textes))]
+        seen_choix = set()
+        unique_choix = []
+        for c in choix_intervalle:
+            c_clean = c.strip()
+            if c_clean.lower() not in seen_choix:
+                seen_choix.add(c_clean.lower())
+                unique_choix.append(c_clean if c_clean else "Ø")
+                
+        if len(unique_choix) > 1 or (len(unique_choix) == 1 and unique_choix[0] != "Ø"):
+            if len(unique_choix) == 1:
+                resultat_pieces.append(unique_choix[0])
+            else:
+                bloc_choix = " | ".join(f"'{u}'" if u != "Ø" else "Ø" for u in unique_choix)
+                resultat_pieces.append(f"[ {bloc_choix} ]")
+        if i < num_invariants:
+            resultat_pieces.append(invariants_originaux_reference[i])
+            
+    chaine_finale = " ".join([p for p in resultat_pieces if p])
+    return re.sub(r'\s+', ' ', chaine_finale).strip()
+
+def compresser_patches_sous_arbre(patches):
+    if not patches: return []
+    par_avant_clean = defaultdict(list)
+    for p in patches:
+        av_clean = epurer_texte(p["avant"])
+        par_avant_clean[av_clean].append(p)
+        
+    regles_phase1 = []
+    for av_clean, liste_p in par_avant_clean.items():
+        raw_apres_list = [p["apres"] for p in liste_p]
+        tous_codes = sorted(list(set(p["dm_code"] for p in liste_p)))
+        apres_condense = factoriser_textes_difflib(raw_apres_list)
+        est_structurel = "[" in apres_condense or "|" in apres_condense
+        regles_phase1.append({
+            "avant": av_clean, "apres": apres_condense, "codes": tous_codes, "structurel": est_structurel
+        })
+
+    simples = [r for r in regles_phase1 if not r["structurel"]]
+    complexes = [r for r in regles_phase1 if r["structurel"]]
+    
+    par_apres_clean_global = defaultdict(list)
+    for r in simples:
+        par_apres_clean_global[r["apres"].strip().lower()].append(r)
+        
+    regles_finales = list(complexes)
+    for ap_clean, liste_r in par_apres_clean_global.items():
+        if len(liste_r) == 1:
+            regles_finales.append(liste_r[0])
+        else:
+            raw_avant_list = [r["avant"] for r in liste_r]
+            tous_codes = sorted(list(set(c for r in liste_r for c in r["codes"])))
+            avant_condense = factoriser_textes_difflib(raw_avant_list)
+            regles_finales.append({
+                "avant": avant_condense, "apres": liste_r[0]["apres"], "codes": tous_codes, "structurel": True
+            })
+    return regles_finales
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GESTION, PROPAGATION ET PLANIFICATION DE L'ARBRE (OPTIMISATION DES PACKS)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def construire_trie(entrees, parent):
+    ici = [e for e in entrees if not e[0]]
+    if ici:
+        by_code = defaultdict(list)
+        for _, code, doc, version in ici:
+            by_code[code].append((doc, version))
+        for code, items in by_code.items():
+            v1_items = [doc for doc, version in items if version == "v1"]
+            v2_items = [doc for doc, version in items if version == "v2"]
+            max_len = max(len(v1_items), len(v2_items))
+            for i in range(max_len):
+                d1 = v1_items[i] if i < len(v1_items) else None
+                d2 = v2_items[i] if i < len(v2_items) else None
+                nom_feuille = f"[{code}]" + (f" (p.{i+1})" if max_len > 1 else "")
+                noeud_feuille = Node(nom_feuille, parent=parent)
+                noeud_feuille.dm_code = code
+                noeud_feuille.feuille = True
+                noeud_feuille.doc_v1 = d1
+                noeud_feuille.doc_v2 = d2
+
+    restants = [e for e in entrees if e[0]]
+    if not restants: return
+    groupes = defaultdict(list)
+    for tokens, code, doc, version in restants:
+        groupes[tokens[0].lower()].append((tokens, code, doc, version))
+    for _, groupe in sorted(groupes.items()):
+        chemins = [e[0] for e in groupe]
+        min_len = min(len(c) for c in chemins)
+        n_commun = 0
+        for i in range(min_len):
+            if len({c[i].lower() for c in chemins}) == 1: n_commun = i + 1
+            else: break
+        nom_branche = " ".join(chemins[0][:n_commun])
+        noeud_intermediaire = Node(nom_branche, parent=parent)
+        construire_trie([(t[n_commun:], c, d, v) for t, c, d, v in groupe], noeud_intermediaire)
+
+
+def propager_bottom_up(racine):
+    """Calcule le statut et limite l'impact des grosses insertions de fichiers."""
+    for noeud in reversed(list(racine.descendants)):
+        if noeud.feuille:
+            d1 = getattr(noeud, 'doc_v1', None)
+            d2 = getattr(noeud, 'doc_v2', None)
+            
+            # GESTION DES INSERTIONS REVISITÉE : Pas besoin d'envoyer tout le pavé au LLM
+            if d1 is None and d2 is not None:
+                noeud.statut = "AJOUTE"
+                noeud.patches.append({
+                    "avant": "[Néant - Nouveau Module]", 
+                    "apres": f"Insertion complète du module {noeud.dm_code}", 
+                    "dm_code": noeud.dm_code
+                })
+            # GESTION DES SUPPRESSIONS
+            elif d2 is None and d1 is not None:
+                noeud.statut = "SUPPRIME"
+                noeud.patches.append({
+                    "avant": f"Suppression complète du module {noeud.dm_code}", 
+                    "apres": "[Supprimé]", 
+                    "dm_code": noeud.dm_code
+                })
+            elif d1 is not None and d2 is not None:
+                t1, t2 = d1["content"], d2["content"]
+                if re.sub(r'\s+', ' ', t1).strip() == re.sub(r'\s+', ' ', t2).strip():
+                    noeud.statut = "INCHANGE"
+                else:
+                    noeud.statut = "MODIFIE"
+                    for avant, apres in diff_contenu(t1, t2):
+                        noeud.patches.append({"avant": avant, "apres": apres, "dm_code": noeud.dm_code})
+        else:
+            for patch in [p for enfant in noeud.children for p in enfant.patches]:
+                noeud.patches.append(patch)
+
+
+def estimer_tokens_arbre(noeud):
+    modifs_uniques = {(p["avant"], p["apres"]) for p in noeud.patches}
+    noeud.tokens_cumules = sum(len(av.split()) + len(ap.split()) for av, ap in modifs_uniques)
+    
+    if not noeud.feuille:
+        for enfant in noeud.children:
+            estimer_tokens_arbre(enfant)
+
+def planifier_appels_llm(racine, budget_max_appels=10, limite_tokens_par_appel=2000):
+    selection_pivots = [racine]
+    continuer = True
+    
+    while continuer:
+        continuer = False
+        nouvelle_selection = []
+        for noeud in selection_pivots:
+            if noeud.tokens_cumules > limite_tokens_par_appel and not noeud.feuille:
+                nouvelle_selection.extend(noeud.children)
+                continuer = True
+            else:
+                nouvelle_selection.append(noeud)
+        selection_pivots = nouvelle_selection
+
+    if len(selection_pivots) > budget_max_appels:
+        return selection_pivots
+
+    while len(selection_pivots) < budget_max_appels:
+        divisibles = [n for n in selection_pivots if not n.feuille]
+        if not divisibles:
+            break
+        noeud_cible = max(divisibles, key=lambda n: n.tokens_cumules)
+        croissance = len(noeud_cible.children) - 1
+        if len(selection_pivots) + croissance <= budget_max_appels:
+            selection_pivots.remove(noeud_cible)
+            selection_pivots.extend(noeud_cible.children)
+        else:
+            eligibles = [n for n in divisibles if len(n.children) - 1 <= (budget_max_appels - len(selection_pivots))]
+            if not eligibles:
+                break
+            noeud_compromis = max(eligibles, key=lambda n: n.tokens_cumules)
+            selection_pivots.remove(noeud_compromis)
+            selection_pivots.extend(noeud_compromis.children)
+            
+    return selection_pivots
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COMPACTAGE DU CONTENU D'UN PIVOT SPÉCIFIQUE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extraire_payload_du_pivot(noeud_pivot):
+    packs_chapitres = []
+    noeuds_a_traiter = [noeud_pivot] if noeud_pivot.feuille else [n for n in noeud_pivot.descendants if not n.feuille and n.patches]
+    if not noeuds_a_traiter and noeud_pivot.patches:
+        noeuds_a_traiter = [noeud_pivot]
+
+    for n in noeuds_a_traiter:
+        regles = compresser_patches_sous_arbre(n.patches)
+        if regles:
+            chemin = " > ".join(a.name for a in n.path)
+            pack = {"chapitre": chemin, "changements": []}
+            for r in regles:
+                pack["changements"].append({
+                    "dm_codes": sorted(list(set(r["codes"]))),
+                    "texte_avant": r["avant"],
+                    "texte_apres": r["apres"]
+                })
+            packs_chapitres.append(pack)
+            
+    return packs_chapitres
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SCHÉMAS DE SORTIE STRUCTURÉE (PYDANTIC)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ModificationDetaillee(BaseModel):
+    descriptions: List[str] = Field(
+        description="Description humaine, claire et technique des evolutions observees entre l'ancienne et la nouvelle valeur."
+    )
+
+class SectionFicheVersion(BaseModel):
+    chapitre: str = Field(description="Chemin complet ou chapitre cible de la modification.")
+    codes_dm: List[str] = Field(description="Liste dedupliquee des codes DM (DMC) concernes par ce bloc.")
+    modifications_apportees: ModificationDetaillee = Field(description="Synthese descriptive de la modification.")
+
+class FicheVersionGlobale(BaseModel):
+    titre_fiche: str = Field(description="Intitule formel de la note de version.")
+    resume_macro: str = Field(description="Explication globale de haut niveau synthetisant l'impact technique global.")
+    sections: List[SectionFicheVersion] = Field(description="Ensemble des chapitres modifies.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PIPELINE LANGCHAIN DE GÉNÉRATION DE FICHE TECHNIQUE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generer_fiche_version_llm(noeud_pivot) -> FicheVersionGlobale:
+    donnees_pack = extraire_payload_du_pivot(noeud_pivot)
+    payload_textuel = json.dumps(donnees_pack, indent=2, ensure_ascii=False)
+    
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
+    llm_structure = llm.with_structured_output(FicheVersionGlobale)
+    
+    prompt_template = ChatPromptTemplate.from_messages([
+        ("system", (
+            "Vous etes un expert de la documentation technique et de la gestion de configuration.\n"
+            "Votre role est de transformer un condensat brut de modifications textuelles en une fiche "
+            "de version intelligible pour des operateurs humains.\n\n"
+            "Regles de redaction strictes :\n"
+            "- N'utilisez aucun emoji, icone graphique ou artifice de mise en forme visuelle.\n"
+            "- Redigez des phrases fluides, orientees metier et purement explicatives.\n"
+            "- Conservez la precision des variables ou chiffres cles indiques dans les blocs.\n"
+            "- Restez factuel, neutre et concis."
+        )),
+        ("user", (
+            "Voici les donnees structurees issues de notre pack optimise (Pivot : {nom_pivot}) :\n\n"
+            "{input_data}\n\n"
+            "Generez la fiche de version conformement au schema structure demande."
+        ))
+    ])
+    
+    chaine = prompt_template | llm_structure
+    return chaine.invoke({"nom_pivot": noeud_pivot.name, "input_data": payload_textuel})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# JEU DE TEST TECHNIQUE AVEC CONTIGUÏTÉ ET INSERTION SÉPARÉE
+# ══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    
+    dico_v1 = [
+        # Deux modules identiques partageant la même modification
+        {
+            "type": "XML_procedure", 
+            "content": "Serrer la vanne d'isolement principale. Attendre deux minutes. Ouvrir le clapet de sécurité.",
+            "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}
+        },
+        {
+            "type": "XML_procedure", 
+            "content": "Serrer la vanne d'isolement principale. Attendre deux minutes. Ouvrir le clapet de sécurité.",
+            "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-002"}
+        }
+        # Note: Pas de DM-ELEC-003 en V1 pour simuler une grosse insertion pure
+    ]
+
+    dico_v2 = [
+        # Modifications contiguës : les changements se suivent de près (séparés par un court point fixe)
+        {
+            "type": "XML_procedure", 
+            "content": "Serrer la vanne d'isolement à 45 Nm. Attendre deux minutes. Vérifier la pression et ouvrir le clapet.",
+            "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}
+        },
+        {
+            "type": "XML_procedure", 
+            "content": "Serrer la vanne d'isolement à 45 Nm. Attendre deux minutes. Vérifier la pression et ouvrir le clapet.",
+            "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-002"}
+        },
+        # Nouveau module apparu en V2 (Grosse insertion protégée)
+        {
+            "type": "XML_procedure", 
+            "content": "Procédure complète d'urgence électrique cabine...\nLigne A...\nLigne B...\nLigne C...",
+            "extra_information": {"DM_title": "Electricite > Basse Tension", "DM_code": "DM-ELEC-003"}
+        }
+    ]
+
+    liste_v1 = extraire(dico_v1)
+    liste_v2 = extraire(dico_v2)
+
+    entrees = []
+    for d in liste_v1:
+        titre = d.get("extra_information", {}).get("DM_title", "Sans Titre")
+        code = d.get("extra_information", {}).get("DM_code", "UNK")
+        entrees.append((normaliser(titre), code, d, "v1"))
+
+    for d in liste_v2:
+        titre = d.get("extra_information", {}).get("DM_title", "Sans Titre")
+        code = d.get("extra_information", {}).get("DM_code", "UNK")
+        entrees.append((normaliser(titre), code, d, "v2"))
+
+    entrees.sort(key=lambda x: [t.lower() for t in x[0]])
+
+    racine = Node("Procédures", parent=None)
+    construire_trie(entrees, racine)
+    propager_bottom_up(racine)
+    
+    estimer_tokens_arbre(racine)
+    noeuds_pivots_optimaux = planifier_appels_llm(
+        racine, 
+        budget_max_appels=3, 
+        limite_tokens_par_appel=150 
+    )
+
+    print(f"Planification terminée : Arbre découpé en {len(noeuds_pivots_optimaux)} pack(s) optimal(aux).")
+    
+    for index, pivot in enumerate(noeuds_pivots_optimaux, 1):
+        if pivot.tokens_cumules == 0:
+            continue
+            
+        print(f"\nTraitement du Pack {index} (Pivot: {pivot.name} | Poids factorisé: {pivot.tokens_cumules} tokens)...")
+        
+        try:
+            fiche = generer_fiche_version_llm(pivot)
+            
+            print(f"=== NOTE DE VERSION GENEREE (PACK {index}) ===")
+            print(f"Titre   : {fiche.titre_fiche}")
+            print(f"Synthese: {fiche.resume_macro}")
+            print("---------------------------------------------")
+            
+            for section in fiche.sections:
+                print(f"Chapitre  : {section.chapitre}")
+                print(f"Module(s) : {', '.join(section.codes_dm)}")
+                print("Evolutions :")
+                for modification in section.modifications_apportees.descriptions:
+                    print(f"  - {modification}")
+            print("=============================================")
+                    
+        except Exception as error:
+            print(f"Erreur lors du traitement du pack {index} : {error}")
+
+
 
 import difflib
 import json
