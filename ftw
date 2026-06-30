@@ -1,3 +1,4 @@
+
 import difflib
 import json
 from typing import List
@@ -6,24 +7,24 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. STRUCTURE DE L'ARBRE UNIFIÉ
+# 1. STRUCTURE DE L'ARBRE (ADAPTÉE À TON FORMAT DE DONNÉES)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Node:
     def __init__(self, name, parent=None):
         self.name = name
         self.parent = parent
-        self.children = {}  # Stockage direct par {nom: Node} pour l'efficacité
+        self.children = {}  # Stockage direct par {nom: Node}
         self.is_leaf = False
         self.dm_code = None
         self.v1 = None
         self.v2 = None
-        self.difference = None  # Contiendra le bloc de diff textuel avec contexte (ou None)
+        self.difference = None  # Contiendra le bloc de diff (unified_diff) avec contexte
         self.tokens = 0
 
     @property
     def path(self):
-        """Reconstitue la chaîne des nœuds du sommet jusqu'à cette entité."""
+        """Reconstitue la chaîne des chapitres du sommet jusqu'à ce nœud."""
         chemin = []
         courant = self
         while courant:
@@ -32,37 +33,61 @@ class Node:
         return chemin
 
 
-def batir_arbre(docs_v1, docs_v2):
-    """Construit un arbre unique en fusionnant l'arborescence de la V1 et de la V2."""
+def batir_arbre(dico_v1, dico_v2):
+    """
+    Construit l'arbre unifié en lisant directement ton format de dictionnaire :
+    - Filtre sur 'XML_procedure'
+    - Extraction du chemin via 'DM_title' découpé par le séparateur '>'
+    - Extraction du code via 'DM_code'
+    """
     racine = Node("Root")
     
-    for d in docs_v1:
+    # Filtrage des procédures v1
+    liste_v1 = [d for d in dico_v1 if d.get("type") == "XML_procedure"]
+    for d in liste_v1:
+        extra = d.get("extra_information", {})
+        titre = extra.get("DM_title", "Sans Titre")
+        dm_code = extra.get("DM_code", "UNK")
+        
+        # Nettoyage et découpage du titre (ex: "Hydraulique > Vannes" -> ["Hydraulique", "Vannes"])
+        chemin = [etape.strip() for etape in titre.split(">") if etape.strip()]
+        
         courant = racine
-        for etape in d["path"]:
+        for etape in chemin:
             courant = courant.children.setdefault(etape, Node(etape, parent=courant))
-        feuille = courant.children.setdefault(d["dm_code"], Node(d["dm_code"], parent=courant))
+            
+        feuille = courant.children.setdefault(dm_code, Node(dm_code, parent=courant))
         feuille.is_leaf = True
-        feuille.dm_code = d["dm_code"]
-        feuille.v1 = d["content"]
+        feuille.dm_code = dm_code
+        feuille.v1 = d.get("content", "")
 
-    for d in docs_v2:
+    # Fusion des procédures v2
+    liste_v2 = [d for d in dico_v2 if d.get("type") == "XML_procedure"]
+    for d in liste_v2:
+        extra = d.get("extra_information", {})
+        titre = extra.get("DM_title", "Sans Titre")
+        dm_code = extra.get("DM_code", "UNK")
+        
+        chemin = [etape.strip() for etape in titre.split(">") if etape.strip()]
+        
         courant = racine
-        for etape in d["path"]:
+        for etape in chemin:
             courant = courant.children.setdefault(etape, Node(etape, parent=courant))
-        feuille = courant.children.setdefault(d["dm_code"], Node(d["dm_code"], parent=courant))
+            
+        feuille = courant.children.setdefault(dm_code, Node(dm_code, parent=courant))
         feuille.is_leaf = True
-        feuille.dm_code = d["dm_code"]
-        feuille.v2 = d["content"]
+        feuille.dm_code = dm_code
+        feuille.v2 = d.get("content", "")
         
     return racine
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2. DIFF DE LIGNES AVEC CONTEXTE ET FILTRES ANTI-BRUIT
+# 2. MOTEUR DE DIFF PAR LIGNE ET PROPAGATION DES POIDS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def generer_diff_et_tokens(noeud):
-    """Compare par ligne avec 1 ligne de contexte et évalue les tokens de modification."""
+    """Compare v1 et v2 ligne par ligne avec 1 ligne de contexte autour des modifs."""
     if noeud.is_leaf:
         t1 = (noeud.v1 or "").strip()
         t2 = (noeud.v2 or "").strip()
@@ -74,14 +99,14 @@ def generer_diff_et_tokens(noeud):
             lignes_v1 = t1.splitlines()
             lignes_v2 = t2.splitlines()
             
-            # n=1 capture exactement 1 ligne de contexte inchangée avant et après chaque bloc modifié
+            # n=1 force à prendre 1 ligne de contexte avant et après la modification
             diff_generateur = difflib.unified_diff(lignes_v1, lignes_v2, n=1, lineterm="")
             liste_diff = list(diff_generateur)
             
             if len(liste_diff) > 2:
-                # Nettoyage des lignes d'en-tête système (--- et +++) inutiles au LLM
+                # On enlève les en-têtes système (--- et +++) inutiles pour le LLM
                 noeud.difference = "\n".join(liste_diff[2:])
-                # Évaluation budgétaire stricte sur la taille réelle du diff + son contexte
+                # On compte les tokens UNIQUEMENT sur le paquet de modification + son contexte
                 noeud.tokens = len(noeud.difference.split())
             else:
                 noeud.difference = None
@@ -100,7 +125,7 @@ def clean_diff_tree(noeud):
 
 
 def imposer_poids_branches(noeud):
-    """Remonte récursivement la somme des tokens des feuilles vers les branches parentes."""
+    """Remonte récursivement la somme des tokens des lignes modifiées vers les parents."""
     if noeud.is_leaf:
         return noeud.tokens
     noeud.tokens = sum(imposer_poids_branches(e) for e in noeud.children.values())
@@ -108,11 +133,11 @@ def imposer_poids_branches(noeud):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. PLANIFICATION ET EXTRACTION DU PAYLOAD
+# 3. ALGORITHME D'OPTIMISATION DU BUDGET D'APPELS LLM
 # ══════════════════════════════════════════════════════════════════════════════
 
 def optimiser_appels_llm(racine, M, max_token):
-    """Détermine au maximum M nœuds pivots respectant le plafond max_token."""
+    """Détermine au maximum M nœuds pivots sans dépasser le plafond max_token."""
     pivots = [racine]
     while len(pivots) < M:
         candidats = [n for n in pivots if n.tokens > max_token and n.children]
@@ -128,10 +153,10 @@ def optimiser_appels_llm(racine, M, max_token):
 
 
 def extraire_payload_du_pivot(noeud_pivot):
-    """Extrait à plat toutes les feuilles modifiées situées sous un nœud pivot donné."""
+    """Extrait toutes les feuilles modifiées situées sous un nœud pivot sélectionné."""
     def collecter_feuilles(n):
         if n.is_leaf:
-            # Reconstitution textuelle du chapitre d'appartenance
+            # Reconstitution propre de la chaîne de chapitres
             chemin_chapitre = " > ".join(p.name for p in n.path[:-1] if p.name != "Root")
             return [{
                 "chapitre": chemin_chapitre or "Général",
@@ -146,48 +171,47 @@ def extraire_payload_du_pivot(noeud_pivot):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4. INTERFACES PYDANTIC ET APPEL LLM STRUCTURÉ
+# 4. SCHÉMAS DE SORTIE STRUCTURÉE (PYDANTIC) ET PIPELINE LANGCHAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ModificationDMC(BaseModel):
     dm_code: str = Field(description="Le code d'identification du Data Module impacté.")
-    analyse_technique: str = Field(description="Description métier factuelle et rigoureuse des lignes modifiées visibles dans le diff.")
+    analyse_technique: str = Field(description="Explication métier claire et factuelle des lignes modifiées (+ / -) avec leur contexte.")
 
 class SectionChapitre(BaseModel):
-    chapitre: str = Field(description="Le chemin du chapitre cible de la documentation.")
+    chapitre: str = Field(description="Le chemin ou dossier cible dans la documentation.")
     analyses_modules: List[ModificationDMC] = Field(description="Analyses détaillées par module pour ce chapitre.")
 
 class FicheVersionGlobale(BaseModel):
-    titre_fiche: str = Field(description="Titre formel et professionnel de la note d'évolution.")
-    synthese_macro: str = Field(description="Résumé de haut niveau expliquant globalement l'orientation technique de ce paquet.")
+    titre_fiche: str = Field(description="Titre officiel de la note d'évolution.")
+    synthese_macro: str = Field(description="Résumé global de l'orientation technique de ce paquet de modifications.")
     sections: List[SectionChapitre] = Field(description="Ensemble des chapitres documentaires modifiés.")
 
 
 def generer_fiche_version_llm(noeud_pivot) -> FicheVersionGlobale:
-    """Consomme les diffs du pivot et pilote le LLM pour générer une note de version propre."""
+    """Prend un nœud pivot, extrait son payload de diffs avec contexte, et interroge le LLM."""
     donnees_pack = extraire_payload_du_pivot(noeud_pivot)
     payload_textuel = json.dumps(donnees_pack, indent=2, ensure_ascii=False)
     
-    # Configuration de l'agent OpenAI avec sortie fortement typée
     llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
     llm_structure = llm.with_structured_output(FicheVersionGlobale)
     
     prompt_template = ChatPromptTemplate.from_messages([
         ("system", (
-            "Vous êtes un ingénieur expert en documentation aéronautique et de maintenance.\n"
-            "Votre mission consiste à rédiger une note d'évolution technique claire à partir de fragments de diff unifié (unified diff).\n\n"
-            "Consigne d'analyse :\n"
-            "Chaque élément contient un champ 'difference' qui isole les lignes supprimées (-) et ajoutées (+) ainsi qu'une ligne de contexte d'origine.\n"
-            "Analysez la transformation technique subie par le fichier et documentez-la dans le champ 'analyse_technique'.\n\n"
-            "Règles impératives :\n"
-            "- Soyez direct, professionnel et factuel. N'utilisez aucun émoji ou symbole graphique.\n"
-            "- Ne mentionnez pas la structure technique du diff (ex: ne dites pas 'la ligne précédée d'un moins a été retirée').\n"
-            "- Traduisez directement les lignes en impact métier ou de procédure de maintenance."
+            "Vous êtes un ingénieur expert en documentation technique et aéronautique.\n"
+            "Votre but est de rédiger une note d'évolution claire à partir de fragments de diff unifié (unified diff).\n\n"
+            "Consignes d'analyse :\n"
+            "- Chaque élément contient un champ 'difference' avec les lignes supprimées (-), ajoutées (+), et leur contexte immédiat.\n"
+            "- Expliquez la transformation technique subie par le fichier directement dans le champ 'analyse_technique'.\n\n"
+            "Règles strictes :\n"
+            "- Restez factuel, neutre et professionnel. Aucun émoji ou symbole graphique.\n"
+            "- Ne mentionnez jamais la syntaxe du diff dans votre texte (ne dites pas 'la ligne précédée d'un plus a été ajoutée').\n"
+            "- Traduisez directement le changement en impact ou consigne de maintenance pour l'opérateur."
         )),
         ("user", (
-            "Voici les paquets de diff capturés sous le pivot '{nom_pivot}' :\n\n"
+            "Voici les paquets de diff et lignes de contexte pour le pivot '{nom_pivot}' :\n\n"
             "{input_data}\n\n"
-            "Générez l'analyse structurée correspondante."
+            "Générez l'analyse structurée de ces évolutions."
         ))
     ])
     
@@ -196,44 +220,49 @@ def generer_fiche_version_llm(noeud_pivot) -> FicheVersionGlobale:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# EXÉCUTION DU PIPELINE (DÉMO)
+# 5. JEU DE TEST AVEC TA STRUCTURE DE DICTIONNAIRES EXACTE
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # Simulation de fichiers aéronautiques (V1)
-    mock_v1 = [
-        {
-            "path": ["Hydraulique", "Vannes"], "dm_code": "DMC-01",
-            "content": "Étape 1 : Couper l'alimentation générale.\nÉtape 2 : Serrer l'écrou borgne doucement.\nÉtape 3 : Contrôler les voyants de bord."
-        },
-        {
-            "path": ["Hydraulique", "Vannes"], "dm_code": "DMC-02",
-            "content": "Étape 1 : Couper l'alimentation générale.\nÉtape 2 : Serrer l'écrou borgne doucement.\nÉtape 3 : Contrôler les voyants de bord."
-        }
-    ]
-
-    # Évolutions ciblées (V2) : DMC-01 change de valeur, DMC-02 reste identique
-    mock_v2 = [
-        {
-            "path": ["Hydraulique", "Vannes"], "dm_code": "DMC-01",
-            "content": "Étape 1 : Couper l'alimentation générale.\nÉtape 2 : Serrer l'écrou borgne à un couple de 45 Nm.\nÉtape 3 : Contrôler les voyants de bord."
-        },
-        {
-            "path": ["Hydraulique", "Vannes"], "dm_code": "DMC-02",
-            "content": "Étape 1 : Couper l'alimentation générale.\nÉtape 2 : Serrer l'écrou borgne doucement.\nÉtape 3 : Contrôler les voyants de bord."
-        }
-    ]
-
-    # Executer les étapes successives
-    arbre = batir_arbre(mock_v1, mock_v2)
-    generer_diff_et_tokens(arbre)
-    clean_diff_tree(arbre)          # <--- Élagage radical des éléments inchangés (DMC-02 disparaît)
-    imposer_poids_branches(arbre)   # <--- Calcul final des poids réels basés sur le diff
     
-    # Découpage adaptatif
+    # Données d'origine basées EXACTEMENT sur tes dictionnaires
+    dico_v1 = [
+        {
+            "type": "XML_procedure", 
+            "content": "Ligne 1 : Initialiser le système.\nLigne 2 : Ouvrir la vanne doucement.\nLigne 3 : Vérifier la pression.",
+            "extra_information": {"DM_title": "Hydraulique > Vannes > Decharge", "DM_code": "DM-HYD-001"}
+        },
+        {
+            "type": "XML_procedure", 
+            "content": "Ligne 1 : Initialiser le système.\nLigne 2 : Ouvrir la vanne doucement.\nLigne 3 : Vérifier la pression.",
+            "extra_information": {"DM_title": "Hydraulique > Vannes > Decharge", "DM_code": "DM-HYD-002"}
+        }
+    ]
+
+    # Données modifiées (DMC-001 change à la ligne 2, DMC-002 reste inchangé)
+    dico_v2 = [
+        {
+            "type": "XML_procedure", 
+            "content": "Ligne 1 : Initialiser le système.\nLigne 2 : Ouvrir la vanne à un couple de 45 Nm.\nLigne 3 : Vérifier la pression.",
+            "extra_information": {"DM_title": "Hydraulique > Vannes > Decharge", "DM_code": "DM-HYD-001"}
+        },
+        {
+            "type": "XML_procedure", 
+            "content": "Ligne 1 : Initialiser le système.\nLigne 2 : Ouvrir la vanne doucement.\nLigne 3 : Vérifier la pression.",
+            "extra_information": {"DM_title": "Hydraulique > Vannes > Decharge", "DM_code": "DM-HYD-002"}
+        }
+    ]
+
+    # Pipeline d'exécution
+    arbre = batir_arbre(dico_v1, dico_v2)
+    generer_diff_et_tokens(arbre)
+    clean_diff_tree(arbre)          # <-- DM-HYD-002 n'ayant pas bougé, il est nettoyé ici.
+    imposer_poids_branches(arbre)   # <-- On calcule les tokens sur le diff restant + contexte
+    
+    # Planification des appels (Ex: Max 2 packs, limite de 500 tokens par paquet)
     pivots_optimaux = optimiser_appels_llm(arbre, M=2, max_token=500)
     
-    # Lancement du traitement LLM sur les pivots d'intérêts
+    # Lancement de la génération des fiches
     for idx, pivot in enumerate(pivots_optimaux, 1):
         if pivot.tokens == 0:
             continue
@@ -241,7 +270,7 @@ if __name__ == "__main__":
         try:
             fiche_finale = generer_fiche_version_llm(pivot)
             
-            print(f"=== NOTE D'ÉVOLUTION TECHNIQUE (PACK {idx}) ===")
+            print(f"=== NOTE D'ÉVOLUTION TECHNIQUE GÉNÉRÉE (PACK {idx}) ===")
             print(f"Titre : {fiche_finale.titre_fiche}")
             print(f"Macro : {fiche_finale.synthese_macro}\n")
             
@@ -249,13 +278,11 @@ if __name__ == "__main__":
                 print(f" Chapitre : {sec.chapitre}")
                 for mod in sec.analyses_modules:
                     print(f"   * Module : {mod.dm_code}")
-                    print(f"     Analyse : {mod.analyse_technique}")
-            print("=" * 45 + "\n")
+                    print(f"     Analyse Technique : {mod.analyse_technique}")
+            print("=" * 55 + "\n")
             
         except Exception as e:
-            print(f"Erreur lors du traitement du pack {idx} : {e}")
-
-
+            print(f"Erreur lors de l'appel LLM pour le pack {idx} : {e}")
 
 
 
