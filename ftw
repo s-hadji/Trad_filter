@@ -1,3 +1,365 @@
+import re
+import difflib
+from collections import defaultdict
+import ftfy
+
+# ==============================================================================
+# 0. NETTOYAGE, ENCODAGE ET FILTRAGE DES IDENTIQUES
+# ==============================================================================
+def ajuster_et_fixer_texte(texte):
+    if not texte:
+        return ""
+    texte_repare = ftfy.fix_text(texte)
+    return texte_repare.encode('utf-8', errors='replace').decode('utf-8')
+
+def drop_identique(avant, apres, liste_symboles=None):
+    """
+    Détermine si deux textes sont identiques après suppression de la casse,
+    des espaces et d'une liste de symboles définis.
+    """
+    if liste_symboles is None:
+        # Liste ajustable de symboles/ponctuatons à ignorer
+        liste_symboles = [',', '.', ';', ':', '!', '?', '(', ')', '[', ']', '{', '}', '-', '_', '"', "'", '«', '»', '/', '\\', '*']
+    
+    # 1. Nettoyage des espaces et passage en minuscules
+    norm_av = "".join(avant.split()).lower()
+    norm_ap = "".join(apres.split()).lower()
+    
+    # 2. Suppression des symboles de la liste
+    for sym in liste_symboles:
+        norm_av = norm_av.replace(sym, '')
+        norm_ap = norm_ap.replace(sym, '')
+        
+    return norm_av == norm_ap
+
+# ==============================================================================
+# 1. FUSION EN AMONT PAR DM_CODE
+# ==============================================================================
+def fusionner_par_dm_code(liste_docs):
+    groupes = defaultdict(list)
+    for doc in liste_docs:
+        info = doc.get("extra_information", {})
+        if "DM_code" in info:
+            info["DM_code"] = ajuster_et_fixer_texte(info["DM_code"])
+        if "DM_title" in info:
+            info["DM_title"] = ajuster_et_fixer_texte(info["DM_title"])
+            
+        code = info.get("DM_code")
+        if code:
+            groupes[code].append(doc)
+            
+    docs_fusionnes = []
+    for code, docs in groupes.items():
+        docs.sort(key=lambda x: x.get("type", ""))
+        morceaux_texte = []
+        info_commune = {}
+        
+        for d in docs:
+            doc_type = d.get("type")
+            if doc_type not in ["XML_procedure", "XML_description"]:
+                continue
+            
+            label = "Procédure" if doc_type == "XML_procedure" else "Description"
+            contenu_propre = ajuster_et_fixer_texte(d.get("content", ""))
+            morceaux_texte.append(f"[{label}]\n{contenu_propre.strip()}")
+            
+            if not info_commune:
+                info_commune = d.get("extra_information", {})
+        
+        if morceaux_texte:
+            texte_unique = "\n\n".join(morceaux_texte)
+            docs_fusionnes.append({
+                "type": "XML_fusionne",
+                "content": texte_unique,
+                "extra_information": info_commune
+            })
+            
+    return docs_fusionnes
+
+# ==============================================================================
+# 2. STRUCTURE DE L'ARBRE
+# ==============================================================================
+class ChapitreNode:
+    def __init__(self, name="Racine"):
+        self.name = name
+        self.children = {}  
+        self.modules = {}   
+
+def ajouter_au_trie(racine, doc, version):
+    if doc.get("type") != "XML_fusionne": 
+        return
+        
+    info = doc.get("extra_information", {})
+    titre, code, contenu = info.get("DM_title", ""), info.get("DM_code", ""), doc.get("content", "")
+    
+    type_label = "Fusionne"
+    elements = [e.strip() for e in titre.split(">") if e.strip()]
+    
+    courant = racine
+    for elem in elements:
+        if elem not in courant.children:
+            courant.children[elem] = ChapitreNode(elem)
+        courant = courant.children[elem]
+    
+    cle_module = (code, type_label)
+    if cle_module not in courant.modules:
+        courant.modules[cle_module] = {
+            "v1": None, "v2": None, "status": None, 
+            "lignes_ajoutees": 0, "lignes_supprimees": 0, "transformations_internes": []
+        }
+        
+    courant.modules[cle_module][version] = contenu
+
+# ==============================================================================
+# 3. DOUBLE DIFFER AVEC FUSION DES MODIFICATIONS CONTIGUËS
+# ==============================================================================
+def calculer_mutations_tokens(t1, t2):
+    """ Diff de Niveau 2 : Analyse et fusionne les tokens modifiés contigus """
+    tok1 = re.findall(r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]', t1) if t1 else []
+    tok2 = re.findall(r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]', t2) if t2 else []
+    
+    matcher = difflib.SequenceMatcher(None, tok1, tok2, autojunk=False)
+    opcodes = matcher.get_opcodes()
+    
+    # --- STRATÉGIE DE FUSION DES OPCODES CONTIGUS ---
+    opcodes_fuses = []
+    bloc_courant = None
+    
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag == 'equal':
+            if bloc_courant:
+                opcodes_fuses.append(bloc_courant)
+                bloc_courant = None
+        else:
+            if bloc_courant is None:
+                bloc_courant = {'tag': tag, 'i1': i1, 'i2': i2, 'j1': j1, 'j2': j2}
+            else:
+                # Si des modifications se collent (en amont ou en aval), on fusionne
+                bloc_courant['tag'] = 'replace'
+                bloc_courant['i2'] = i2
+                bloc_courant['j2'] = j2
+                
+    if bloc_courant:
+        opcodes_fuses.append(bloc_courant)
+        
+    transformations = []
+    for o in opcodes_fuses:
+        tag = o['tag']
+        i1, i2, j1, j2 = o['i1'], o['i2'], o['j1'], o['j2']
+        
+        txt_av = ' '.join(tok1[i1:i2]) if tag in ['delete', 'replace'] else ""
+        txt_ap = ' '.join(tok2[j1:j2]) if tag in ['insert', 'replace'] else ""
+        
+        # Application du filtre d'exclusion intelligent
+        if drop_identique(txt_av, txt_ap):
+            continue
+            
+        # Capture du contexte amont / aval
+        if tag in ['delete', 'replace']:
+            mot_avant = tok1[i1 - 1] if i1 > 0 else ""
+            mot_apres = tok1[i2] if i2 < len(tok1) else ""
+        else:
+            mot_avant = tok2[j1 - 1] if j1 > 0 else ""
+            mot_apres = tok2[j2] if j2 < len(tok2) else ""
+            
+        transformations.append({
+            "tag": tag,
+            "txt_av": txt_av,
+            "txt_ap": txt_ap,
+            "mot_avant": mot_avant,
+            "mot_apres": mot_apres
+        })
+            
+    return transformations
+
+def executer_double_diff(v1, v2):
+    lignes_v1 = v1.splitlines() if v1 else []
+    lignes_v2 = v2.splitlines() if v2 else []
+    
+    matcher = difflib.SequenceMatcher(None, lignes_v1, lignes_v2, autojunk=False)
+    
+    nb_ajouts = 0
+    nb_suppr = 0
+    mutations_locales = []
+    
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'equal':
+            continue
+        elif tag == 'delete':
+            nb_suppr += (i2 - i1)
+        elif tag == 'insert':
+            nb_ajouts += (j2 - j1)
+        elif tag == 'replace':
+            bloc_avant = "\n".join(lignes_v1[i1:i2])
+            bloc_apres = "\n".join(lignes_v2[j1:j2])
+            
+            mutations_internes = calculer_mutations_tokens(bloc_avant, bloc_apres)
+            mutations_locales.extend(mutations_internes)
+            
+    return nb_ajouts, nb_suppr, mutations_locales
+
+def analyser_et_tagger_arbre(noeud):
+    for cle_module, mod in noeud.modules.items():
+        v1, v2 = mod["v1"], mod["v2"]
+        
+        if v2 is not None and v1 is None:
+            mod["status"] = "NOUVEAU"
+            mod["lignes_ajoutees"] = len(v2.splitlines())
+        elif v1 is not None and v2 is None:
+            mod["status"] = "SUPPRIME"
+            mod["lignes_supprimees"] = len(v1.splitlines())
+        else:
+            if v1.strip() == v2.strip():
+                mod["status"] = "IDENTIQUE"
+            else:
+                mod["status"] = "MODIFIE"
+                ajouts, suppr, modifs = executer_double_diff(v1, v2)
+                mod["lignes_ajoutees"] = ajouts
+                mod["lignes_supprimees"] = suppr
+                mod["transformations_internes"] = modifs
+                
+    for enfant in noeud.children.values():
+        analyser_et_tagger_arbre(enfant)
+
+# ==============================================================================
+# 4. COLLECTE ET STRUCTURE SANS DUPLICATA DE CONTEXTE
+# ==============================================================================
+def structure_branche_factory():
+    return {
+        "resume_lignes": [],
+        "modifications": defaultdict(list)  # Clé : (tag, txt_av, txt_ap) -> Liste de tuples contextes
+    }
+
+def collecter_donnees_condensees(noeud, chemin_actuel="", donnees_par_branche=None):
+    if donnees_par_branche is None:
+        donnees_par_branche = defaultdict(structure_branche_factory)
+        
+    nom_chemin = f"{chemin_actuel} > {noeud.name}" if chemin_actuel else noeud.name
+    
+    for (dm_code, type_label), mod in noeud.modules.items():
+        identifiant_bloc = f"{dm_code}"
+        
+        if mod["lignes_ajoutees"] > 0 or mod["lignes_supprimees"] > 0:
+            phrase = f"Module {identifiant_bloc} : {mod['lignes_ajoutees']} ligne(s) ajoutée(s), {mod['lignes_supprimees']} ligne(s) supprimée(s)."
+            donnees_par_branche[nom_chemin]["resume_lignes"].append(phrase)
+            
+        if mod["status"] == "MODIFIE" and mod["transformations_internes"]:
+            for trans in mod["transformations_internes"]:
+                cle_unique_modif = (trans["tag"], trans["txt_av"], trans["txt_ap"])
+                
+                # On stocke l'identifiant et l'environnement de contexte
+                donnees_par_branche[nom_chemin]["modifications"][cle_unique_modif].append(
+                    (identifiant_bloc, trans["mot_avant"], trans["mot_apres"])
+                )
+                    
+    for enfant in noeud.children.values():
+        collecter_donnees_condensees(enfant, nom_chemin, donnees_par_branche)
+        
+    return donnees_par_branche
+
+def generer_batchs_llm(donnees_par_branche, max_tokens_per_batch=1000):
+    batchs = []
+    contenu_courant = []
+    tokens_courants = 0
+    
+    consigne_systeme = (
+        "ROLE: Analyser les micro-modifications fournies. Confirmer ou synthétiser "
+        "la liste des modules impactés par les mêmes changements globaux.\n"
+        "==================================================================\n"
+    )
+    
+    for chemin, contenu in donnees_par_branche.items():
+        bloc_texte_branche = f"Sous-Branche : {chemin}\n"
+        
+        if contenu["resume_lignes"]:
+            bloc_texte_branche += "  Structure globale :\n"
+            for phrase in contenu["resume_lignes"]:
+                bloc_texte_branche += f"    - {phrase}\n"
+                
+        if contenu["modifications"]:
+            bloc_texte_branche += "  Modifications internes détectées :\n"
+            for (tag, txt_av, txt_ap), occurrences in contenu["modifications"].items():
+                blocs_associes = ", ".join(sorted(list(set(occ[0] for occ in occurrences))))
+                
+                # --- STRATÉGIE ADAPTATIVE DE CONTEXTE ---
+                if len(occurrences) > 1:
+                    # Répétition détectée -> Pas de contexte (Gain maximal de jetons)
+                    if tag == 'delete':
+                        phrase_modif = f"[Supprimé: '{txt_av}']"
+                    elif tag == 'insert':
+                        phrase_modif = f"[Ajouté: '{txt_ap}']"
+                    elif tag == 'replace':
+                        phrase_modif = f"['{txt_av}' -> '{txt_ap}']"
+                    
+                    bloc_texte_branche += f"    - Répétition globale : {phrase_modif} | (Vu dans : {blocs_associes})\n"
+                else:
+                    # Unique -> On conserve le contexte complet pour précision chirurgicale
+                    _, mot_avant, mot_apres = occurrences[0]
+                    ctx_av = f"{mot_avant} " if mot_avant else ""
+                    ctx_ap = f" {mot_apres}" if mot_apres else ""
+                    
+                    if tag == 'delete':
+                        phrase_modif = f"... {ctx_av}[Supprimé: '{txt_av}']{ctx_ap} ..."
+                    elif tag == 'insert':
+                        phrase_modif = f"... {ctx_av}[Ajouté: '{txt_ap}']{ctx_ap} ..."
+                    elif tag == 'replace':
+                        phrase_modif = f"... {ctx_av}['{txt_av}' -> '{txt_ap}']{ctx_ap} ..."
+                    
+                    bloc_texte_branche += f"    - Unique : {phrase_modif} | (Bloc : {blocs_associes})\n"
+                
+        bloc_texte_branche += "--------------------------------------------------\n"
+        tokens_bloc = max(1, len(bloc_texte_branche) // 4)
+        
+        if tokens_courants + tokens_bloc > max_tokens_per_batch:
+            batchs.append(consigne_systeme + "".join(contenu_courant))
+            contenu_courant = [bloc_texte_branche]
+            tokens_courants = tokens_bloc
+        else:
+            contenu_courant.append(bloc_texte_branche)
+            tokens_courants += tokens_bloc
+            
+    if contenu_courant:
+        batchs.append(consigne_systeme + "".join(contenu_courant))
+        
+    return batchs
+
+# ==============================================================================
+# 5. TEST DE VÉRIFICATION
+# ==============================================================================
+if __name__ == "__main__":
+    # DM-001 et DM-002 subissent la même modification (Répétition).
+    # DM-001 a également une modification collée/contiguë ("mot" + "ici" -> "terme" + "la").
+    # DM-003 subit un changement de casse / symbole pur (doit être ignoré par drop_identique).
+    dico_v1 = [
+        {"type": "XML_procedure", "content": "Changer ce mot ici maintenant.", "extra_information": {"DM_title": "Test", "DM_code": "DM-001"}},
+        {"type": "XML_procedure", "content": "Changer ce mot maintenant.", "extra_information": {"DM_title": "Test", "DM_code": "DM-002"}},
+        {"type": "XML_procedure", "content": "Texte initial.", "extra_information": {"DM_title": "Test", "DM_code": "DM-003"}},
+    ]
+    
+    dico_v2 = [
+        {"type": "XML_procedure", "content": "Changer ce terme la maintenant.", "extra_information": {"DM_title": "Test", "DM_code": "DM-001"}},
+        {"type": "XML_procedure", "content": "Changer ce terme maintenant.", "extra_information": {"DM_title": "Test", "DM_code": "DM-002"}},
+        {"type": "XML_procedure", "content": "texte initial !!!  ", "extra_information": {"DM_title": "Test", "DM_code": "DM-003"}},
+    ]
+
+    dico_v1_fusionne = fusionner_par_dm_code(dico_v1)
+    dico_v2_fusionne = fusionner_par_dm_code(dico_v2)
+
+    racine_arbre = ChapitreNode()
+    for doc in dico_v1_fusionne: ajouter_au_trie(racine_arbre, doc, "v1")
+    for doc in dico_v2_fusionne: ajouter_au_trie(racine_arbre, doc, "v2")
+    
+    analyser_et_tagger_arbre(racine_arbre)
+    donnees_condensees = collecter_donnees_condensees(racine_arbre)
+    liste_des_batchs = generer_batchs_llm(donnees_condensees, max_tokens_per_batch=1000)
+    
+    for idx, batch in enumerate(liste_des_batchs, 1):
+        print(batch)
+
+
+
+
+
 
 import re
 import difflib
