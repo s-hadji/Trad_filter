@@ -3,6 +3,184 @@ import difflib
 from collections import defaultdict
 
 # ==============================================================================
+# 1. STRUCTURE DE L'ARBRE ET INSERTION
+# ==============================================================================
+class ChapitreNode:
+    def __init__(self, name="Racine"):
+        self.name = name
+        self.children = {}  
+        # Structure : { (dm_code, type_label): {"v1": text, "v2": text, "status": str, "transformations": []} }
+        self.modules = {}   
+
+def ajouter_au_trie(racine, doc, version):
+    doc_type = doc.get("type")
+    if doc_type not in ["XML_procedure", "XML_description"]: 
+        return
+        
+    info = doc.get("extra_information", {})
+    titre, code, contenu = info.get("DM_title", ""), info.get("DM_code", ""), doc.get("content", "")
+    
+    type_label = "Procedure" if doc_type == "XML_procedure" else "Description"
+    
+    elements = [e.strip() for e in titre.split(">") if e.strip()]
+    courant = racine
+    for elem in elements:
+        if elem not in courant.children:
+            courant.children[elem] = ChapitreNode(elem)
+        courant = courant.children[elem]
+    
+    cle_module = (code, type_label)
+    if cle_module not in courant.modules:
+        courant.modules[cle_module] = {"v1": None, "v2": None, "status": None, "transformations": []}
+        
+    courant.modules[cle_module][version] = contenu
+
+# ==============================================================================
+# 2. CALCUL DES MUTATIONS UNIQUES
+# ==============================================================================
+def calculer_mutations_uniques(t1, t2):
+    tok1 = re.findall(r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]', t1) if t1 else []
+    tok2 = re.findall(r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]', t2) if t2 else []
+    
+    matcher = difflib.SequenceMatcher(None, tok1, tok2, autojunk=False)
+    transformations = []
+    
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        mut = None
+        if tag == 'delete':
+            txt = ' '.join(tok1[i1:i2])
+            mut = f"Retrait de : '{txt}'"
+        elif tag == 'insert':
+            txt = ' '.join(tok2[j1:j2])
+            mut = f"Ajout de : '{txt}'"
+        elif tag == 'replace':
+            txt_av = ' '.join(tok1[i1:i2])
+            txt_ap = ' '.join(tok2[j1:j2])
+            mut = f"'{txt_av}' -> '{txt_ap}'"
+            
+        if mut and mut not in transformations:
+            transformations.append(mut)
+            
+    return transformations
+
+def analyser_et_tagger_arbre(noeud):
+    for cle_module, mod in noeud.modules.items():
+        v1, v2 = mod["v1"], mod["v2"]
+        
+        if v2 is not None and v1 is None:
+            mod["status"] = "NOUVEAU"
+            mod["transformations"] = ["Creation complete du bloc."]
+        elif v1 is not None and v2 is None:
+            mod["status"] = "SUPPRIME"
+            mod["transformations"] = ["Suppression complete du bloc."]
+        else:
+            if v1.strip() == v2.strip():
+                mod["status"] = "IDENTIQUE"
+                mod["transformations"] = []
+            else:
+                mod["status"] = "MODIFIE"
+                mod["transformations"] = calculer_mutations_uniques(v1, v2)
+                
+    for enfant in noeud.children.values():
+        analyser_et_tagger_arbre(enfant)
+
+# ==============================================================================
+# 3. CARTOGRAPHIE ET FUSION PAR SOUS-BRANCHE
+# ==============================================================================
+def collecter_tous_les_modules_avec_chemin(noeud, chemin_actuel="", liste_globale=None):
+    if liste_globale is None: 
+        liste_globale = []
+    
+    nom_chemin = f"{chemin_actuel} > {noeud.name}" if chemin_actuel else noeud.name
+    
+    for (dm_code, type_label), mod in noeud.modules.items():
+        if mod["status"] != "IDENTIQUE":
+            liste_globale.append((dm_code, type_label, nom_chemin, mod))
+            
+    for enfant in noeud.children.values():
+        collecter_tous_les_modules_avec_chemin(enfant, nom_chemin, liste_globale)
+        
+    return liste_globale
+
+def cartographier_par_sous_branche(racine):
+    modules_actifs = collecter_tous_les_modules_avec_chemin(racine)
+    
+    # 1. On calcule d'abord l'occurrence globale de chaque modification
+    compteur_global_mutations = defaultdict(int)
+    for _, _, _, mod in modules_actifs:
+        for mutation in mod["transformations"]:
+            compteur_global_mutations[mutation] += 1
+
+    # 2. On groupe tout par Sous-Branche, puis par Modification
+    # Structure : { nom_chemin: { mutation: [(dm_code, type_label), ...] } }
+    registre_branches = defaultdict(lambda: defaultdict(list))
+    
+    for dm_code, type_label, nom_chemin, mod in modules_actifs:
+        for mutation in mod["transformations"]:
+            registre_branches[nom_chemin][mutation].append((dm_code, type_label))
+            
+    return registre_branches, compteur_global_mutations
+
+# ==============================================================================
+# 4. AFFICHAGE DE L'ARBRE COUVRANT
+# ==============================================================================
+def afficher_index_par_sous_branche(registre_branches, compteur_global):
+    print("==================================================================")
+    print("      CARTOGRAPHIE DES MODIFICATIONS REGROUPÉES PAR BRANCHE       ")
+    print("==================================================================")
+    
+    for chemin, dic_mutations in registre_branches.items():
+        print(f"Sous-Branche : {chemin}")
+        
+        for mutation, modules_impactes in dic_mutations.items():
+            total_global = compteur_global[mutation]
+            # On indique si cette modification precise se repete ailleurs dans le projet
+            status_repetition = f"[REPETEE {total_global}x au total]" if total_global > 1 else "[UNIQUE]"
+            
+            print(f"    Modification : {mutation} {status_repetition}")
+            for dm_code, type_label in modules_impactes:
+                print(f"        - Module : {dm_code} ({type_label})")
+                
+        print("-" * 66)
+
+# ==============================================================================
+# JEU DE DONNÉES DE TEST
+# ==============================================================================
+if __name__ == "__main__":
+    dico_v1 = [
+        {"type": "XML_procedure", "content": "Ouvrir le clapet d'isolement.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}},
+        {"type": "XML_description", "content": "Ce systeme de vannes controle le flux.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}},
+        {"type": "XML_procedure", "content": "Ouvrir le clapet de securite.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-002"}},
+        {"type": "XML_description", "content": "Description du bloc de purge.", "extra_information": {"DM_title": "Hydraulique > Purge", "DM_code": "DM-HYD-099"}}
+    ]
+    
+    dico_v2 = [
+        # Ici on applique "lentement" a 3 endroits dans la branche Vannes, et on ajoute une modif unique sur DM-HYD-001
+        {"type": "XML_procedure", "content": "Ouvrir doucement le clapet d'isolement lentement.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}},
+        {"type": "XML_description", "content": "Ce systeme de vannes controle le flux lentement.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}},
+        {"type": "XML_procedure", "content": "Ouvrir le clapet de securite lentement.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-002"}},
+        {"type": "XML_description", "content": "Description du bloc de purge obsolete.", "extra_information": {"DM_title": "Hydraulique > Purge", "DM_code": "DM-HYD-099"}}
+    ]
+
+    racine_arbre = ChapitreNode()
+    for doc in dico_v1: ajouter_au_trie(racine_arbre, doc, "v1")
+    for doc in dico_v2: ajouter_au_trie(racine_arbre, doc, "v2")
+    
+    analyser_et_tagger_arbre(racine_arbre)
+    
+    # Appel du nouveau moteur de tri
+    registre_final, compteur_global = cartographier_par_sous_branche(racine_arbre)
+    
+    afficher_index_par_sous_branche(registre_final, compteur_global)
+
+
+
+
+import re
+import difflib
+from collections import defaultdict
+
+# ==============================================================================
 # 1. STRUCTURE DE L'ARBRE ET INSERTION (MULTI-TYPES)
 # ==============================================================================
 class ChapitreNode:
