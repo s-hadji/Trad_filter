@@ -9,6 +9,176 @@ class ChapitreNode:
     def __init__(self, name="Racine"):
         self.name = name
         self.children = {}  
+        self.modules = {}   # { "DM-XXX": {"v1": text, "v2": text, "transformations": [], "mots_cles": set()} }
+
+def ajouter_au_trie(racine, doc, version):
+    if doc.get("type") != "XML_procedure": return
+    info = doc.get("extra_information", {})
+    titre, code, contenu = info.get("DM_title", ""), info.get("DM_code", ""), doc.get("content", "")
+    
+    elements = [e.strip() for e in titre.split(">") if e.strip()]
+    courant = racine
+    for elem in elements:
+        if elem not in courant.children:
+            courant.children[elem] = ChapitreNode(elem)
+        courant = courant.children[elem]
+    
+    if code not in courant.modules:
+        courant.modules[code] = {"v1": None, "v2": None, "status": None, "transformations": [], "mots_cles": set()}
+    courant.modules[code][version] = contenu
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. EXTRACTION DES MUTATIONS PRÉCISES SANS DOUBLON
+# ══════════════════════════════════════════════════════════════════════════════
+def calculer_mutations_uniques(t1, t2):
+    """Extrait uniquement les mutations atomiques dans une liste sans duplicata."""
+    tok1 = re.findall(r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]', t1) if t1 else []
+    tok2 = re.findall(r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]', t2) if t2 else []
+    
+    matcher = difflib.SequenceMatcher(None, tok1, tok2, autojunk=False)
+    transformations = []
+    
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        mut = None
+        if tag == 'delete':
+            txt = ' '.join(tok1[i1:i2])
+            mut = f"Retrait de : '{txt}'"
+        elif tag == 'insert':
+            txt = ' '.join(tok2[j1:j2])
+            mut = f"Ajout de : '{txt}'"
+        elif tag == 'replace':
+            txt_av = ' '.join(tok1[i1:i2])
+            txt_ap = ' '.join(tok2[j1:j2])
+            mut = f"'{txt_av}' ➜ '{txt_ap}'"
+            
+        # Filtrage anti-doublon en conservant l'ordre d'apparition
+        if mut and mut not in transformations:
+            transformations.append(mut)
+            
+    return transformations
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. STATUTS ET EXTRACTION DES MOTS-CLÉS
+# ══════════════════════════════════════════════════════════════════════════════
+def extraire_mots_techniques(textes_liste):
+    mots_trouves = set()
+    STOP_WORDS = {"la", "le", "les", "de", "des", "du", "un", "une", "et", "en", "à", "principale", "deux", "minutes"}
+    for t in textes_liste:
+        for m in re.findall(r'[a-zA-ZÀ-ÿ]{3,}', t.lower()):
+            if m not in STOP_WORDS: mots_trouves.add(m)
+    return mots_trouves
+
+def analyser_et_tagger_arbre(noeud):
+    for dm_code, mod in noeud.modules.items():
+        v1, v2 = mod["v1"], mod["v2"]
+        
+        if v2 is not None and v1 is None:
+            mod["status"] = "NOUVEAU"
+            mod["transformations"] = ["Création complète du module."]
+            mod["mots_cles"] = extraire_mots_techniques([v2])
+        elif v1 is not None and v2 is None:
+            mod["status"] = "SUPPRIMÉ"
+            mod["transformations"] = ["Suppression complète du module."]
+            mod["mots_cles"] = extraire_mots_techniques([v1])
+        else:
+            if v1.strip() == v2.strip():
+                mod["status"] = "IDENTIQUE"
+                mod["transformations"] = [] # Liste vide si aucun changement
+            else:
+                mod["status"] = "MODIFIÉ"
+                # Stockage direct des mutations uniques dans la liste
+                mod["transformations"] = calculer_mutations_uniques(v1, v2)
+                mod["mots_cles"] = extraire_mots_techniques(mod["transformations"])
+                
+    for enfant in noeud.children.values():
+        analyser_et_tagger_arbre(enfant)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. RECHERCHE TRAVERSANTE DES LIENS
+# ══════════════════════════════════════════════════════════════════════════════
+def collecter_tous_les_modules_modifies(noeud, liste_globale=None):
+    if liste_globale is None: liste_globale = []
+    for dm_code, mod in noeud.modules.items():
+        if mod["status"] != "IDENTIQUE":
+            liste_globale.append((dm_code, mod))
+    for enfant in noeud.children.values():
+        collecter_tous_les_modules_modifies(enfant, liste_globale)
+    return liste_globale
+
+def analyser_les_liens_systemiques(racine):
+    modules_actifs = collecter_tous_les_modules_modifies(racine)
+    mots_partages = defaultdict(list)
+    for dm_code, mod in modules_actifs:
+        for mot in mod["mots_cles"]:
+            mots_partages[mot].append(dm_code)
+    return {mot: codes for mot, codes in mots_partages.items() if len(codes) > 1}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. AFFICHAGE CIBLÉ DES LISTES DE MUTATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+def afficher_uniquement_les_listes_de_mutations(noeud, chemin_actuel=""):
+    nom_chemin = f"{chemin_actuel} > {noeud.name}" if chemin_actuel else noeud.name
+    
+    # On isole uniquement les modules ayant subi un changement (Modifié, Nouveau, Supprimé)
+    modules_modifies = {k: v for k, v in noeud.modules.items() if v["status"] != "IDENTIQUE"}
+    
+    if modules_modifies:
+        print(f"\n📂 Sous-Chapitre : {nom_chemin}")
+        for dm_code, mod in modules_modifies.items():
+            print(f"  🔹 Module : {dm_code} ➜ [{mod['status']}]")
+            # Affichage direct de la liste Python brute ou formatée
+            print(f"    📋 Liste des modifications : {mod['transformations']}")
+            
+    for enfant in noeud.children.values():
+        afficher_uniquement_les_listes_de_mutations(enfant, nom_chemin)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXÉCUTION
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    dico_v1 = [
+        {"type": "XML_procedure", "content": "Serrer la vanne d'isolement principale. Attendre deux minutes. Ouvrir le clapet.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}},
+        {"type": "XML_procedure", "content": "Serrer la vanne d'isolement principale. Attendre deux minutes. Ouvrir le clapet.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-002"}},
+        {"type": "XML_procedure", "content": "Ancienne procédure obsolète à retirer du système.", "extra_information": {"DM_title": "Hydraulique > Purge", "DM_code": "DM-HYD-099"}}
+    ]
+    dico_v2 = [
+        {"type": "XML_procedure", "content": "Serrer la vanne d'isolement à 45 Nm. Attendre deux minutes. Vérifier la pression et ouvrir le clapet.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}},
+        {"type": "XML_procedure", "content": "Serrer la vanne d'isolement principale. Attendre deux minutes. Ouvrir le clapet lentement.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-002"}},
+        {"type": "XML_procedure", "content": "Procédure complète de sécurité électrique cabine.", "extra_information": {"DM_title": "Electricite > Cabine", "DM_code": "DM-ELEC-003"}}
+    ]
+
+    racine_arbre = ChapitreNode()
+    for doc in dico_v1: ajouter_au_trie(racine_arbre, doc, "v1")
+    for doc in dico_v2: ajouter_au_trie(racine_arbre, doc, "v2")
+
+    analyser_et_tagger_arbre(racine_arbre)
+    
+    print("==================================================================")
+    print("      AFFICHAGE STRICT DES LISTES DE MUTATIONS PAR MODULE        ")
+    print("==================================================================")
+    afficher_uniquement_les_listes_de_mutations(racine_arbre)
+    
+    print("\n==================================================================")
+    print("            CORRÉLATIONS ET LIENS TRANSVERSES                    ")
+    print("==================================================================")
+    liens = analyser_les_liens_systemiques(racine_arbre)
+    if liens:
+        for mot, codes in liens.items():
+            print(f"🔗 Lien sémantique ['{mot.upper()}'] ➜ Trouvé dans : {codes}")
+
+
+
+import re
+import difflib
+from collections import defaultdict
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. STRUCTURE DE L'ARBRE ET INSERTION
+# ══════════════════════════════════════════════════════════════════════════════
+class ChapitreNode:
+    def __init__(self, name="Racine"):
+        self.name = name
+        self.children = {}  
         self.modules = {}   # { "DM-XXX": {"v1": text, "v2": text, "transformations": [...], "mots_cles": set()} }
 
 def ajouter_au_trie(racine, doc, version):
