@@ -9,7 +9,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STRUCTURE DE L'ARBRE (STANDALONE AVEC TOKENS CUMULÉS)
+# STRUCTURE DE L'ARBRE
 # ══════════════════════════════════════════════════════════════════════════════
 
 TOKENS_PARASITES = {'-', '/', '|', '–', '—', '·', '>', '→', '->'}
@@ -30,14 +30,6 @@ class Node:
         self.doc_v2 = None
 
     @property
-    def descendants(self):
-        nodes = []
-        for child in self.children:
-            nodes.append(child)
-            nodes.extend(child.descendants)
-        return nodes
-
-    @property
     def path(self):
         path = []
         current = self
@@ -48,7 +40,7 @@ class Node:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FONCTIONS DE NETTOYAGE ET SÉPARATION FINE (TOKENIZER PERFO)
+# TOKENIZER ET MOTEUR DE DIFF CONTIGU
 # ══════════════════════════════════════════════════════════════════════════════
 
 def normaliser(ligne):
@@ -65,12 +57,7 @@ def extraire_tokens_perfo(texte):
     if not texte:
         return []
     pattern = r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]'
-    return re.findall(pattern, texte)  # CORRIGÉ : suppression de text=
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MOTEUR DE DIFF ET FUSION PAR CONTIGUÏTÉ RETRAVAILLÉ
-# ══════════════════════════════════════════════════════════════════════════════
+    return re.findall(pattern, texte)
 
 def diff_contenu(t1, t2):
     mots_v1 = extraire_tokens_perfo(t1)
@@ -113,7 +100,7 @@ def diff_contenu(t1, t2):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GESTION ET PROPAGATION DANS L'ARBRE
+# GESTION ET PROPAGATION RÉCURSIVE DE L'ARBRE (CORRIGÉ)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def construire_trie(entrees, parent):
@@ -153,37 +140,40 @@ def construire_trie(entrees, parent):
         construire_trie([(t[n_commun:], c, d, v) for t, c, d, v in groupe], noeud_intermediaire)
 
 
-def propager_bottom_up(racine):
-    for noeud in reversed(list(racine.descendants)):
-        if noeud.feuille:
-            d1 = getattr(noeud, 'doc_v1', None)
-            d2 = getattr(noeud, 'doc_v2', None)
-            
-            if d1 is None and d2 is not None:
-                noeud.statut = "AJOUTE"
-                noeud.patches.append({
-                    "avant": "[Néant - Nouveau Module Documentaire]", 
-                    "apres": f"Création et insertion complète du module {noeud.dm_code}", 
-                    "dm_code": noeud.dm_code
-                })
-            elif d2 is None and d1 is not None:
-                noeud.statut = "SUPPRIME"
-                noeud.patches.append({
-                    "avant": f"Suppression complète du module {noeud.dm_code}", 
-                    "apres": "[Supprimé du référentiel]", 
-                    "dm_code": noeud.dm_code
-                })
-            elif d1 is not None and d2 is not None:
-                t1, t2 = d1["content"], d2["content"]
-                if re.sub(r'\s+', ' ', t1).strip() == re.sub(r'\s+', ' ', t2).strip():
-                    noeud.statut = "INCHANGE"
-                else:
-                    noeud.statut = "MODIFIE"
-                    for avant, apres in diff_contenu(t1, t2):
-                        noeud.patches.append({"avant": avant, "apres": apres, "dm_code": noeud.dm_code})
-        else:
-            for patch in [p for enfant in noeud.children for p in enfant.patches]:
-                noeud.patches.append(patch)
+def propager_bottom_up(noeud):
+    """Propagation récursive stricte incluant tous les niveaux de l'arbre."""
+    if noeud.feuille:
+        d1 = getattr(noeud, 'doc_v1', None)
+        d2 = getattr(noeud, 'doc_v2', None)
+        noeud.patches = []
+        
+        if d1 is None and d2 is not None:
+            noeud.statut = "AJOUTE"
+            noeud.patches.append({
+                "avant": "[Néant - Nouveau Module Documentaire]", 
+                "apres": f"Création et insertion complète du module {noeud.dm_code}", 
+                "dm_code": noeud.dm_code
+            })
+        elif d2 is None and d1 is not None:
+            noeud.statut = "SUPPRIME"
+            noeud.patches.append({
+                "avant": f"Suppression complète du module {noeud.dm_code}", 
+                "apres": "[Supprimé du référentiel]", 
+                "dm_code": noeud.dm_code
+            })
+        elif d1 is not None and d2 is not None:
+            t1, t2 = d1["content"], d2["content"]
+            if re.sub(r'\s+', ' ', t1).strip() == re.sub(r'\s+', ' ', t2).strip():
+                noeud.statut = "INCHANGE"
+            else:
+                noeud.statut = "MODIFIE"
+                for avant, apres in diff_contenu(t1, t2):
+                    noeud.patches.append({"avant": avant, "apres": apres, "dm_code": noeud.dm_code})
+    else:
+        noeud.patches = []
+        for enfant in noeud.children:
+            propager_bottom_up(enfant)  # Appel récursif descendant
+            noeud.patches.extend(enfant.patches) # Collecte montante
 
 
 def estimer_tokens_arbre(noeud):
@@ -211,15 +201,25 @@ def planifier_appels_llm(racine, budget_max_appels=10, limite_tokens_par_appel=2
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# COMPACTAGE ET FACTORISATION PAR TRAJECTOIRE STRICTE
+# FACTORISATION PAR TRAJECTOIRE CLAIRE
 # ══════════════════════════════════════════════════════════════════════════════
 
 def extraire_payload_du_pivot(noeud_pivot):
     packs_chapitres = []
     
-    noeuds_feuilles = [noeud_pivot] if noeud_pivot.feuille else [n for n in noeud_pivot.descendants if n.feuille and n.patches]
-    if not noeuds_feuilles and noeud_pivot.patches:
+    # Trouver toutes les feuilles sous ce pivot qui ont des modifs
+    if noeud_pivot.feuille:
         noeuds_feuilles = [noeud_pivot]
+    else:
+        # Parcours à la main pour éviter la propriété descendante manquante de la racine
+        noeuds_feuilles = []
+        file = [noeud_pivot]
+        while file:
+            courant = file.pop(0)
+            if courant.feuille and courant.patches:
+                noeuds_feuilles.append(courant)
+            else:
+                file.extend(courant.children)
 
     patches_par_chapitre = defaultdict(list)
     for n in noeuds_feuilles:
@@ -252,28 +252,25 @@ def extraire_payload_du_pivot(noeud_pivot):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SCHÉMAS DE SORTIE STRUCTURÉE (PYDANTIC) ET LLM PIPELINE
+# FORMATAGE LLM (PYDANTIC V2)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ModificationDetaillee(BaseModel):
-    descriptions: List[str] = Field(
-        description="Description métier claire de l'évolution (ex: 'Mise à jour du couple de serrage à 45 Nm')."
-    )
+    descriptions: List[str] = Field(description="Explications claires des évolutions.")
 
 class SectionFicheVersion(BaseModel):
-    chapitre: str = Field(description="Dossier ou arborescence concernée.")
-    codes_dm: List[str] = Field(description="Modules ayant subi ce changement exact.")
-    modifications_apportees: ModificationDetaillee = Field(description="Explication descriptive.")
+    chapitre: str = Field(description="Dossier ou sous-système concerné.")
+    codes_dm: List[str] = Field(description="Modules cibles.")
+    modifications_apportees: ModificationDetaillee = Field(description="Détails.")
 
 class FicheVersionGlobale(BaseModel):
-    titre_fiche: str = Field(description="Titre de la note d'évolution.")
-    resume_macro: str = Field(description="Synthèse globale de haut niveau.")
-    sections: List[SectionFicheVersion] = Field(description="Liste des blocs de modifications.")
+    titre_fiche: str = Field(description="Titre de la release note.")
+    resume_macro: str = Field(description="Synthèse de haut niveau.")
+    sections: List[SectionFicheVersion] = Field(description="Modifications par chapitres.")
 
 
-def generer_fiche_version_llm(noeud_pivot) -> FicheVersionGlobale:
-    donnees_pack = extraire_payload_du_pivot(noeud_pivot)
-    payload_textuel = json.dumps(donnees_pack, indent=2, ensure_ascii=False)
+def generer_fiche_version_llm(noeud_pivot, payload_brut) -> FicheVersionGlobale:
+    payload_textuel = json.dumps(payload_brut, indent=2, ensure_ascii=False)
     
     llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
     llm_structure = llm.with_structured_output(FicheVersionGlobale)
@@ -300,7 +297,7 @@ def generer_fiche_version_llm(noeud_pivot) -> FicheVersionGlobale:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# JEU DE TEST TECHNIQUE RE-VÉRIFIÉ
+# LANCEMENT DU TEST INTERACTIF
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
@@ -335,39 +332,59 @@ if __name__ == "__main__":
         }
     ]
 
+    print("1. Extraction et Tokenisation...")
     liste_v1 = extraire(dico_v1)
     liste_v2 = extraire(dico_v2)
 
     entrees = []
-    for d in liste_v1:  # CORRIGÉ : liste_v1
+    for d in liste_v1:
         entrees.append((normaliser(d["extra_information"]["DM_title"]), d["extra_information"]["DM_code"], d, "v1"))
-    for d in liste_v2:  # CORRIGÉ : liste_v2
+    for d in liste_v2:
         entrees.append((normaliser(d["extra_information"]["DM_title"]), d["extra_information"]["DM_code"], d, "v2"))
 
     entrees.sort(key=lambda x: [t.lower() for t in x[0]])
 
+    print("2. Construction de l'arbre et propagation récursive...")
     racine = Node("Procédures", parent=None)
     construire_trie(entrees, racine)
+    
+    # Appel récursif global corrigé
     propager_bottom_up(racine)
     estimer_tokens_arbre(racine)
     
-    pivots = planifier_appels_llm(racine, budget_max_appels=3, limite_tokens_par_appel=200)
+    print("3. Planification des appels...")
+    pivots = planifier_appels_llm(racine, budget_max_appels=3, limite_tokens_par_appel=500)
+
+    print(f"-> Nombre de pivots trouvés : {len(pivots)}")
 
     for index, pivot in enumerate(pivots, 1):
-        if pivot.tokens_cumules == 0: continue
+        print(f"\n--- ANALYSE DU PACK {index} (Pivot: {pivot.name}) ---")
+        
+        # Étape clé : extraction de la trajectoire claire
+        payload_brut = extraire_payload_du_pivot(pivot)
+        
+        print("\n[VÉRIFICATION] Contenu JSON envoyé au LLM :")
+        print(json.dumps(payload_brut, indent=2, ensure_ascii=False))
+        
+        if pivot.tokens_cumules == 0:
+            print("Aucune modification détectée dans ce pack.")
+            continue
+            
+        print("\n[LLM] Envoi à l'API OpenAI (Génération de la note de version)...")
         try:
-            fiche = generer_fiche_version_llm(pivot)
-            print(f"\n=== NOTE DE VERSION PACK {index} ===")
+            fiche = generer_fiche_version_llm(pivot, payload_brut)
+            print(f"\n=== FICHE DE VERSION FINALE (PACK {index}) ===")
+            print(f"Titre : {fiche.titre_fiche}")
             print(f"Macro : {fiche.resume_macro}")
             for sec in fiche.sections:
-                print(f" Chapitre  : {sec.chapitre}")
-                print(f" Module(s) : {', '.join(sec.codes_dm)}")
+                print(f"  Chapitre  : {sec.chapitre}")
+                print(f"  Module(s) : {', '.join(sec.codes_dm)}")
                 for desc in sec.modifications_apportees.descriptions:
-                    print(f"   - {desc}")
-            print("=" * 45)
+                    print(f"    - {desc}")
+            print("=" * 50)
         except Exception as e:
-            print(f"Erreur Pack {index} : {e}")
-
+            print(f"Erreur lors de l'appel LLM : {e}")
+            print("Note : Vérifiez que votre variable d'environnement OPENAI_API_KEY est correctement configurée.")
 
 
 
