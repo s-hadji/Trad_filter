@@ -1,6 +1,298 @@
 import re
 import difflib
 from collections import defaultdict
+import ftfy  # <--- Ajout de la bibliothèque pour réparer le texte
+
+# ==============================================================================
+# 0. NETTOYAGE ET ENCODAGE DU TEXTE
+# ==============================================================================
+def ajuster_et_fixer_texte(texte):
+    """
+    Régle les problèmes de Mojibake (mauvais encodage) avec ftfy,
+    puis finalise en forçant un encodage/décodage propre en UTF-8.
+    """
+    if not texte:
+        return ""
+    
+    # 1. ftfy répare les caractères cassés (ex: "Ã©" devient "é")
+    texte_repare = ftfy.fix_text(texte)
+    
+    # 2. Sécurisation finale de l'encodage en UTF-8 (élimine ou remplace les octets invalides)
+    texte_utf8 = texte_repare.encode('utf-8', errors='replace').decode('utf-8')
+    
+    return texte_utf8
+
+# ==============================================================================
+# 1. FUSION EN AMONT (PRE-TRAITEMENT)
+# ==============================================================================
+def fusionner_par_dm_code(liste_docs):
+    """
+    Prend une liste de documents, nettoie leur texte, regroupe ceux 
+    qui partagent le même DM_code, et fusionne leur contenu.
+    """
+    groupes = defaultdict(list)
+    for doc in liste_docs:
+        # Nettoyage préventif des métadonnées qui pourraient contenir des accents
+        info = doc.get("extra_information", {})
+        if "DM_code" in info:
+            info["DM_code"] = ajuster_et_fixer_texte(info["DM_code"])
+        if "DM_title" in info:
+            info["DM_title"] = ajuster_et_fixer_texte(info["DM_title"])
+            
+        code = info.get("DM_code")
+        if code:
+            groupes[code].append(doc)
+            
+    docs_fusionnes = []
+    for code, docs in groupes.items():
+        docs.sort(key=lambda x: x.get("type", ""))
+        
+        morceaux_texte = []
+        info_commune = {}
+        
+        for d in docs:
+            doc_type = d.get("type")
+            if doc_type not in ["XML_procedure", "XML_description"]:
+                continue
+            
+            label = "Procédure" if doc_type == "XML_procedure" else "Description"
+            
+            # --- Nettoyage et encodage du contenu textuel brut ici ---
+            contenu_propre = ajuster_et_fixer_texte(d.get("content", ""))
+            
+            morceaux_texte.append(f"[{label}]\n{contenu_propre.strip()}")
+            
+            if not info_commune:
+                info_commune = d.get("extra_information", {})
+        
+        if morceaux_texte:
+            texte_unique = "\n\n".join(morceaux_texte)
+            docs_fusionnes.append({
+                "type": "XML_fusionne",
+                "content": texte_unique,
+                "extra_information": info_commune
+            })
+            
+    return docs_fusionnes
+
+# ==============================================================================
+# 2. STRUCTURE DE L'ARBRE
+# ==============================================================================
+class ChapitreNode:
+    def __init__(self, name="Racine"):
+        self.name = name
+        self.children = {}  
+        self.modules = {}   
+
+def ajouter_au_trie(racine, doc, version):
+    if doc.get("type") != "XML_fusionne": 
+        return
+        
+    info = doc.get("extra_information", {})
+    titre, code, contenu = info.get("DM_title", ""), info.get("DM_code", ""), doc.get("content", "")
+    
+    type_label = "Fusionne"
+    
+    elements = [e.strip() for e in titre.split(">") if e.strip()]
+    courant = racine
+    for elem in elements:
+        if elem not in courant.children:
+            courant.children[elem] = ChapitreNode(elem)
+        courant = courant.children[elem]
+    
+    cle_module = (code, type_label)
+    if cle_module not in courant.modules:
+        courant.modules[cle_module] = {"v1": None, "v2": None, "status": None, "transformations": []}
+        
+    courant.modules[cle_module][version] = contenu
+
+# ==============================================================================
+# 3. FILTRAGE INTELLIGENT DES TYPOS ET ESPACES
+# ==============================================================================
+def filtre_modif_typo(avant, apres):
+    norm_av = re.sub(r'\s+', '', avant.lower())
+    norm_ap = re.sub(r'\s+', '', apres.lower())
+    if norm_av == norm_ap:
+        return True
+    if norm_av.rstrip('s') == norm_ap.rstrip('s'):
+        return True
+    return False
+
+# ==============================================================================
+# 4. CALCUL DES MUTATIONS AVEC CLASSIFICATION
+# ==============================================================================
+def calculer_mutations_uniques(t1, t2):
+    tok1 = re.findall(r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]', t1) if t1 else []
+    tok2 = re.findall(r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]', t2) if t2 else []
+    
+    matcher = difflib.SequenceMatcher(None, tok1, tok2, autojunk=False)
+    transformations = []
+    
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'equal':
+            continue
+            
+        txt_av = ' '.join(tok1[i1:i2]) if tag in ['delete', 'replace'] else ""
+        txt_ap = ' '.join(tok2[j1:j2]) if tag in ['insert', 'replace'] else ""
+        
+        is_typo = filtre_modif_typo(txt_av, txt_ap)
+        categorie = "TYPO" if is_typo else "REAL"
+        
+        if tag == 'delete':
+            mut = f"Retrait de : '{txt_av}'"
+        elif tag == 'insert':
+            mut = f"Ajout de : '{txt_ap}'"
+        elif tag == 'replace':
+            mut = f"'{txt_av}' -> '{txt_ap}'"
+            
+        item = (mut, categorie)
+        if item not in transformations:
+            transformations.append(item)
+            
+    return transformations
+
+def analyser_et_tagger_arbre(noeud):
+    for cle_module, mod in noeud.modules.items():
+        v1, v2 = mod["v1"], mod["v2"]
+        
+        if v2 is not None and v1 is None:
+            mod["status"] = "NOUVEAU"
+        elif v1 is not None and v2 is None:
+            mod["status"] = "SUPPRIME"
+        else:
+            if v1.strip() == v2.strip():
+                mod["status"] = "IDENTIQUE"
+            else:
+                mod["status"] = "MODIFIE"
+                mod["transformations"] = calculer_mutations_uniques(v1, v2)
+                
+    for enfant in noeud.children.values():
+        analyser_et_tagger_arbre(enfant)
+
+# ==============================================================================
+# 5. COMPTAGE DE TOKENS ET PREPARATION DES BATCHS POUR LLM
+# ==============================================================================
+def estimer_tokens(texte):
+    return max(1, len(texte) // 4)
+
+def collecter_donnees_condensees(noeud, chemin_actuel="", donnees_par_branche=None):
+    if donnees_par_branche is None:
+        donnees_par_branche = defaultdict(lambda: {"ajouts": [], "suppressions": [], "modifications": [], "typos": []})
+        
+    nom_chemin = f"{chemin_actuel} > {noeud.name}" if chemin_actuel else noeud.name
+    
+    for (dm_code, type_label), mod in noeud.modules.items():
+        identifiant_bloc = f"{dm_code} ({type_label})"
+        
+        if mod["status"] == "NOUVEAU":
+            donnees_par_branche[nom_chemin]["ajouts"].append(identifiant_bloc)
+        elif mod["status"] == "SUPPRIME":
+            donnees_par_branche[nom_chemin]["suppressions"].append(identifiant_bloc)
+        elif mod["status"] == "MODIFIE":
+            for mut, categorie in mod["transformations"]:
+                if categorie == "TYPO":
+                    donnees_par_branche[nom_chemin]["typos"].append(f"{identifiant_bloc}: {mut}")
+                else:
+                    donnees_par_branche[nom_chemin]["modifications"].append({
+                        "bloc": identifiant_bloc,
+                        "mutation": mut
+                    })
+                    
+    for enfant in noeud.children.values():
+        collecter_donnees_condensees(enfant, nom_chemin, donnees_par_branche)
+        
+    return donnees_par_branche
+
+def generer_batchs_llm(donnees_par_branche, max_tokens_per_batch=1000):
+    batchs = []
+    contenu_courant = []
+    tokens_courants = 0
+    
+    consigne_systeme = (
+        "ROLE: Analyser les modifications textuelles fournies. Identifier et lister "
+        "si une modification se repete a l'identique d'un module a l'autre ou d'un "
+        "chapitre/sous-branche au suivant. Produire un rapport de correlation.\n"
+        "==================================================================\n"
+    )
+    
+    for chemin, contenu in donnees_par_branche.items():
+        bloc_texte_branche = f"Sous-Branche : {chemin}\n"
+        
+        if contenu["ajouts"]:
+            bloc_texte_branche += f"  Ajout des blocs complets : {', '.join(contenu['ajouts'])}\n"
+        if contenu["suppressions"]:
+            bloc_texte_branche += f"  Suppression des blocs complets : {', '.join(contenu['suppressions'])}\n"
+        if contenu["typos"]:
+            bloc_texte_branche += f"  Modifications mineures (typos/espaces) : {len(contenu['typos'])} detectees.\n"
+            
+        if contenu["modifications"]:
+            bloc_texte_branche += "  Modifications significatives a analyser :\n"
+            for modif in contenu["modifications"]:
+                bloc_texte_branche += f"    - Bloc : {modif['bloc']} | Modification : {modif['mutation']}\n"
+                
+        bloc_texte_branche += "--------------------------------------------------\n"
+        
+        tokens_bloc = estimer_tokens(bloc_texte_branche)
+        
+        if tokens_bloc + estimer_tokens(consigne_systeme) > max_tokens_per_batch:
+            batchs.append(consigne_systeme + bloc_texte_branche)
+            continue
+            
+        if tokens_courants + tokens_bloc > max_tokens_per_batch:
+            payload_final = consigne_systeme + "".join(contenu_courant)
+            batchs.append(payload_final)
+            contenu_courant = [bloc_texte_branche]
+            tokens_courants = tokens_bloc
+        else:
+            contenu_courant.append(bloc_texte_branche)
+            tokens_courants += tokens_bloc
+            
+    if contenu_courant:
+        payload_final = consigne_systeme + "".join(contenu_courant)
+        batchs.append(payload_final)
+        
+    return batchs
+
+# ==============================================================================
+# 6. EXECUTION SUR UN EXEMPLE AVEC TEXTE MAL ENCODÉ (MOJIBAKE)
+# ==============================================================================
+if __name__ == "__main__":
+    # Simulation de chaînes cassées courantes ("Ã©" au lieu de "é")
+    dico_v1 = [
+        {"type": "XML_procedure", "content": "Ouvrir le clapet Ã©lectrique.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}},
+        {"type": "XML_description", "content": "Description initiale.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}}
+    ]
+    
+    dico_v2 = [
+        {"type": "XML_procedure", "content": "Ouvrir le clapet Ã©lectrique lentement.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}},
+        {"type": "XML_description", "content": "description initiale  ", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}}
+    ]
+
+    # Traitement : correction ftfy + encodage UTF-8 + fusion par DM_code
+    dico_v1_fusionne = fusionner_par_dm_code(dico_v1)
+    dico_v2_fusionne = fusionner_par_dm_code(dico_v2)
+
+    racine_arbre = ChapitreNode()
+    for doc in dico_v1_fusionne: ajouter_au_trie(racine_arbre, doc, "v1")
+    for doc in dico_v2_fusionne: ajouter_au_trie(racine_arbre, doc, "v2")
+    
+    analyser_et_tagger_arbre(racine_arbre)
+    donnees_condensees = collecter_donnees_condensees(racine_arbre)
+    liste_des_batchs = generer_batchs_llm(donnees_condensees, max_tokens_per_batch=200)
+    
+    print(f"Nombre total de batchs prets a l'envoi : {len(liste_des_batchs)}\n")
+    for idx, batch in enumerate(liste_des_batchs, 1):
+        print(f"=== BATCH NUMERO {idx} ===")
+        print(batch)
+
+
+
+
+
+
+import re
+import difflib
+from collections import defaultdict
 import ftfy
 
 # ==============================================================================
