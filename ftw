@@ -1,5 +1,188 @@
 import re
 import difflib
+from collections import defaultdict
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. STRUCTURE DE L'ARBRE ET INSERTION
+# ══════════════════════════════════════════════════════════════════════════════
+class ChapitreNode:
+    def __init__(self, name="Racine"):
+        self.name = name
+        self.children = {}  
+        self.modules = {}   # { "DM-XXX": {"v1": text, "v2": text, "transformations": [...], "mots_cles": set()} }
+
+def ajouter_au_trie(racine, doc, version):
+    if doc.get("type") != "XML_procedure": return
+    info = doc.get("extra_information", {})
+    titre, code, contenu = info.get("DM_title", ""), info.get("DM_code", ""), doc.get("content", "")
+    
+    elements = [e.strip() for e in titre.split(">") if e.strip()]
+    courant = racine
+    for elem in elements:
+        if elem not in courant.children:
+            courant.children[elem] = ChapitreNode(elem)
+        courant = courant.children[elem]
+    
+    if code not in courant.modules:
+        courant.modules[code] = {"v1": None, "v2": None, "status": None, "avant": "", "apres": "", "transformations": [], "mots_cles": set()}
+    courant.modules[code][version] = contenu
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. ANALYSE DU "QUOI EN QUOI" (TRANSFORMATIONS LOCALES)
+# ══════════════════════════════════════════════════════════════════════════════
+def calculer_diff_et_mutations(t1, t2):
+    """Calcule le diff linéaire et extrait précisément le 'Quoi est devenu Quoi'."""
+    tok1 = re.findall(r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]', t1) if t1 else []
+    tok2 = re.findall(r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]', t2) if t2 else []
+    
+    matcher = difflib.SequenceMatcher(None, tok1, tok2, autojunk=False)
+    avant_pieces, apres_pieces, transformations = [], [], []
+    
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'equal':
+            if not avant_pieces or avant_pieces[-1] != "[...identique...]": avant_pieces.append("[...identique...]")
+            if not apres_pieces or apres_pieces[-1] != "[...identique...]": apres_pieces.append("[...identique...]")
+        elif tag == 'delete':
+            txt = ' '.join(tok1[i1:i2])
+            avant_pieces.append(f"[SUPPRIMÉ: {txt}]")
+            transformations.append(f"Retrait de : '{txt}'")
+        elif tag == 'insert':
+            txt = ' '.join(tok2[j1:j2])
+            apres_pieces.append(f"[AJOUTÉ: {txt}]")
+            transformations.append(f"Ajout de : '{txt}'")
+        elif tag == 'replace':
+            txt_av = ' '.join(tok1[i1:i2])
+            txt_ap = ' '.join(tok2[j1:j2])
+            avant_pieces.append(f"[SUPPRIMÉ: {txt_av}]")
+            apres_pieces.append(f"[AJOUTÉ: {txt_ap}]")
+            transformations.append(f"'{txt_av}' ➜ modifié en ➜ '{txt_ap}'")
+            
+    return " ".join(avant_pieces), " ".join(apres_pieces), transformations
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. STATUTS ET EXTRACTION DES MOTS-CLÉS DE LA MODIFICATION
+# ══════════════════════════════════════════════════════════════════════════════
+def extraire_mots_techniques(textes_liste):
+    """Isole les mots significatifs impactés pour détecter les liaisons."""
+    mots_trouves = set()
+    STOP_WORDS = {"la", "le", "les", "de", "des", "du", "un", "une", "et", "en", "à", "principale", "deux", "minutes"}
+    for t in textes_liste:
+        for m in re.findall(r'[a-zA-ZÀ-ÿ]{3,}', t.lower()):
+            if m not in STOP_WORDS: mots_trouves.add(m)
+    return mots_trouves
+
+def analyser_et_tagger_arbre(noeud):
+    for dm_code, mod in noeud.modules.items():
+        v1, v2 = mod["v1"], mod["v2"]
+        
+        if v2 is not None and v1 is None:
+            mod["status"] = "NOUVEAU"
+            mod["avant"], mod["apres"] = "[Néant]", f"[AJOUTÉ: {v2}]"
+            mod["transformations"] = [f"Création complète du module."]
+            mod["mots_cles"] = extraire_mots_techniques([v2])
+        elif v1 is not None and v2 is None:
+            mod["status"] = "SUPPRIMÉ"
+            mod["avant"], mod["apres"] = f"[SUPPRIMÉ: {v1}]", "[Néant]"
+            mod["transformations"] = [f"Suppression complète du module."]
+            mod["mots_cles"] = extraire_mots_techniques([v1])
+        else:
+            if v1.strip() == v2.strip():
+                mod["status"] = "IDENTIQUE"
+                mod["avant"], mod["apres"] = "[...identique...]", "[...identique...]"
+            else:
+                mod["status"] = "MODIFIÉ"
+                mod["avant"], mod["apres"], mod["transformations"] = calculer_diff_et_mutations(v1, v2)
+                # On extrait les mots-clés uniquement de ce qui a bougé (ajouts/suppressions)
+                mod["mots_cles"] = extraire_mots_techniques(mod["transformations"])
+                
+    for enfant in noeud.children.values():
+        analyser_et_tagger_arbre(enfant)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. RECHERCHE TRAVERSANTE DES LIENS ENTRE MODIFICATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+def collecter_tous_les_modules_modifies(noeud, liste_globale=None):
+    if liste_globale is None: liste_globale = []
+    for dm_code, mod in noeud.modules.items():
+        if mod["status"] != "IDENTIQUE":
+            liste_globale.append((dm_code, mod))
+    for enfant in noeud.children.values():
+        collecter_tous_les_modules_modifies(enfant, liste_globale)
+    return liste_globale
+
+def analyser_les_liens_systemiques(racine):
+    """Détecte si plusieurs modules partagent des modifications corrélées."""
+    modules_actifs = collecter_tous_les_modules_modifies(racine)
+    mots_partages = defaultdict(list)
+    
+    # Cartographie Mot ➜ Listes de modules impactés
+    for dm_code, mod in modules_actifs:
+        for mot in mod["mots_cles"]:
+            mots_partages[mot].append(dm_code)
+            
+    # On ne garde que les mots présents dans au moins 2 modules distincts
+    liens_detectes = {mot: codes for mot, codes in mots_partages.items() if len(codes) > 1}
+    return liens_detectes
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. AFFICHAGE GLOBAL
+# ══════════════════════════════════════════════════════════════════════════════
+def afficher_analyse_complete(noeud, chemin_actuel=""):
+    nom_chemin = f"{chemin_actuel} > {noeud.name}" if chemin_actuel else noeud.name
+    if noeud.modules:
+        print(f"\n📂 Sous-Chapitre : {nom_chemin}")
+        for dm_code, mod in noeud.modules.items():
+            print(f"  🔹 Module : {dm_code} ➜ [{mod['status']}]")
+            print(f"    [AVANT] : {mod['avant']}")
+            print(f"    [APRÈS] : {mod['apres']}")
+            if mod["transformations"]:
+                print(f"    🔎 Mutations précises ('Quoi en Quoi') :")
+                for t in mod["transformations"]:
+                    print(f"       • {t}")
+            
+    for enfant in noeud.children.values():
+        afficher_analyse_complete(enfant, nom_chemin)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXECUTION
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    dico_v1 = [
+        {"type": "XML_procedure", "content": "Serrer la vanne d'isolement principale. Attendre deux minutes. Ouvrir le clapet.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}},
+        {"type": "XML_procedure", "content": "Serrer la vanne d'isolement principale. Attendre deux minutes. Ouvrir le clapet.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-002"}},
+        {"type": "XML_procedure", "content": "Ancienne procédure obsolète à retirer du système.", "extra_information": {"DM_title": "Hydraulique > Purge", "DM_code": "DM-HYD-099"}}
+    ]
+    dico_v2 = [
+        {"type": "XML_procedure", "content": "Serrer la vanne d'isolement à 45 Nm. Attendre deux minutes. Vérifier la pression et ouvrir le clapet.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}},
+        {"type": "XML_procedure", "content": "Serrer la vanne d'isolement principale. Attendre deux minutes. Ouvrir le clapet lentement.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-002"}},
+        {"type": "XML_procedure", "content": "Procédure complète de sécurité électrique cabine.", "extra_information": {"DM_title": "Electricite > Cabine", "DM_code": "DM-ELEC-003"}}
+    ]
+
+    racine_arbre = ChapitreNode()
+    for doc in dico_v1: ajouter_au_trie(racine_arbre, doc, "v1")
+    for doc in dico_v2: ajouter_au_trie(racine_arbre, doc, "v2")
+
+    analyser_et_tagger_arbre(racine_arbre)
+    
+    print("==================================================================")
+    print(" 1. ARBORESCENCE & MUTATIONS PRÉCISES (QUOI EN QUOI) ")
+    print("==================================================================")
+    afficher_analyse_complete(racine_arbre)
+    
+    print("\n==================================================================")
+    print(" 2. ANALYSE DES LIENS ET CORRÉLATIONS INTER-MODULES ")
+    print("==================================================================")
+    liens = analyser_les_liens_systemiques(racine_arbre)
+    if liens:
+        for mot, codes in liens.items():
+            print(f"🔗 Lien détecté via la notion de '{mot.upper()}' ➜ Impacte conjointement : {', '.join(codes)}")
+    else:
+        print("Aucun lien sémantique transverse détecté.")
+
+
+
+import re
+import difflib
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. CRÉATION DE L'ARBRE (STRUCTURE PAR SOUS-CHAPITRE)
