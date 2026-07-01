@@ -1,3 +1,174 @@
+import re
+import difflib
+from collections import defaultdict
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. STRUCTURE DE L'ARBRE ET INSERTION
+# ══════════════════════════════════════════════════════════════════════════════
+class ChapitreNode:
+    def __init__(self, name="Racine"):
+        self.name = name
+        self.children = {}  
+        self.modules = {}   # { "DM-XXX": {"v1": text, "v2": text, "transformations": []} }
+
+def ajouter_au_trie(racine, doc, version):
+    if doc.get("type") != "XML_procedure": return
+    info = doc.get("extra_information", {})
+    titre, code, contenu = info.get("DM_title", ""), info.get("DM_code", ""), doc.get("content", "")
+    
+    elements = [e.strip() for e in titre.split(">") if e.strip()]
+    courant = racine
+    for elem in elements:
+        if elem not in courant.children:
+            courant.children[elem] = ChapitreNode(elem)
+        courant = courant.children[elem]
+    
+    if code not in courant.modules:
+        courant.modules[code] = {"v1": None, "v2": None, "status": None, "transformations": []}
+    courant.modules[code][version] = contenu
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. CALCUL DES MUTATIONS UNIQUES PAR MODULE
+# ══════════════════════════════════════════════════════════════════════════════
+def calculer_mutations_uniques(t1, t2):
+    tok1 = re.findall(r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]', t1) if t1 else []
+    tok2 = re.findall(r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]', t2) if t2 else []
+    
+    matcher = difflib.SequenceMatcher(None, tok1, tok2, autojunk=False)
+    transformations = []
+    
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        mut = None
+        if tag == 'delete':
+            txt = ' '.join(tok1[i1:i2])
+            mut = f"Retrait de : '{txt}'"
+        elif tag == 'insert':
+            txt = ' '.join(tok2[j1:j2])
+            mut = f"Ajout de : '{txt}'"
+        elif tag == 'replace':
+            txt_av = ' '.join(tok1[i1:i2])
+            txt_ap = ' '.join(tok2[j1:j2])
+            mut = f"'{txt_av}' ➜ '{txt_ap}'"
+            
+        if mut and mut not in transformations:
+            transformations.append(mut)
+            
+    return transformations
+
+def analyser_et_tagger_arbre(noeud):
+    for dm_code, mod in noeud.modules.items():
+        v1, v2 = mod["v1"], mod["v2"]
+        
+        if v2 is not None and v1 is None:
+            mod["status"] = "NOUVEAU"
+            mod["transformations"] = ["Création complète du module."]
+        elif v1 is not None and v2 is None:
+            mod["status"] = "SUPPRIMÉ"
+            mod["transformations"] = ["Suppression complète du module."]
+        else:
+            if v1.strip() == v2.strip():
+                mod["status"] = "IDENTIQUE"
+                mod["transformations"] = []
+            else:
+                mod["status"] = "MODIFIÉ"
+                mod["transformations"] = calculer_mutations_uniques(v1, v2)
+                
+    for enfant in noeud.children.values():
+        analyser_et_tagger_arbre(enfant)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. COLLECTE INTELLIGENTE ET SYSTÈME DE REGROUPEMENT PAR BRANCHE
+# ══════════════════════════════════════════════════════════════════════════════
+def collecter_tous_les_modules_avec_chemin(noeud, chemin_actuel="", liste_globale=None):
+    """Parcourt l'arbre en construisant dynamiquement la chaîne de la sous-branche."""
+    if liste_globale is None: liste_globale = []
+    
+    # Construction du fil d'Ariane (chemin de la sous-branche)
+    nom_chemin = f"{chemin_actuel} > {noeud.name}" if chemin_actuel else noeud.name
+    
+    for dm_code, mod in noeud.modules.items():
+        if mod["status"] != "IDENTIQUE":
+            # On stocke le code du module ET son chemin exact dans l'arbre
+            liste_globale.append((dm_code, nom_chemin, mod))
+            
+    for enfant in noeud.children.values():
+        collecter_tous_les_modules_avec_chemin(enfant, nom_chemin, liste_globale)
+        
+    return liste_globale
+
+def cartographier_mutations_et_branches(racine):
+    """Associe chaque modification unique aux chemins et modules où elle apparaît."""
+    modules_actifs = collecter_tous_les_modules_avec_chemin(racine)
+    registre_global = defaultdict(list)
+    
+    for dm_code, nom_chemin, mod in modules_actifs:
+        for mutation in mod["transformations"]:
+            # On enregistre la localisation complète : (le_chemin, le_code_dm)
+            registre_global[mutation].append((nom_chemin, dm_code))
+            
+    return registre_global
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. RENDU VISUEL ARBORESCENT SANS RÉPÉTITION
+# ══════════════════════════════════════════════════════════════════════════════
+def afficher_index_arborescent(registre):
+    print("==================================================================")
+    print(" 🎯 INDEX GLOBAL DES MODIFICATIONS & ARBRES COUVRANTS FUSIONNÉS  ")
+    print("==================================================================")
+    
+    for mutation, occurrences in registre.items():
+        nb_apparitions = len(occurrences)
+        
+        if nb_apparitions > 1:
+            print(f"🔄 [RÉPÉTÉE {nb_apparitions}x] La modification : {mutation}")
+        else:
+            print(f"📌 [UNIQUE]      La modification : {mutation}")
+            
+        # --- ALGO DE FUSION DES SOUS-BRANCHES ---
+        # On regroupe les codes DM sous une même clé "chemin" pour éviter les doublons de dossiers
+        arbre_couvrant = defaultdict(list)
+        for nom_chemin, dm_code in occurrences:
+            arbre_couvrant[nom_chemin].append(dm_code)
+            
+        # Affichage propre de l'arbre fusionné
+        for chemin, codes in arbre_couvrant.items():
+            print(f"    📂 Sous-Branche : {chemin}")
+            for code in codes:
+                print(f"        🔹 Module : {code}")
+                
+        print("-" * 66)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# JEU DE DONNÉES DE TEST
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    dico_v1 = [
+        {"type": "XML_procedure", "content": "Ouvrir le clapet d'isolement.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}},
+        {"type": "XML_procedure", "content": "Ouvrir le clapet de sécurité.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-002"}},
+        {"type": "XML_procedure", "content": "Ancienne procédure obsolète à retirer du système.", "extra_information": {"DM_title": "Hydraulique > Purge", "DM_code": "DM-HYD-099"}}
+    ]
+    
+    dico_v2 = [
+        # DM-HYD-001 et DM-HYD-002 partagent EXACTEMENT la même modif au même endroit
+        {"type": "XML_procedure", "content": "Ouvrir le clapet d'isolement lentement.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}},
+        {"type": "XML_procedure", "content": "Ouvrir le clapet de sécurité lentement.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-002"}},
+        {"type": "XML_procedure", "content": "Procédure complète de sécurité électrique cabine.", "extra_information": {"DM_title": "Electricite > Cabine", "DM_code": "DM-ELEC-003"}}
+    ]
+
+    racine_arbre = ChapitreNode()
+    for doc in dico_v1: ajouter_au_trie(racine_arbre, doc, "v1")
+    for doc in dico_v2: ajouter_au_trie(racine_arbre, doc, "v2")
+    analyser_et_tagger_arbre(racine_arbre)
+    
+    # Exécution de la cartographie arborescente
+    registre_fustione = cartographier_mutations_et_branches(racine_arbre)
+    
+    # Rendu final en console
+    index_visuel = afficher_index_arborescent(registre_fustione)
+
+
+
+
 
 import re
 import difflib
