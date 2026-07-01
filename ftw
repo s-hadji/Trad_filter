@@ -1,35 +1,43 @@
-
 import re
 import difflib
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. STRUCTURE DE L'ARBRE ET DES BRANCHES
+# 1. CRÉATION DE L'ARBRE (STRUCTURE PAR SOUS-CHAPITRE)
 # ══════════════════════════════════════════════════════════════════════════════
 class ChapitreNode:
     def __init__(self, name="Racine"):
         self.name = name
         self.children = {}  # Sous-chapitres : { "Nom": ChapitreNode }
-        self.modules = {}   # Correspondance par DM Code : { "DM-XXX": {"v1": doc, "v2": doc, ...} }
+        self.modules = {}   # Modules par DM Code : { "DM-XXX": {"v1": text, "v2": text} }
 
-def ajouter_au_trie(racine, chemin_str, dm_code, doc, version):
-    """Découpe le chemin et insère le document dans la bonne branche."""
-    elements = [e.strip() for e in chemin_str.split(">") if e.strip()]
+def ajouter_au_trie(racine, doc, version):
+    """Filtre sur XML_procedure et insère le contenu dans l'arbre selon DM_title."""
+    if doc.get("type") != "XML_procedure":
+        return
+        
+    info = doc.get("extra_information", {})
+    titre = info.get("DM_title", "")
+    code = info.get("DM_code", "")
+    contenu = doc.get("content", "")
+    
+    # Découpage du chemin (ex: "Hydraulique > Vannes")
+    elements = [e.strip() for e in titre.split(">") if e.strip()]
     courant = racine
     for elem in elements:
         if elem not in courant.children:
             courant.children[elem] = ChapitreNode(elem)
         courant = courant.children[elem]
     
-    if dm_code not in courant.modules:
-        courant.modules[dm_code] = {"v1": None, "v2": None, "status": None, "avant": "", "apres": ""}
-    courant.modules[dm_code][version] = doc
+    # Correspondance V1 / V2 au sein du même nœud
+    if code not in courant.modules:
+        courant.modules[code] = {"v1": None, "v2": None, "status": None, "avant": "", "apres": ""}
+    courant.modules[code][version] = contenu
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2. MOTEUR DE TAGGING & AVANT/APRÈS LINEAIRE
+# 2. TAGGING & AVANT / APRÈS (ORDRE CONSERVÉ + ELLIPSE IDENTIQUE)
 # ══════════════════════════════════════════════════════════════════════════════
-def calculer_diff_dm(t1, t2):
-    """Génère un flux ordonné avec balises et marqueur [...identique...]."""
-    # Découpage propre en mots et ponctuation
+def calculer_avant_apres_global(t1, t2):
+    """Génère la trajectoire linéaire ordonnée avec les balises demandées."""
     tok1 = re.findall(r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]', t1) if t1 else []
     tok2 = re.findall(r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]', t2) if t2 else []
     
@@ -38,7 +46,7 @@ def calculer_diff_dm(t1, t2):
     
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == 'equal':
-            # Évite les doublons de marqueurs identiques à la suite
+            # Injection du tag d'égalité sans doublon
             if not avant_pieces or avant_pieces[-1] != "[...identique...]":
                 avant_pieces.append("[...identique...]")
             if not apres_pieces or apres_pieces[-1] != "[...identique...]":
@@ -54,84 +62,110 @@ def calculer_diff_dm(t1, t2):
     return " ".join(avant_pieces), " ".join(apres_pieces)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. DÉTECTION DES STATUTS DES BRANCHES & FICHIERS
+# 3. DÉTECTION DES STATUTS (NOUVEAU, SUPPRIMÉ, IDENTIQUE, MODIFIÉ)
 # ══════════════════════════════════════════════════════════════════════════════
 def analyser_et_tagger_arbre(noeud):
-    """Parcourt l'arbre, détecte les changements et applique le taging."""
+    """Parcourt l'arbre pour qualifier chaque module et générer son diff."""
     for dm_code, mod in noeud.modules.items():
         v1, v2 = mod["v1"], mod["v2"]
         
         # Détection : Nouvelle branche / Nouveau Module
-        if v2 and not v1:
+        if v2 is not None and v1 is None:
             mod["status"] = "NOUVEAU"
             mod["avant"] = "[Néant - Nouveau Module]"
-            mod["apres"] = f"[AJOUTÉ: {v2['content']}]"
+            mod["apres"] = f"[AJOUTÉ: {v2}]"
             
         # Détection : Suppression de branche / Module supprimé
-        elif v1 and not v2:
+        elif v1 is not None and v2 is None:
             mod["status"] = "SUPPRIMÉ"
-            mod["avant"] = f"[SUPPRIMÉ: {v1['content']}]"
+            mod["avant"] = f"[SUPPRIMÉ: {v1}]"
             mod["apres"] = "[Néant - Supprimé]"
             
-        # Détection : Contenu présent dans les deux versions
+        # Détection : Branche présente dans les deux versions
         else:
-            if v1["content"].strip() == v2["content"].strip():
+            if v1.strip() == v2.strip():
                 mod["status"] = "IDENTIQUE"
                 mod["avant"] = "[...identique...]"
                 mod["apres"] = "[...identique...]"
             else:
                 mod["status"] = "MODIFIÉ"
-                mod["avant"], mod["apres"] = calculer_diff_dm(v1["content"], v2["content"])
+                mod["avant"], mod["apres"] = calculer_avant_apres_global(v1, v2)
                 
-    # Analyse récursive des sous-chapitres
+    # Récursion sur les sous-chapitres enfants
     for enfant in noeud.children.values():
         analyser_et_tagger_arbre(enfant)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4. AFFICHAGE DES RÉSULTATS PAR BRANCHE
+# 4. AFFICHAGE FINAL PAR BRANCHE ET DM CODE
 # ══════════════════════════════════════════════════════════════════════════════
-def afficher_arbre(noeud, niveau=0):
-    indent = "  " * niveau
-    if noeud.name != "Racine":
-        print(f"\n{indent}📁 Sous-Chapitre : {noeud.name}")
-        indent += "  "
-        
-    for dm_code, mod in noeud.modules.items():
-        print(f"{indent}🔹 Module : {dm_code} ➜ Statut : [{mod['status']}]")
-        print(f"{indent}  [AVANT] : {mod['avant']}")
-        print(f"{indent}  [APRÈS] : {mod['apres']}")
-        
+def afficher_analyse(noeud, chemin_actuel=""):
+    nom_chemin = f"{chemin_actuel} > {noeud.name}" if chemin_actuel else noeud.name
+    
+    # On n'affiche que s'il y a des modules dans ce sous-chapitre
+    if noeud.modules:
+        print(f"\n📂 Sous-Chapitre : {nom_chemin}")
+        for dm_code, mod in noeud.modules.items():
+            print(f"  🔹 Module : {dm_code} ➜ [{mod['status']}]")
+            print(f"    [AVANT] : {mod['avant']}")
+            print(f"    [APRÈS] : {mod['apres']}")
+            
     for enfant in noeud.children.values():
-        afficher_arbre(enfant, niveau + 1)
+        afficher_analyse(enfant, nom_chemin)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# JEU DE TEST RAPIDE
+# EXÉCUTION SUR TES DONNÉES DE BASE
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    # Données brutes simulées (V1 et V2)
-    v1_data = [
-        {"path": "Hydraulique > Vannes", "code": "DM-HYD-001", "content": "Ouvrir la vanne principale. Attendre 2 min."},
-        {"path": "Hydraulique > Vannes", "code": "DM-HYD-002", "content": "Procédure inchangée qui ne bouge pas."},
-        {"path": "Hydraulique > Purge", "code": "DM-HYD-099", "content": "Ancienne ligne à supprimer."}
+    dico_v1 = [
+        {
+            "type": "XML_procedure", 
+            "content": "Serrer la vanne d'isolement principale. Attendre deux minutes. Ouvrir le clapet.",
+            "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}
+        },
+        {
+            "type": "XML_procedure", 
+            "content": "Serrer la vanne d'isolement principale. Attendre deux minutes. Ouvrir le clapet.",
+            "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-002"}
+        },
+        {
+            "type": "XML_procedure", 
+            "content": "Ancienne procédure obsolète à retirer du système.",
+            "extra_information": {"DM_title": "Hydraulique > Purge", "DM_code": "DM-HYD-099"}
+        }
     ]
-    v2_data = [
-        {"path": "Hydraulique > Vannes", "code": "DM-HYD-001", "content": "Ouvrir la vanne principale lentement. Attendre 2 min."},
-        {"path": "Hydraulique > Vannes", "code": "DM-HYD-002", "content": "Procédure inchangée qui ne bouge pas."},
-        {"path": "Electricité > Cabine", "code": "DM-EL-003", "content": "Nouveau protocole de sécurité."}
+
+    dico_v2 = [
+        {
+            "type": "XML_procedure", 
+            "content": "Serrer la vanne d'isolement à 45 Nm. Attendre deux minutes. Vérifier la pression et ouvrir le clapet.",
+            "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}
+        },
+        {
+            "type": "XML_procedure", 
+            "content": "Serrer la vanne d'isolement principale. Attendre deux minutes. Ouvrir le clapet.",
+            "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-002"}
+        },
+        {
+            "type": "XML_procedure", 
+            "content": "Procédure complète de sécurité électrique cabine.",
+            "extra_information": {"DM_title": "Electricite > Basse Tension", "DM_code": "DM-ELEC-003"}
+        }
     ]
 
     racine_arbre = ChapitreNode()
 
-    # Étape 1 & 2 : Création de l'arbre et correspondance
-    for d in v1_data: ajouter_au_trie(racine_arbre, d["path"], d["code"], d, "v1")
-    for d in v2_data: ajouter_au_trie(racine_arbre, d["path"], d["code"], d, "v2")
+    # Étape 1 : Insertion directe depuis tes listes v1 et v2
+    for doc in dico_v1: ajouter_au_trie(racine_arbre, doc, "v1")
+    for doc in dico_v2: ajouter_au_trie(racine_arbre, doc, "v2")
 
-    # Étape 3 : Détection et Tagging automatique
+    # Étape 2 & 3 : Détection automatique des changements et Tagging
     analyser_et_tagger_arbre(racine_arbre)
 
-    # Étape 4 : Affichage final
-    print("=== RÉSULTAT DE L'ANALYSE DES BRANCHES ===")
-    afficher_arbre(racine_arbre)
+    # Étape 4 : Affichage structuré
+    print("==================================================")
+    print("       RÉSULTAT DE L'ANALYSE DES BRANCHES        ")
+    print("==================================================")
+    afficher_analyse(racine_arbre)
 
 
 
