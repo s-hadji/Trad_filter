@@ -1,6 +1,292 @@
 import re
 import difflib
 from collections import defaultdict
+import ftfy
+
+# ==============================================================================
+# 1. STRUCTURE DE L'ARBRE ET RECEPTION DES DONNEES
+# ==============================================================================
+class ChapitreNode:
+    def __init__(self, name="Racine"):
+        self.name = name
+        self.children = {}  
+        self.modules = {}   
+
+def ajouter_au_trie(racine, doc, version):
+    doc_type = doc.get("type")
+    if doc_type not in ["XML_procedure", "XML_description"]: 
+        return
+        
+    info = doc.get("extra_information", {})
+    titre, code = info.get("DM_title", ""), info.get("DM_code", "")
+    
+    contenu_brut = doc.get("content", "")
+    contenu = ftfy.fix_text(contenu_brut) if contenu_brut else ""
+    
+    type_label = "Procedure" if doc_type == "XML_procedure" else "Description"
+    
+    elements = [e.strip() for e in titre.split(">") if e.strip()]
+    courant = racine
+    for elem in elements:
+        if elem not in courant.children:
+            courant.children[elem] = ChapitreNode(elem)
+        courant = courant.children[elem]
+    
+    cle_module = (code, type_label)
+    if cle_module not in courant.modules:
+        courant.modules[cle_module] = {"v1": None, "v2": None, "status": None, "transformations": []}
+        
+    courant.modules[cle_module][version] = contenu
+
+# ==============================================================================
+# 2. FILTRAGE ET ANALYSE DES MUTATIONS
+# ==============================================================================
+def filtre_modif_typo(avant, apres):
+    norm_av = re.sub(r'[^a-zA-Z0-9À-ÿ]', '', avant.lower())
+    norm_ap = re.sub(r'[^a-zA-Z0-9À-ÿ]', '', apres.lower())
+    
+    if norm_av == norm_ap:
+        return True
+    if norm_av.rstrip('s') == norm_ap.rstrip('s'):
+        return True
+    return False
+
+def calculer_mutations_uniques(t1, t2):
+    tok1 = re.findall(r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]', t1) if t1 else []
+    tok2 = re.findall(r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]', t2) if t2 else []
+    
+    matcher = difflib.SequenceMatcher(None, tok1, tok2, autojunk=False)
+    transformations = []
+    
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'equal':
+            continue
+            
+        txt_av = ' '.join(tok1[i1:i2]) if tag in ['delete', 'replace'] else ""
+        txt_ap = ' '.join(tok2[j1:j2]) if tag in ['insert', 'replace'] else ""
+        
+        is_typo = filtre_modif_typo(txt_av, txt_ap)
+        categorie = "TYPO" if is_typo else "REAL"
+        
+        if tag == 'delete':
+            mut = f"Retrait de : '{txt_av}'"
+        elif tag == 'insert':
+            mut = f"Ajout de : '{txt_ap}'"
+        elif tag == 'replace':
+            mut = f"'{txt_av}' -> '{txt_ap}'"
+            
+        item = (mut, categorie)
+        if item not in transformations:
+            transformations.append(item)
+            
+    return transformations
+
+def analyser_et_tagger_arbre(noeud):
+    for cle_module, mod in noeud.modules.items():
+        v1, v2 = mod["v1"], mod["v2"]
+        
+        if v2 is not None and v1 is None:
+            mod["status"] = "NOUVEAU"
+        elif v1 is not None and v2 is None:
+            mod["status"] = "SUPPRIME"
+        else:
+            if v1.strip() == v2.strip():
+                mod["status"] = "IDENTIQUE"
+            else:
+                mod["status"] = "MODIFIE"
+                mod["transformations"] = calculer_mutations_uniques(v1, v2)
+                
+    for enfant in noeud.children.values():
+        analyser_et_tagger_arbre(enfant)
+
+# ==============================================================================
+# 3. EXTRACTION, DÉDUPLICATION GLOBALE ET CARTOGRAPHIE
+# ==============================================================================
+def collecter_et_dedupler_donnees(noeud, chemin_actuel="", donnees_branches=None, registre_mutations_global=None):
+    if donnees_branches is None:
+        donnees_branches = defaultdict(lambda: {"ajouts": [], "suppressions": [], "typos": 0})
+    if registre_mutations_global is None:
+        # Structure : { mutation_text: {"id": str, "occurrences": [{"branche": str, "bloc": str}]} }
+        registre_mutations_global = {}
+        
+    nom_chemin = f"{chemin_actuel} > {noeud.name}" if chemin_actuel else noeud.name
+    
+    for (dm_code, type_label), mod in noeud.modules.items():
+        identifiant_bloc = f"{dm_code} ({type_label})"
+        
+        if mod["status"] == "NOUVEAU":
+            donnees_branches[nom_chemin]["ajouts"].append(identifiant_bloc)
+        elif mod["status"] == "SUPPRIME":
+            donnees_branches[nom_chemin]["suppressions"].append(identifiant_bloc)
+        elif mod["status"] == "MODIFIE":
+            for mut, categorie in mod["transformations"]:
+                if categorie == "TYPO":
+                    donnees_branches[nom_chemin]["typos"] += 1
+                else:
+                    # Traitement de la modification réelle : Enregistrement et isolation globale
+                    if mut not in registre_mutations_global:
+                        num_id = len(registre_mutations_global) + 1
+                        registre_mutations_global[mut] = {
+                            "id": f"MOD-{num_id:03d}",
+                            "occurrences": []
+                        }
+                    registre_mutations_global[mut]["occurrences"].append({
+                        "branche": nom_chemin,
+                        "bloc": identifiant_bloc
+                    })
+                    
+    for enfant in noeud.children.values():
+        collecter_et_dedupler_donnees(enfant, nom_chemin, donnees_branches, registre_mutations_global)
+        
+    return donnees_branches, registre_mutations_global
+
+# ==============================================================================
+# 4. PREPARATION ET COMPACTAGE DU PACK LLM (BATCHING)
+# ==============================================================================
+def estimer_tokens(texte):
+    return max(1, len(texte) // 4)
+
+def generer_paquets_llm(donnees_branches, registre_mutations_global, max_tokens_per_batch=1500):
+    batchs = []
+    
+    consigne_systeme = (
+        "ROLE: Analyser la liste des modifications dedupliquees ci-dessous.\n"
+        "Pour chaque identifiant (MOD-XXX), rediger un commentaire synthetique expliquant "
+        "l'impact fonctionnel ou la portee de ce changement.\n"
+        "FORMAT DE REPONSE ATTENDU:\n"
+        "MOD-XXX: [Votre commentaire ici]\n"
+        "==================================================================\n"
+    )
+    
+    # 1. On prepare le catalogue des modifications uniques (Chaque modif apparait une seule fois)
+    corps_catalogue = "CATALOGUE DES MODIFICATIONS UNIQUE A ANALYSER :\n"
+    for mut_text, info in registre_mutations_global.items():
+        corps_catalogue += f"  - ID: {info['id']} | Modification: {mut_text}\n"
+        
+    corps_catalogue += "==================================================================\n"
+    
+    # 2. On injecte l'etat condensé des structures pour donner du contexte au LLM si besoin
+    corps_contextuel_structures = "CONTEXTE COMPLEMENTAIRE DES STRUCTURES (HORS ANALYSE ELEMENTAIRE) :\n"
+    for chemin, contenu in donnees_branches.items():
+        if contenu["ajouts"] or contenu["suppressions"] or contenu["typos"] > 0:
+            corps_contextuel_structures += f"Sous-Branche : {chemin}\n"
+            if contenu["ajouts"]:
+                corps_contextuel_structures += f"  Ajout de blocs complets : {', '.join(contenu['ajouts'])}\n"
+            if contenu["suppressions"]:
+                corps_contextuel_structures += f"  Suppression de blocs complets : {', '.join(contenu['suppressions'])}\n"
+            if contenu["typos"] > 0:
+                corps_contextuel_structures += f"  Modifications de type typo : {contenu['typos']} detectees.\n"
+                
+    payload_total = consigne_systeme + corps_catalogue + corps_contextuel_structures
+    
+    # Decoupage en batch elementaire si la structure globale depasse la limite
+    # (Ici adapte pour la re-segmentation de lignes de modifications uniques si volumineux)
+    if estimer_tokens(payload_total) <= max_tokens_per_batch:
+        batchs.append(payload_total)
+    else:
+        # Si le catalogue est gigantesque, on segmente uniquement le catalogue des IDs
+        lignes_catalogue = corps_catalogue.split('\n')
+        tampon_courant = []
+        for ligne in lignes_catalogue:
+            tampon_courant.append(ligne)
+            if estimer_tokens("\n".join(tampon_courant)) > max_tokens_per_batch - 300:
+                batchs.append(consigne_systeme + "\n".join(tampon_courant))
+                tampon_courant = []
+        if tampon_courant:
+            batchs.append(consigne_systeme + "\n".join(tampon_courant))
+            
+    return batchs
+
+# ==============================================================================
+# 5. REINJECTION ET SUPERPOSITION APRES RETOUR LLM
+# ==============================================================================
+def superposer_et_reinjecter_analyses(commentaires_bruts_llm, registre_mutations_global):
+    """
+    Prend le dictionnaire de reponses fournies par le LLM pour chaque ID unique,
+    et reconstruit la cartographie complete en superposant le commentaire sur toutes
+    les sous-branches et modules concernes.
+    """
+    # Inversion de l'index pour travailler par Branche / Module de destination
+    # Structure : { sous_branche: { bloc_id: [ (mutation, commentaire_llm), ... ] } }
+    vue_applicative = defaultdict(lambda: defaultdict(list))
+    
+    for mut_text, info in registre_mutations_global.items():
+        mod_id = info["id"]
+        # Recuperation du commentaire du LLM pour cet ID, ou valeur par defaut si manquant
+        commentaire = commentaires_bruts_llm.get(mod_id, "Aucune analyse disponible pour ce bloc.")
+        
+        for occ in info["occurrences"]:
+            vue_applicative[occ["branche"]][occ["bloc"]].append({
+                "mutation": mut_text,
+                "commentaire_llm": commentaire
+            })
+            
+    # Affichage final superposé et pret pour l'utilisateur ou l'IHM
+    print("==================================================================")
+    print("      RAPPORT DE SUPERPOSITION ET DE REINJECTION APRES LLM        ")
+    print("==================================================================")
+    for sous_branche, blocs in vue_applicative.items():
+        print(f"Sous-Branche : {sous_branche}")
+        for bloc_id, modifs in blocs.items():
+            print(f"  Composant : {bloc_id}")
+            for item in modifs:
+                print(f"    - Modification brute : {item['mutation']}")
+                print(f"      Analyse detaillee LLM  : {item['commentaire_llm']}")
+        print("-" * 66)
+
+# ==============================================================================
+# 6. SIMULATION DE BOUT EN BOUT
+# ==============================================================================
+if __name__ == "__main__":
+    # Donnes de test : On injecte la modification identique "Ajout de : 'lentement'"
+    # a travers plusieurs modules situes dans des chapitres distincts.
+    dico_v1 = [
+        {"type": "XML_procedure", "content": "Ouvrir la vanne principale.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}},
+        {"type": "XML_description", "content": "Flux hydraulique continu.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-002"}},
+        {"type": "XML_procedure", "content": "Activer le disjoncteur.", "extra_information": {"DM_title": "Electricite > Securite", "DM_code": "DM-ELEC-88"}}
+    ]
+    
+    dico_v2 = [
+        # La meme modification s'applique sur les 3 modules ci-dessous
+        {"type": "XML_procedure", "content": "Ouvrir la vanne principale lentement.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}},
+        {"type": "XML_description", "content": "Flux hydraulique continu lentement.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-002"}},
+        {"type": "XML_procedure", "content": "Activer le disjoncteur lentement.", "extra_information": {"DM_title": "Electricite > Securite", "DM_code": "DM-ELEC-88"}}
+    ]
+
+    # Construction de l'arbre et traitement initial
+    racine_arbre = ChapitreNode()
+    for doc in dico_v1: ajouter_au_trie(racine_arbre, doc, "v1")
+    for doc in dico_v2: ajouter_au_trie(racine_arbre, doc, "v2")
+    analyser_et_tagger_arbre(racine_arbre)
+    
+    # Aggregation et deduplication absolue
+    donnees_branches, registre_global = collecter_et_dedupler_donnees(racine_arbre)
+    
+    # Generation du paquet unique a destination du LLM
+    paquets_prets = generer_paquets_llm(donnees_branches, registre_global)
+    
+    print(f"Nombre de paquets packages pour le LLM : {len(paquets_prets)}\n")
+    print("--- APERCU DU CONTENU UNIQUE ENVOYE AU LLM ---")
+    print(paquets_prets[0])
+    
+    # --------------------------------------------------------------------------
+    # SIMULATION DU RETOUR DE L'API LLM
+    # --------------------------------------------------------------------------
+    # Le LLM ne repond qu'une seule fois pour MOD-001, car il n'a vu l'instruction qu'une seule fois
+    reponse_simulee_llm = {
+        "MOD-001": "Introduction d'une contrainte temporelle de securite pour eviter les coups de bélier ou surtensions."
+    }
+    
+    # 3. Superposition automatique et re-dispatching global
+    superposer_et_reinjecter_analyses(reponse_simulee_llm, registre_global)
+
+
+
+
+
+import re
+import difflib
+from collections import defaultdict
 
 # ==============================================================================
 # 1. STRUCTURE DE L'ARBRE
