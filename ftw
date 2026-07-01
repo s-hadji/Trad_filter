@@ -1,3 +1,37 @@
+def afficher_arbre_textuel(noeud, niveau=0):
+    """Affiche l'arbre des chapitres et leurs modules avec une indentation visuelle."""
+    indent = "  " * niveau
+    # Affichage du chapitre courant
+    print(f"{indent}📁 {noeud.name}")
+    
+    # Affichage des modules contenus dans ce chapitre
+    for (code, type_label), mod in noeud.modules.items():
+        status = mod.get('status') or 'NON ANALYSÉ'
+        print(f"{indent}  📄 Module: {code} [{status}]")
+        
+    # Appel récursif pour les sous-chapitres (enfants)
+    for enfant in noeud.children.values():
+        afficher_arbre_textuel(enfant, niveau + 1)
+if __name__ == "__main__":
+    # ... (ton code de préparation des dicos v1 et v2) ...
+
+    racine_arbre = ChapitreNode()
+    for doc in dico_v1_fusionne: ajouter_au_trie(racine_arbre, doc, "v1")
+    for doc in dico_v2_fusionne: ajouter_au_trie(racine_arbre, doc, "v2")
+    
+    analyser_et_tagger_arbre(racine_arbre)
+    
+    # ==========================================
+    # APPPEL ICI POUR VOIR L'ARBRE DIRECTEMENT
+    # ==========================================
+    print("\n--- STRUCTURE DE L'ARBRE ---")
+    afficher_arbre_textuel(racine_arbre)
+    print("----------------------------\n")
+
+    # ... (le reste de ton code pour les batchs LLM) ...
+
+
+
 import re
 import difflib
 from collections import defaultdict
