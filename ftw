@@ -3,6 +3,259 @@ import difflib
 from collections import defaultdict
 
 # ==============================================================================
+# 1. STRUCTURE DE L'ARBRE
+# ==============================================================================
+class ChapitreNode:
+    def __init__(self, name="Racine"):
+        self.name = name
+        self.children = {}  
+        # Structure : { (dm_code, type_label): {"v1": text, "v2": text, "status": str, "transformations": []} }
+        self.modules = {}   
+
+def ajouter_au_trie(racine, doc, version):
+    doc_type = doc.get("type")
+    if doc_type not in ["XML_procedure", "XML_description"]: 
+        return
+        
+    info = doc.get("extra_information", {})
+    titre, code, contenu = info.get("DM_title", ""), info.get("DM_code", ""), doc.get("content", "")
+    
+    type_label = "Procedure" if doc_type == "XML_procedure" else "Description"
+    
+    elements = [e.strip() for e in titre.split(">") if e.strip()]
+    courant = racine
+    for elem in elements:
+        if elem not in courant.children:
+            courant.children[elem] = ChapitreNode(elem)
+        courant = courant.children[elem]
+    
+    cle_module = (code, type_label)
+    if cle_module not in courant.modules:
+        courant.modules[cle_module] = {"v1": None, "v2": None, "status": None, "transformations": []}
+        
+    courant.modules[cle_module][version] = contenu
+
+# ==============================================================================
+# 2. FILTRAGE INTELLIGENT DES TYPOS ET ESPACES
+# ==============================================================================
+def filtre_modif_typo(avant, apres):
+    """
+    Determine si une modification releve uniquement d'un probleme de casse,
+    d'espacement ou de la presence/absence d'un 's' (pluriel).
+    """
+    # Normalisation de base : retrait des espaces et passage en minuscules
+    norm_av = re.sub(r'\s+', '', avant.lower())
+    norm_ap = re.sub(r'\s+', '', apres.lower())
+    
+    if norm_av == norm_ap:
+        return True
+        
+    # Verification de la variation sur un 's' final (singulier/pluriel)
+    if norm_av.rstrip('s') == norm_ap.rstrip('s'):
+        return True
+        
+    return False
+
+# ==============================================================================
+# 3. CALCUL DES MUTATIONS AVEC CLASSIFICATION
+# ==============================================================================
+def calculer_mutations_uniques(t1, t2):
+    tok1 = re.findall(r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]', t1) if t1 else []
+    tok2 = re.findall(r'[a-zA-Z0-9À-ÿ]+|[^a-zA-Z0-9À-ÿ\s]', t2) if t2 else []
+    
+    matcher = difflib.SequenceMatcher(None, tok1, tok2, autojunk=False)
+    transformations = []
+    
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'equal':
+            continue
+            
+        txt_av = ' '.join(tok1[i1:i2]) if tag in ['delete', 'replace'] else ""
+        txt_ap = ' '.join(tok2[j1:j2]) if tag in ['insert', 'replace'] else ""
+        
+        # Identification du type de modification
+        is_typo = filtre_modif_typo(txt_av, txt_ap)
+        categorie = "TYPO" if is_typo else "REAL"
+        
+        if tag == 'delete':
+            mut = f"Retrait de : '{txt_av}'"
+        elif tag == 'insert':
+            mut = f"Ajout de : '{txt_ap}'"
+        elif tag == 'replace':
+            mut = f"'{txt_av}' -> '{txt_ap}'"
+            
+        item = (mut, categorie)
+        if item not in transformations:
+            transformations.append(item)
+            
+    return transformations
+
+def analyser_et_tagger_arbre(noeud):
+    for cle_module, mod in noeud.modules.items():
+        v1, v2 = mod["v1"], mod["v2"]
+        
+        if v2 is not None and v1 is None:
+            mod["status"] = "NOUVEAU"
+        elif v1 is not None and v2 is None:
+            mod["status"] = "SUPPRIME"
+        else:
+            if v1.strip() == v2.strip():
+                mod["status"] = "IDENTIQUE"
+            else:
+                mod["status"] = "MODIFIE"
+                mod["transformations"] = calculer_mutations_uniques(v1, v2)
+                
+    for enfant in noeud.children.values():
+        analyser_et_tagger_arbre(enfant)
+
+# ==============================================================================
+# 4. COMPTAGE DE TOKENS ET PREPARATION DES BATCHS POUR LLM
+# ==============================================================================
+def estimer_tokens(texte):
+    """
+    Heuristique standard d'estimation de tokens (1 token pour environ 4 caracteres).
+    Peut etre remplacee par tiktoken.get_encoding().encode() si disponible.
+    """
+    return max(1, len(texte) // 4)
+
+def collecter_donnees_condensees(noeud, chemin_actuel="", donnees_par_branche=None):
+    if donnees_par_branche is None:
+        donnees_par_branche = defaultdict(lambda: {"ajouts": [], "suppressions": [], "modifications": [], "typos": []})
+        
+    nom_chemin = f"{chemin_actuel} > {noeud.name}" if chemin_actuel else noeud.name
+    
+    for (dm_code, type_label), mod in noeud.modules.items():
+        identifiant_bloc = f"{dm_code} ({type_label})"
+        
+        if mod["status"] == "NOUVEAU":
+            donnees_par_branche[nom_chemin]["ajouts"].append(identifiant_bloc)
+        elif mod["status"] == "SUPPRIME":
+            donnees_par_branche[nom_chemin]["suppressions"].append(identifiant_bloc)
+        elif mod["status"] == "MODIFIE":
+            for mut, categorie in mod["transformations"]:
+                if categorie == "TYPO":
+                    donnees_par_branche[nom_chemin]["typos"].append(f"{identifiant_bloc}: {mut}")
+                else:
+                    donnees_par_branche[nom_chemin]["modifications"].append({
+                        "bloc": identifiant_bloc,
+                        "mutation": mut
+                    })
+                    
+    for enfant in noeud.children.values():
+        collecter_donnees_condensees(enfant, nom_chemin, donnees_par_branche)
+        
+    return donnees_par_branche
+
+def generer_batchs_llm(donnees_par_branche, max_tokens_per_batch=1000):
+    """
+    Structure les donnees de maniere ultra-condensee et les decoupe en batchs
+    en fonction de la limite stricte de tokens definie.
+    """
+    batchs = []
+    contenu_courant = []
+    tokens_courants = 0
+    
+    # Consigne de role injectee au debut de chaque lot pour guider le LLM
+    consigne_systeme = (
+        "ROLE: Analyser les modifications textuelles fournies. Identifier et lister "
+        "si une modification se repete a l'identique d'un module a l'autre ou d'un "
+        "chapitre/sous-branche au suivant. Produire un rapport de correlation.\n"
+        "==================================================================\n"
+    )
+    
+    for chemin, contenu in donnees_par_branche.items():
+        bloc_texte_branche = f"Sous-Branche : {chemin}\n"
+        
+        # Condensation des ajouts et suppressions de blocs complets (en une seule phrase)
+        if contenu["ajouts"]:
+            bloc_texte_branche += f"  Ajout des blocs complets : {', '.join(contenu['ajouts'])}\n"
+        if contenu["suppressions"]:
+            bloc_texte_branche += f"  Suppression des blocs complets : {', '.join(contenu['suppressions'])}\n"
+            
+        # Condensation des fautes de frappe de type typo
+        if contenu["typos"]:
+            bloc_texte_branche += f"  Modifications mineures (typos/espaces) : {len(contenu['typos'])} detectees.\n"
+            
+        # Traitement detaille des veritables modifications structurales/semantiques
+        if contenu["modifications"]:
+            bloc_texte_branche += "  Modifications significatives a analyser :\n"
+            for modif in contenu["modifications"]:
+                bloc_texte_branche += f"    - Bloc : {modif['bloc']} | Modification : {modif['mutation']}\n"
+                
+        bloc_texte_branche += "--------------------------------------------------\n"
+        
+        tokens_bloc = estimer_tokens(bloc_texte_branche)
+        
+        # Si le bloc unitaire depasse la limite a lui seul, on cree un lot dedie
+        if tokens_bloc + estimer_tokens(consigne_systeme) > max_tokens_per_batch:
+            batchs.append(consigne_systeme + bloc_texte_branche)
+            continue
+            
+        # Partitionnement si la taille limite du batch courant est atteinte
+        if tokens_courants + tokens_bloc > max_tokens_per_batch:
+            payload_final = consigne_systeme + "".join(contenu_courant)
+            batchs.append(payload_final)
+            contenu_courant = [bloc_texte_branche]
+            tokens_courants = tokens_bloc
+        else:
+            contenu_courant.append(bloc_texte_branche)
+            tokens_courants += tokens_bloc
+            
+    if contenu_courant:
+        payload_final = consigne_systeme + "".join(contenu_courant)
+        batchs.append(payload_final)
+        
+    return batchs
+
+# ==============================================================================
+# 5. EXECUTION ET SIMULATION DE CONTEXTE ENTRANT
+# ==============================================================================
+if __name__ == "__main__":
+    dico_v1 = [
+        {"type": "XML_procedure", "content": "Ouvrir le clapet.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}},
+        {"type": "XML_description", "content": "Description initiale.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}},
+        {"type": "XML_procedure", "content": "Ancien bloc a supprimer.", "extra_information": {"DM_title": "Hydraulique > Purge", "DM_code": "DM-HYD-099"}}
+    ]
+    
+    dico_v2 = [
+        # DM-HYD-001 (Procedure) : Vrai changement semantique ("clapet" -> "clapet lentement")
+        {"type": "XML_procedure", "content": "Ouvrir le clapet lentement.", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}},
+        # DM-HYD-001 (Description) : Simple modification de type typo (changement de casse + espace)
+        {"type": "XML_description", "content": "description initiale  ", "extra_information": {"DM_title": "Hydraulique > Vannes", "DM_code": "DM-HYD-001"}},
+        # DM-ELEC-102 : Nouveau bloc complet (doit etre condense)
+        {"type": "XML_procedure", "content": "Nouveau contenu complet.", "extra_information": {"DM_title": "Electricite > Cabine", "DM_code": "DM-ELEC-102"}}
+    ]
+
+    racine_arbre = ChapitreNode()
+    for doc in dico_v1: ajouter_au_trie(racine_arbre, doc, "v1")
+    for doc in dico_v2: ajouter_au_trie(racine_arbre, doc, "v2")
+    
+    analyser_et_tagger_arbre(racine_arbre)
+    
+    # Extraction et structuration des donnees condensees
+    donnees_condensees = collecter_donnees_condensees(racine_arbre)
+    
+    # Generation des paquets (Batchs) prets pour l'envoi au LLM (Limite arbitraire a 200 tokens pour l'exemple)
+    liste_des_batchs = generer_batchs_llm(donnees_condensees, max_tokens_per_batch=200)
+    
+    # Affichage des batchs generes
+    print(f"Nombre total de batchs prets a l'envoi : {len(liste_des_batchs)}\n")
+    for idx, batch in enumerate(liste_des_batchs, 1):
+        print(f"=== BATCH ENVOYE AU LLM NUMERO {idx} (Taille estimee : {estimer_tokens(batch)} tokens) ===")
+        print(batch)
+
+
+
+
+
+
+
+
+import re
+import difflib
+from collections import defaultdict
+
+# ==============================================================================
 # 1. STRUCTURE DE L'ARBRE ET INSERTION
 # ==============================================================================
 class ChapitreNode:
