@@ -1,3 +1,129 @@
+
+import difflib
+from collections import defaultdict
+import ftfy
+
+# ==============================================================================
+# 1. NETTOYAGE ET FILTRAGE INTERNATIONAUX
+# ==============================================================================
+def drop_identique(avant, apres, liste_symboles=None):
+    """ Renvoie True si avant et après sont identiques (hors casse, espaces, symboles) """
+    if liste_symboles is None:
+        liste_symboles = [',', '.', ';', ':', '!', '?', '(', ')', '[', ']', '{', '}', '-', '_', '"', "'", '«', '»', '/', '\\', '*']
+    
+    # Passage en minuscules et retrait de tous les espaces
+    norm_av = "".join(avant.split()).lower()
+    norm_ap = "".join(apres.split()).lower()
+    
+    # Retrait des symboles configurés
+    for sym in liste_symboles:
+        norm_av = norm_av.replace(sym, '')
+        norm_ap = norm_ap.replace(sym, '')
+        
+    return norm_av == norm_ap
+
+# ==============================================================================
+# 2. COMPARATEUR DE LIGNES ET REGROUPEMENT UNIQUE
+# ==============================================================================
+def analyser_modifications(dico_v1, dico_v2):
+    # 1. On mappe les contenus par DM_code pour un accès direct
+    v1_map = {doc["extra_information"]["DM_code"]: ftfy.fix_text(doc.get("content", "")) for doc in dico_v1 if "extra_information" in doc}
+    v2_map = {doc["extra_information"]["DM_code"]: ftfy.fix_text(doc.get("content", "")) for doc in dico_v2 if "extra_information" in doc}
+    
+    # Dictionnaire de regroupement : (Type_Modif, Texte_Avant, Texte_Après) -> Liste des DM_codes
+    modifications_groupees = defaultdict(set)
+    
+    # Tous les codes uniques vus en V1 ou V2
+    tous_les_codes = set(v1_map.keys()).union(v2_map.keys())
+    
+    for code in tous_les_codes:
+        txt1 = v1_map.get(code, "")
+        txt2 = v2_map.get(code, "")
+        
+        # Si le fichier est inchangé globalement, on passe
+        if txt1 == txt2:
+            continue
+            
+        lines1 = txt1.splitlines()
+        lines2 = txt2.splitlines()
+        
+        # Comparaison par ligne
+        matcher = difflib.SequenceMatcher(None, lines1, lines2, autojunk=False)
+        
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == 'equal':
+                continue  # On ignore les lignes qui ne changent pas
+                
+            # Extraction brute des lignes modifiées
+            bloc_avant = "\n".join(lines1[i1:i2])
+            bloc_après = "\n".join(lines2[j1:j2])
+            
+            # Filtrage via ta fonction personnalisée
+            if drop_identique(bloc_avant, bloc_après):
+                continue
+                
+            # On stocke la modification unique comme clé, et on y ajoute le module
+            cle_modification = (tag, bloc_avant, bloc_après)
+            modifications_groupees[cle_modification].add(code)
+            
+    return modifications_groupees
+
+# ==============================================================================
+# 3. GÉNÉRATEUR DE RAPPORT POUR LE LLM
+# ==============================================================================
+def generer_rapport_llm(modifications_groupees):
+    lignes_rapport = [
+        "ROLE: Analyser les changements structurels ci-dessous.",
+        "Chaque modification est unique et liste l'ensemble des modules touchés.",
+        "==================================================================\n"
+    ]
+    
+    if not modifications_groupees:
+        lignes_rapport.append("Aucune modification significative détectée.")
+        return "\n".join(lignes_rapport)
+        
+    for (tag, avant, apres), modules in modifications_groupees.items():
+        liste_modules = ", ".join(sorted(list(modules)))
+        
+        lignes_rapport.append(f"### [Impacte : {liste_modules}]")
+        
+        if tag == 'replace':
+            lignes_rapport.append(f"  [-] AVANT :\n{avant}")
+            lignes_rapport.append(f"  [+] APRÈS :\n{apres}")
+        elif tag == 'delete':
+            lignes_rapport.append(f"  [-] SUPPRIMÉ :\n{avant}")
+        elif tag == 'insert':
+            lignes_rapport.append(f"  [+] AJOUTÉ :\n{apres}")
+            
+        lignes_rapport.append("-" * 50)
+        
+    return "\n".join(lignes_rapport)
+
+# ==============================================================================
+# 4. JEU DE TEST (RÉPÉTITIONS ET FAUSSES MODIFS)
+# ==============================================================================
+if __name__ == "__main__":
+    # DM-001 et DM-002 partagent exactement la même modification de ligne
+    # DM-003 n'a qu'un changement cosmétique (doit être ignoré par drop_identique)
+    donnees_v1 = [
+        {"content": "Ligne 1\nLe moteur doit tourner.\nLigne 3", "extra_information": {"DM_code": "DM-001"}},
+        {"content": "Ligne 1\nLe moteur doit tourner.\nLigne 3", "extra_information": {"DM_code": "DM-002"}},
+        {"content": "Texte inchangé.", "extra_information": {"DM_code": "DM-003"}},
+    ]
+    
+    donnees_v2 = [
+        {"content": "Ligne 1\nLe moteur DOIT s'arrêter.\nLigne 3", "extra_information": {"DM_code": "DM-001"}},
+        {"content": "Ligne 1\nLe moteur DOIT s'arrêter.\nLigne 3", "extra_information": {"DM_code": "DM-002"}},
+        {"content": "texte inchangé. !!!  ", "extra_information": {"DM_code": "DM-003"}}, # Casse + symboles
+    ]
+
+    modifs = analyser_modifications(donnees_v1, donnees_v2)
+    print(generer_rapport_llm(modifs))
+
+
+
+
+
 import re
 import difflib
 from collections import defaultdict
