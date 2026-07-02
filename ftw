@@ -1,3 +1,49 @@
+import requests
+import logging
+
+# Configuration fictive basée sur ton image.png (à adapter avec tes vrais imports)
+class Settings:
+    URL_TOKENIZER_LLM = "https://api.ton-llm.com/v1/tokenize"
+    MODEL_LLM = "ton-modele-courant"
+    API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxx"
+
+settings = Settings()
+log = logging.getLogger(__name__)
+
+def appeler_tokenizer_api(prompt):
+    """
+    Code extrait directement de image.png.
+    Prend un texte en entrée et renvoie le nombre exact de tokens via l'API.
+    """
+    url = f"{settings.URL_TOKENIZER_LLM}"
+    model = settings.MODEL_LLM
+    api_key = f"{settings.API_KEY}"
+    
+    header = {
+        "content-type": "application/json",
+        "authorization": f"Bearer {api_key}"
+    }
+    
+    try:
+        response = requests.post(url, json={"model": model, "prompt": prompt}, headers=header)
+        
+        if response.status_code == 200:
+            response_json = response.json()
+            nb_tokens = int(response_json["count"])
+            return nb_tokens
+        else:
+            log.error(f"Error while counting tokens: {response.text}, {response.status_code}")
+            return None
+    except Exception as e:
+        log.error(f"Erreur de connexion au tokenizer: {e}")
+        return None
+
+
+
+
+
+
+
 def afficher_arbre_textuel(noeud, niveau=0):
     """Affiche l'arbre des chapitres et leurs modules avec une indentation visuelle."""
     indent = "  " * niveau
