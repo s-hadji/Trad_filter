@@ -1,3 +1,35 @@
+
+def extraire_donnees_utiles(liste_noeuds_optimises):
+    resultat_nettoye = []
+
+    for node in liste_noeuds_optimises:
+        dict_feuilles = {}
+        stack = [node]
+        
+        while stack:
+            curr = stack.pop()
+            if not curr.children:
+                dm_code = getattr(curr, 'dm_code', None)
+                md_out = getattr(curr, 'md_out', None)
+                
+                # On ne garde la feuille que si elle a un code ET du contenu textuel réel
+                if dm_code and md_out and str(md_out).strip():
+                    dict_feuilles[dm_code] = md_out
+            else:
+                stack.extend(curr.children)
+                
+        # VÉRIFICATION : Si le dictionnaire est vide (tout était None ou vide),
+        # on DROP le node, il ne sert à rien.
+        if dict_feuilles:
+            resultat_nettoye.append({
+                "node": node,
+                "donnees": dict_feuilles
+            })
+
+    return resultat_nettoye
+
+
+
 def extraire_donnees_feuilles(liste_noeuds_optimises):
     resultat_final = []
 
