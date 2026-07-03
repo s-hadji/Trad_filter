@@ -1,32 +1,22 @@
-def calculer_longueurs_rec(node):
+def calculer_tokens_rec(node):
     if not node:
-        return
+        return 0
 
-    # Si c'est une feuille, ses longueurs sont déjà fixées.
-    # On s'assure juste qu'elle renvoie ses valeurs pour le parent.
+    # Cas d'une feuille : son token_cumulés vaut la longueur de son propre md_out
     if not node.children:
-        return node.doc_v1.get('length', 0), node.doc_v2.get('length', 0)
+        # Le .getattr() évite les bugs si md_out est absent ou None
+        md_out_content = getattr(node, 'md_out', '') or ''
+        node.token_cumulés = len(md_out_content)
+        return node.token_cumulés
 
-    total_len_v1 = 0
-    total_len_v2 = 0
-
-    # On demande d'abord à chaque enfant de calculer sa propre longueur (et celle de ses sous-enfants)
+    # Cas d'un parent : on fait d'abord descendre la récursion chez les enfants
+    total_enfants = 0
     for child in node.children:
-        child_v1, child_v2 = calculer_longueurs_rec(child)
-        total_len_v1 += child_v1
-        total_len_v2 += child_v2
+        total_enfants += calculer_tokens_rec(child)
 
-    # On initialise les dictionnaires du parent s'ils n'existent pas encore
-    if not hasattr(node, 'doc_v1') or node.doc_v1 is None: node.doc_v1 = {}
-    if not hasattr(node, 'doc_v2') or node.doc_v2 is None: node.doc_v2 = {}
-
-    # On applique la somme des enfants au parent
-    node.doc_v1['length'] = total_len_v1
-    node.doc_v2['length'] = total_len_v2
-
-    # On renvoie les totaux pour le parent du nœud actuel
-    return total_len_v1, total_len_v2
-
+    # Le parent stocke la somme récupérée de ses enfants
+    node.token_cumulés = total_enfants
+    return node.token_cumulés
 
 
 import requests
