@@ -1,3 +1,38 @@
+def extraire_donnees_feuilles(liste_noeuds_optimises):
+    resultat_final = []
+
+    for node in liste_noeuds_optimises:
+        dict_feuilles = {}
+        
+        # --- Étape 1 : Récupérer toutes les feuilles sous ce nœud ---
+        # On utilise une petite pile (stack) locale pour trouver les feuilles
+        stack = [node]
+        while stack:
+            curr = stack.pop()
+            
+            if not curr.children:
+                # C'est une feuille ! On extrait ses infos
+                # Le .getattr() sécurise le code si un attribut est manquant
+                dm_code = getattr(curr, 'dm_code', 'sans_code')
+                md_out = getattr(curr, 'md_out', '')
+                
+                # On remplit le dictionnaire de ce nœud
+                dict_feuilles[dm_code] = md_out
+            else:
+                # Ce n'est pas une feuille, on continue à descendre
+                stack.extend(curr.children)
+                
+        # --- Étape 2 : Associer le nœud d'origine avec son dictionnaire de feuilles ---
+        resultat_final.append({
+            "node": node,
+            "donnees": dict_feuilles
+        })
+
+    return resultat_final
+
+
+
+
 def extraire_branches_optimales(node, max_token, resultats=None):
     # Initialisation de la liste au premier appel
     if resultats is None:
