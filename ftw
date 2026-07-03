@@ -1,3 +1,34 @@
+def calculer_longueurs_rec(node):
+    if not node:
+        return
+
+    # Si c'est une feuille, ses longueurs sont déjà fixées.
+    # On s'assure juste qu'elle renvoie ses valeurs pour le parent.
+    if not node.children:
+        return node.doc_v1.get('length', 0), node.doc_v2.get('length', 0)
+
+    total_len_v1 = 0
+    total_len_v2 = 0
+
+    # On demande d'abord à chaque enfant de calculer sa propre longueur (et celle de ses sous-enfants)
+    for child in node.children:
+        child_v1, child_v2 = calculer_longueurs_rec(child)
+        total_len_v1 += child_v1
+        total_len_v2 += child_v2
+
+    # On initialise les dictionnaires du parent s'ils n'existent pas encore
+    if not hasattr(node, 'doc_v1') or node.doc_v1 is None: node.doc_v1 = {}
+    if not hasattr(node, 'doc_v2') or node.doc_v2 is None: node.doc_v2 = {}
+
+    # On applique la somme des enfants au parent
+    node.doc_v1['length'] = total_len_v1
+    node.doc_v2['length'] = total_len_v2
+
+    # On renvoie les totaux pour le parent du nœud actuel
+    return total_len_v1, total_len_v2
+
+
+
 import requests
 import logging
 
