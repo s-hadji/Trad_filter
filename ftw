@@ -1,3 +1,27 @@
+def extraire_branches_optimales(node, max_token, resultats=None):
+    # Initialisation de la liste au premier appel
+    if resultats is None:
+        resultats = []
+        
+    if not node:
+        return resultats
+
+    # CONDITION 1 & 2 : Si le nœud respecte la limite, c'est le plus haut valide.
+    # On le stocke et on NE DESCEND PAS chez ses enfants (élagage).
+    if node.token_cumulés <= max_token:
+        resultats.append(node)
+        return resultats
+
+    # Si le nœud est trop grand, on est obligé de descendre d'un niveau
+    if node.children:
+        for child in node.children:
+            extraire_branches_optimales(child, max_token, resultats)
+            
+    return resultats
+
+
+
+
 def calculer_tokens_rec(node):
     if not node:
         return 0
