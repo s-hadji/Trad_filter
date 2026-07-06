@@ -1,3 +1,42 @@
+import numpy as np
+from sklearn.decomposition import PCA
+
+# 1. On crée un jeu de données d'exemple (5 vecteurs à 3 dimensions)
+X = np.array([
+    [3.4, 6.1, 2.8],
+    [0.1, 0.2, 0.1],  # Proche de l'origine
+    [5.1, 9.8, 4.2],  # Valeurs élevées
+    [1.2, 2.3, 0.5],
+    [2.2, 4.5, 1.9]
+])
+
+# 2. On applique l'ACP pour projeter sur la PREMIÈRE composante principale
+pca = PCA(n_components=1)
+# fit_transform calcule l'axe ET projette directement les données dessus
+X_projete = pca.fit_transform(X) 
+
+# On aplatit le résultat pour obtenir un tableau 1D de scores
+scores_axe_principal = X_projete.flatten()
+
+# 3. On récupère les indices qui permettraient de trier ces scores
+indices_de_tri = np.argsort(scores_axe_principal)
+
+# 4. On applique ces indices pour trier nos vecteurs d'origine
+X_trie = X[indices_de_tri]
+
+# --- Affichage des résultats ---
+print("1. Scores sur l'axe principal (coordonnées 1D) :")
+print(scores_axe_principal)
+
+print("\n2. Ordre des indices (du plus petit au plus grand sur l'axe) :")
+print(indices_de_tri)
+
+print("\n3. Vecteurs d'origine triés selon l'axe principal :")
+print(X_trie)
+
+
+
+
 differ = ModernHtmlDiff(filter_trivial=True, context=False)
 count_modified = 0
 
