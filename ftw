@@ -1,3 +1,46 @@
+differ = ModernHtmlDiff(filter_trivial=True, context=False)
+count_modified = 0
+
+for f in feuille:
+    # On récupère proprement v1 et v2 (vaut None si absent)
+    v1 = getattr(f, "doc_v1", None)
+    v2 = getattr(f, "doc_v2", None)
+
+    # --- CAS 1 : Les deux versions existent -> On compare le texte ---
+    if v1 and v2:
+        _before = textwrap.dedent(v1.get("content", "")).splitlines(keepends=False)
+        _after = textwrap.dedent(v2.get("content", "")).splitlines(keepends=False)
+
+        if differ.has_changes(_before, _after):
+            md_out = differ.make_markdown(
+                _before,
+                _after,
+                fromdesc="before: ",
+                todesc="after: ",
+            )
+            count_modified += 1
+            f.md_out = md_out
+            print(f"Modifié (taille: {len(md_out)})")
+        else:
+            f.md_out = None
+
+    # --- CAS 2 : Pas de v1 mais une v2 -> Insertion complète ---
+    elif not v1 and v2:
+        f.md_out = "**Module complètement inséré**"
+        count_modified += 1
+        print("Inséré")
+
+    # --- CAS 3 : Une v1 mais pas de v2 -> Suppression complète ---
+    elif v1 and not v2:
+        f.md_out = "**Module complètement supprimé**"
+        count_modified += 1
+        print("Supprimé")
+
+    # --- CAS 4 : Ni v1 ni v2 -> Rien à faire ---
+    else:
+        f.md_out = None
+
+
 
 import json
 from typing import List, Dict
