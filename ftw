@@ -1,3 +1,45 @@
+import numpy as np
+from sklearn.decomposition import PCA
+
+# 1. Jeu de données
+X = np.array([
+    [3.4, 6.1, 2.8],
+    [0.1, 0.2, 0.1],  # Proche de l'origine
+    [5.1, 9.8, 4.2],  # Valeurs élevées
+    [1.2, 2.3, 0.5],
+    [2.2, 4.5, 1.9]
+])
+
+# --- MÉTHODE 1 : Tri par l'ACP (Moyenne des 2 premiers axes) ---
+pca = PCA(n_components=2)
+X_projete = pca.fit_transform(X)
+scores_moyens_pca = np.mean(X_projete, axis=1)
+indices_pca = np.argsort(scores_moyens_pca)
+X_trie_pca = X[indices_pca]
+
+# --- MÉTHODE 2 : Tri par la Norme Euclidienne ---
+# np.linalg.norm calcule la distance "directe" entre l'origine (0,0,0) et le point
+normes = np.linalg.norm(X, axis=1)
+indices_norme = np.argsort(normes)
+X_trie_norme = X[indices_norme]
+
+# --- Affichage et Comparaison ---
+print("=== COMPARAISON DES DEUX MÉTHODES ===\n")
+
+print("1. TRI PAR ACP (Moyenne des 2 axes principaux) :")
+print(f"Ordre des indices : {indices_pca}")
+print(X_trie_pca)
+
+print("\n2. TRI PAR NORME EUCLIDIENNE :")
+print(f"Valeurs des normes : {normes}")
+print(f"Ordre des indices : {indices_norme}")
+print(X_trie_norme)
+
+# Vérification automatique si les deux tris sont identiques
+sont_identiques = np.array_equal(indices_pca, indices_norme)
+print(f"\nLes deux méthodes donnent-elles le même ordre ? {sont_identiques}")
+
+
 
 import numpy as np
 from sklearn.decomposition import PCA
