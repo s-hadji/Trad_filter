@@ -1,3 +1,55 @@
+
+import numpy as np
+from sklearn.decomposition import PCA
+
+# 1. Jeu de données d'exemple (5 vecteurs à 3 dimensions)
+X = np.array([
+    [3.4, 6.1, 2.8],
+    [0.1, 0.2, 0.1],  # Proche de l'origine
+    [5.1, 9.8, 4.2],  # Valeurs élevées
+    [1.2, 2.3, 0.5],
+    [2.2, 4.5, 1.9]
+])
+
+# 2. On applique l'ACP pour projeter sur les DEUX premières composantes principales
+pca = PCA(n_components=2)
+X_projete = pca.fit_transform(X)  # Résultat de forme (5, 2) : 2 coordonnées par point
+
+# 3. Calcul de la variance capturée
+variance_par_axe = pca.explained_variance_ratio_
+variance_totale_2_axes = np.sum(variance_par_axe)
+
+# 4. On calcule la moyenne des coordonnées sur les deux directions (axes) pour chaque point
+# axis=1 permet de faire la moyenne de la ligne (Axe 1 + Axe 2) / 2
+scores_moyens = np.mean(X_projete, axis=1)
+
+# 5. On récupère les indices pour trier selon cette moyenne
+indices_de_tri = np.argsort(scores_moyens)
+
+# 6. On applique ces indices pour trier les vecteurs d'origine
+X_trie = X[indices_de_tri]
+
+# --- Affichage des résultats ---
+print("--- Variance expliquée ---")
+print(f"Variance par axe : {variance_par_axe}")
+print(f"Variance totale récupérée par les 2 directions : {variance_totale_2_axes * 100:.2f} %")
+
+print("\n--- Projection et Tri ---")
+print("Coordonnées 2D projetées (Axe 1, Axe 2) :")
+print(X_projete)
+
+print("\nScores moyens (moyenne des 2 directions) :")
+print(scores_moyens)
+
+print("\nOrdre des indices (du plus petit au plus grand score moyen) :")
+print(indices_de_tri)
+
+print("\nVecteurs d'origine triés selon la moyenne des 2 directions principales :")
+print(X_trie)
+
+
+
+
 import numpy as np
 from sklearn.decomposition import PCA
 
