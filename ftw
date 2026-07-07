@@ -1,5 +1,198 @@
 import json
 import numpy as np
+from typing import List, Dict, Any, Literal
+from pydantic import BaseModel, Field
+from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
+from sklearn.preprocessing import normalize
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+
+# ==============================================================================
+# 1. SCHÉMAS PYDANTIC
+# ==============================================================================
+
+class ModificationFusionnee(BaseModel):
+    texte_fusionne: str = Field(
+        description="Le nouveau texte unique condensé combinant les informations au sens identique."
+    )
+    ids_sources: List[int] = Field(
+        description="La liste des IDs numériques originaux qui ont été fusionnés dans ce texte."
+    )
+
+class RapportClusterFusion(BaseModel):
+    elements_fusionnes: List[ModificationFusionnee]
+
+
+# ==============================================================================
+# 2. PIPELINE GLOBAL AVEC CLUSTERING MODULAIRE
+# ==============================================================================
+
+def executer_pipeline_clustering(
+    resultat_analyse: Dict[Any, Any], 
+    strategy: Literal['kmeans', 'dbscan', 'agglomerative'] = 'kmeans',
+    strategy_kwargs: Dict[str, Any] = None
+) -> List[Dict[str, Any]]:
+    
+    if strategy_kwargs is None:
+        strategy_kwargs = {}
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 1 : Indexation à plat et isolation de la première phrase
+    # --------------------------------------------------------------------------
+    toutes_les_phrases = []
+    id_compteur = 0
+
+    for node, fiche in resultat_analyse.items():
+        for section in fiche.sections:
+            if section.modifications_apportees.descriptions:
+                premiere_phrase = section.modifications_apportees.descriptions[0]
+                toutes_les_phrases.append({
+                    "id": id_compteur,
+                    "phrase": premiere_phrase,
+                    "node": node,
+                    "codes_dm": section.codes_dm
+                })
+                id_compteur += 1
+
+    if not toutes_les_phrases:
+        print("⚠️ Aucune donnée à traiter.")
+        return []
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 2 : Vectorisation OpenAI
+    # --------------------------------------------------------------------------
+    print(f"🧬 Vectorisation de {len(toutes_les_phrases)} phrases...")
+    embeddings_model = OpenAIEmbeddings(model="text-embedding-3-small")
+    phrases_textes = [item["phrase"] for item in toutes_les_phrases]
+    X = np.array(embeddings_model.embed_documents(phrases_textes))
+    
+    # Normalisation pour utiliser la similarité cosinus (recommandé pour le texte)
+    X_norm = normalize(X)
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 3 : Application du Clustering Choisi
+    # --------------------------------------------------------------------------
+    print(f"🤖 Application du clustering : Strategy='{strategy}'...")
+    
+    if strategy == 'kmeans':
+        # Par défaut : 1 cluster pour 3 documents (minimum 2)
+        n_clusters = strategy_kwargs.get('n_clusters', max(2, len(phrases_textes) // 3))
+        model = KMeans(n_clusters=n_clusters, random_state=42, **strategy_kwargs)
+        labels = model.fit_predict(X_norm)
+        
+    elif strategy == 'dbscan':
+        # Par défaut : eps=0.3 (seuil de distance), min_samples=1
+        eps = strategy_kwargs.get('eps', 0.3)
+        min_samples = strategy_kwargs.get('min_samples', 1)
+        model = DBSCAN(eps=eps, min_samples=min_samples, metric='cosine', **strategy_kwargs)
+        labels = model.fit_predict(X_norm)
+        
+    elif strategy == 'agglomerative':
+        # Regroupement hiérarchique basé sur un seuil de distance
+        distance_threshold = strategy_kwargs.get('distance_threshold', 0.4)
+        model = AgglomerativeClustering(
+            n_clusters=None, 
+            metric='cosine', 
+            linkage='average', 
+            distance_threshold=distance_threshold, 
+            **strategy_kwargs
+        )
+        labels = model.fit_predict(X_norm)
+    else:
+        raise ValueError(f"Stratégie de clustering '{strategy}' inconnue.")
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 4 : Groupement des items par Cluster & Gestion du bruit
+    # --------------------------------------------------------------------------
+    clusters = {}
+    noise_counter = -1
+    
+    for idx, label in enumerate(labels):
+        # Pour DBSCAN, -1 signifie "Bruit / Isolé". On crée un cluster unique par point isolé.
+        if label == -1:
+            cluster_id = noise_counter
+            noise_counter -= 1
+        else:
+            cluster_id = label
+            
+        if cluster_id not in clusters:
+            clusters[cluster_id] = []
+        clusters[cluster_id].append(toutes_les_phrases[idx])
+
+    print(f"📦 {len(clusters)} clusters distincts générés.")
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 5 : Synthèse par Cluster via LLM (avec optimisation)
+    # --------------------------------------------------------------------------
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    llm_structure = llm.with_structured_output(RapportClusterFusion)
+    
+    prompt_template = ChatPromptTemplate.from_messages([
+        ("system", (
+            "Vous êtes un assistant IA spécialisé dans la déduplication et la synthèse technique.\n"
+            "On vous fournit un groupe (cluster) de modifications sémantiquement proches précédées de leur [ID].\n"
+            "Votre but est de nettoyer et condenser ce groupe :\n"
+            "1. Fusionnez les éléments qui ont exactement le même sens et la même information.\n"
+            "2. Pour chaque texte fusionné, vous DEVEZ lister TOUS les [ID] d'origine qui le composent.\n"
+            "3. Si des phrases expriment des nuances ou des données différentes, laissez-les séparées mais gardez leur [ID]."
+        )),
+        ("user", "Voici les modifications du cluster courant à traiter :\n\n{input_data}")
+    ])
+    
+    chaine = prompt_template | llm_structure
+    elements_fusionnes_llm = []
+
+    for c_id, items in clusters.items():
+        # OPTIMISATION : Si le cluster contient 1 seul élément, inutile d'appeler le LLM
+        if len(items) == 1:
+            seul_item = items[0]
+            elements_fusionnes_llm.append(
+                ModificationFusionnee(
+                    texte_fusionne=seul_item["phrase"],
+                    ids_sources=[seul_item["id"]]
+                )
+            )
+            continue
+            
+        # Préparation du prompt pour les clusters multi-éléments
+        input_data = "\n".join([f"[ID {item['id']}] : {item['phrase']}" for item in items])
+        
+        # Appel LLM
+        resultat = chaine.invoke({"input_data": input_data})
+        elements_fusionnes_llm.extend(resultat.elements_fusionnes)
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 6 : Réagrégation finale (Traçabilité Nodes et DM Codes)
+    # --------------------------------------------------------------------------
+    print("🎯 Reconstruction de la traçabilité des sources...")
+    map_origine = {item["id"]: item for item in toutes_les_phrases}
+    dictionnaire_final_reconstruit = []
+
+    for item_fusionne in elements_fusionnes_llm:
+        noeuds_concernes = set()
+        codes_dm_concernes = set()
+        
+        for id_src in item_fusionne.ids_sources:
+            if id_src in map_origine:
+                origine = map_origine[id_src]
+                noeuds_concernes.add(origine["node"])
+                codes_dm_concernes.update(origine["codes_dm"])
+                
+        dictionnaire_final_reconstruit.append({
+            "texte_synthese": item_fusionne.texte_fusionne,
+            "noeuds_pivots": list(noeuds_concernes),
+            "dm_codes": list(codes_dm_concernes)
+        })
+
+    print("✅ Pipeline de clustering exécuté.")
+    return dictionnaire_final_reconstruit
+
+
+
+
+
+import json
+import numpy as np
 from typing import List, Dict, Any
 from pydantic import BaseModel, Field
 from sklearn.decomposition import PCA
