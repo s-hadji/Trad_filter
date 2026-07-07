@@ -1,3 +1,151 @@
+import json
+import numpy as np
+from typing import List, Dict, Any
+from pydantic import BaseModel, Field
+from sklearn.decomposition import PCA
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+
+# ==============================================================================
+# 1. SCHÉMAS PYDANTIC POUR LA FUSION SÉMANTIQUE
+# ==============================================================================
+
+class ModificationFusionnee(BaseModel):
+    texte_fusionne: str = Field(
+        description="Le nouveau texte unique condensé combinant les informations au sens identique."
+    )
+    ids_sources: List[int] = Field(
+        description="La liste des IDs numériques originaux qui ont été fusionnés dans ce texte."
+    )
+
+class RapportFenetreFusion(BaseModel):
+    elements_fusionnes: List[ModificationFusionnee]
+
+
+# ==============================================================================
+# 2. PIPELINE DE TRAITEMENT GLOBAL
+# ==============================================================================
+
+def executer_pipeline_fusion_semantique(resultat_analyse: Dict[Any, Any], window_size: int = 5, overlap: int = 0) -> List[Dict[str, Any]]:
+    """
+    Prend le dictionnaire {node: FicheVersionGlobale}, extrait les phrases clés,
+    les trie sémantiquement via PCA, applique une fenêtre glissante LLM pour fusionner
+    les doublons et réagrège les métadonnées d'origine (Nodes et dm_codes).
+    """
+    
+    # --------------------------------------------------------------------------
+    # ÉTAPE 1 : Indexation à plat et isolation de la première phrase principale
+    # --------------------------------------------------------------------------
+    toutes_les_phrases = []
+    id_compteur = 0
+
+    for node, fiche in resultat_analyse.items():
+        for section in fiche.sections:
+            # On extrait uniquement la première description principale
+            if section.modifications_apportees.descriptions:
+                premiere_phrase = section.modifications_apportees.descriptions[0]
+                
+                toutes_les_phrases.append({
+                    "id": id_compteur,
+                    "phrase": premiere_phrase,
+                    "node": node,
+                    "codes_dm": section.codes_dm  # Historique des DMC
+                })
+                id_compteur += 1
+
+    if not toutes_les_phrases:
+        print("⚠️ Aucune donnée à traiter.")
+        return []
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 2 : Vectorisation OpenAI & Tri par composantes principales (ACP)
+    # --------------------------------------------------------------------------
+    print(f"🧬 Vectorisation de {len(toutes_les_phrases)} phrases...")
+    embeddings_model = OpenAIEmbeddings(model="text-embedding-3-small")
+    phrases_textes = [item["phrase"] for item in toutes_les_phrases]
+    X = np.array(embeddings_model.embed_documents(phrases_textes))
+
+    # Réduction et calcul des scores pour trier par "sujets" proches
+    pca = PCA(n_components=2)
+    X_projete = pca.fit_transform(X)
+    scores_moyens_pca = np.mean(X_projete, axis=1)
+    indices_tries = np.argsort(scores_moyens_pca)
+
+    # Notre liste est désormais ordonnée de façon à regrouper les sens similaires
+    phrases_triees = [toutes_les_phrases[idx] for idx in indices_tries]
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 3 : Déduplication par fenêtre glissante via le LLM
+    # --------------------------------------------------------------------------
+    print("🧠 Initialisation de la fusion par fenêtre glissante...")
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)  # Température 0 stricte
+    llm_structure = llm.with_structured_output(RapportFenetreFusion)
+    
+    prompt_template = ChatPromptTemplate.from_messages([
+        ("system", (
+            "Vous êtes un assistant IA spécialisé dans la déduplication technique.\n"
+            "On vous fournit une liste de modifications techniques précédées de leur [ID].\n"
+            "Votre but est de réduire la quantité de données :\n"
+            "1. Fusionnez les éléments qui ont exactement le même sens et la même information.\n"
+            "2. Pour chaque texte fusionné, vous DEVEZ lister TOUS les [ID] d'origine qui le composent.\n"
+            "3. Si une phrase est unique et n'a pas d'équivalent, laissez-la seule mais gardez son [ID]."
+        )),
+        ("user", "Voici les modifications à traiter pour cette fenêtre :\n\n{input_data}")
+    ])
+    
+    chaine = prompt_template | llm_structure
+    elements_fusionnes_llm = []
+    i = 0
+    
+    while i < len(phrases_triees):
+        fenetre = phrases_triees[i:i + window_size]
+        if not fenetre:
+            break
+            
+        # Préparation du payload textuel typé : "[ID 3] : Phrase..."
+        input_data = "\n".join([f"[ID {item['id']}] : {item['phrase']}" for item in fenetre])
+        
+        # Appel LLM sur la fenêtre courante
+        resultat = chaine.invoke({"input_data": input_data})
+        elements_fusionnes_llm.extend(resultat.elements_fusionnes)
+        
+        # Progression de la jauge de la fenêtre
+        pas = (window_size - overlap)
+        i += pas if pas > 0 else 1
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 4 : Réagrégation finale et reconstruction de la traçabilité
+    # --------------------------------------------------------------------------
+    print("🎯 Reconstruction de l'arbre des dépendances d'origine...")
+    map_origine = {item["id"]: item for item in toutes_les_phrases}
+    dictionnaire_final_reconstruit = []
+
+    for item_fusionne in elements_fusionnes_llm:
+        noeuds_concernes = set()
+        codes_dm_concernes = set()
+        
+        # On utilise les IDs renvoyés par le LLM pour faire le mapping inverse
+        for id_src in item_fusionne.ids_sources:
+            if id_src in map_origine:
+                origine = map_origine[id_src]
+                noeuds_concernes.add(origine["node"])
+                codes_dm_concernes.update(origine["codes_dm"])
+                
+        # Stockage de l'entité finale synthétisée sans perte de contexte historique
+        dictionnaire_final_reconstruit.append({
+            "texte_synthese": item_fusionne.texte_fusionne,
+            "noeuds_pivots": list(noeuds_concernes),
+            "dm_codes": list(codes_dm_concernes)
+        })
+
+    print("✅ Pipeline terminé avec succès.")
+    return dictionnaire_final_reconstruit
+
+
+
+
+
+
 import numpy as np
 from sklearn.decomposition import PCA
 
