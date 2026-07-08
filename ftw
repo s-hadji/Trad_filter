@@ -1,3 +1,44 @@
+
+def extraire_donnees_utiles(liste_noeuds_optimises):
+    resultat_nettoye = []
+
+    for node in liste_noeuds_optimises:
+        # dm_code -> liste de md_out (on n'écrase JAMAIS)
+        accumulateur = {}
+        stack = [node]
+
+        while stack:
+            curr = stack.pop()
+            if not curr.children:
+                dm_code = getattr(curr, 'dm_code', None)
+                md_out = getattr(curr, 'md_out', None)
+                if dm_code and md_out and str(md_out).strip():
+                    accumulateur.setdefault(dm_code, []).append(str(md_out).strip())
+            else:
+                stack.extend(curr.children)
+
+        if not accumulateur:
+            continue  # node vide -> on drop
+
+        # On recolle les md_out multiples d'un même DM en un seul bloc lisible
+        dict_feuilles = {
+            dm_code: "\n\n---\n\n".join(blocs)
+            for dm_code, blocs in accumulateur.items()
+        }
+
+        resultat_nettoye.append({
+            "node": node,
+            "donnees": dict_feuilles
+        })
+
+    return resultat_nettoye
+
+
+
+
+
+
+
 import json
 import numpy as np
 from typing import List, Dict, Any, Literal
