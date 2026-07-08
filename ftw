@@ -1,5 +1,181 @@
 """
 ==============================================================================
+ PROMPTS DÉFINITIFS — V1 (comptes rendus par pack) & V2 (fusion / condensation)
+==============================================================================
+ Alignés sur la structure réelle du 'md_out' produit par ModernHtmlDiff :
+
+   ...(filtered).
+
+   ### Change 1 — before: `lines 1-7` / after: `lines 1-8`
+
+   ```diff
+   - <ancienne ligne>
+   + <nouvelle ligne>
+     <ligne de contexte>
+   ```
+   Procédure GATM - Horizontal ...   <- CONTENU documentaire réel
+
+ Éléments STRUCTURELS (produits par l'outil, jamais du contenu) :
+   - en-tête récapitulatif / mention de filtrage
+   - titres de blocs '### Change N'
+   - 'before:' / 'after:' + plages 'lines X-Y'
+   - délimiteurs ```diff ... ```
+   - préfixes de ligne '+' / '-'
+
+ Règle de langue : le contenu est MIXTE (chapitres FR, contenu parfois EN,
+ jargon métier FR/EN : GATM, GSE, GPS, Dorsal...). Le jargon technique est
+ PRÉSERVÉ TEL QUEL, jamais traduit ni reformulé.
+==============================================================================
+"""
+
+from langchain_core.prompts import ChatPromptTemplate
+
+
+# ==============================================================================
+# BLOC COMMUN — description des éléments structurels du md_out
+# (réutilisé tel quel dans la V1 ; la V2 n'en a pas besoin car elle ne voit
+#  plus le md_out, seulement des descriptions déjà rédigées.)
+# ==============================================================================
+_STRUCTURE_MD_OUT = (
+    "ÉLÉMENTS STRUCTURELS À IGNORER (produits automatiquement par l'outil de comparaison, "
+    "ils ne font PAS partie du contenu documentaire) :\n"
+    "Servez-vous-en UNIQUEMENT pour comprendre l'organisation des changements ; ne les recopiez "
+    "JAMAIS, ne les citez pas, ne les décrivez pas :\n"
+    "  - l'en-tête récapitulatif en tête de bloc (mention de filtrage, comptage des changements) ;\n"
+    "  - les titres de blocs de la forme '### Change N', qui NUMÉROTENT les changements distincts "
+    "(ils vous indiquent combien de modifications indépendantes contient le bloc) ;\n"
+    "  - les mentions 'before:' / 'after:' suivies de plages 'lines X-Y' : repères de POSITION, "
+    "pas du contenu ;\n"
+    "  - les délimiteurs de bloc de code (```diff ... ```) ;\n"
+    "  - les préfixes de ligne '+' (ligne AJOUTÉE) et '-' (ligne SUPPRIMÉE).\n"
+    "Le contenu documentaire réel est le TEXTE des lignes une fois ces marqueurs retirés "
+    "(par ex. « Procédure GATM - Horizontal... », « Consommables, matériaux... »).\n\n"
+)
+
+_REGLE_LANGUE = (
+    "LANGUE ET JARGON : le contenu peut mêler français et anglais et contient un vocabulaire "
+    "métier spécifique (ex. GATM, GSE, GPS, Dorsal, Horizontal...). PRÉSERVEZ CE JARGON EXACTEMENT "
+    "TEL QU'IL APPARAÎT dans le source. Ne traduisez pas, ne reformulez pas, n'introduisez pas de "
+    "synonymes. La désignation technique doit rester identique au document.\n\n"
+)
+
+
+# ==============================================================================
+# PROMPT V1 — generer_comptes_rendus_packs
+# ==============================================================================
+PROMPT_V1 = ChatPromptTemplate.from_messages([
+    ("system", (
+        "Vous êtes un expert de la documentation technique et de la gestion de configuration.\n"
+        "Votre rôle est de TRANSCRIRE des modifications textuelles brutes en descriptions "
+        "structurées et strictement factuelles. Vous ne rédigez pas une note explicative : "
+        "vous CONSTATEZ des changements.\n\n"
+
+        + _STRUCTURE_MD_OUT
+        + _REGLE_LANGUE +
+
+        "RÈGLES DE FIDÉLITÉ (IMPÉRATIVES) :\n"
+        "1. N'INTERPRÉTEZ PAS. Ne déduisez aucune intention, cause, justification ni conséquence. "
+        "Décrivez EXCLUSIVEMENT ce qui a été ajouté, supprimé ou remplacé.\n"
+        "2. Utilisez le jargon exact du document (voir règle de langue ci-dessus).\n\n"
+
+        "FORMAT DE SORTIE STANDARD (pour comparabilité) :\n"
+        "3. Chaque description suit un FORMAT RÉGULIER ET CONSTANT, clair pour un humain, afin que "
+        "les modifications soient faciles à comparer entre elles. Exprimez de façon homogène la "
+        "nature de l'opération (ajout / suppression / remplacement) et l'élément concerné, en "
+        "reprenant les désignations exactes du document. Restez identique d'une description à l'autre.\n\n"
+
+        "GRANULARITÉ FINE (IMPÉRATIVE) :\n"
+        "4. Chaque '### Change N' ou chaque modification de nature différente donne lieu à UNE "
+        "description SÉPARÉE dans 'descriptions'. Ne fusionnez jamais plusieurs changements distincts "
+        "en une phrase globale ou fourre-tout.\n"
+        "5. Ne fragmentez pas artificiellement un changement unique et cohérent : un changement = "
+        "une description.\n\n"
+
+        "NON-RÉPÉTITION & INTÉGRITÉ DU CROISEMENT (dans les limites de CE pack) :\n"
+        "6. Si une MÊME modification (rigoureusement identique) apparaît sur PLUSIEURS codes DM de "
+        "ce pack, produisez UNE SEULE description englobante et listez TOUS les codes DM concernés "
+        "dans 'codes_dm'. Ne dupliquez pas une description identique sur plusieurs sections.\n"
+        "7. RÈGLE D'INTÉGRITÉ DU CROISEMENT (IMPÉRATIVE) : une section affirme que CHAQUE "
+        "description de sa liste 'descriptions' s'applique à CHAQUE code DM de sa liste 'codes_dm', "
+        "sans exception. Vous ne pouvez donc regrouper plusieurs codes DM dans une même section QUE "
+        "si TOUTES les descriptions de cette section sont présentes, rigoureusement identiques, dans "
+        "CHACUN de ces documents.\n"
+        "8. Si des documents partagent CERTAINES modifications mais pas toutes, SÉPAREZ :\n"
+        "   - une section pour les modifications COMMUNES, listant tous les codes DM concernés ;\n"
+        "   - une ou plusieurs sections pour les modifications PROPRES à certains documents, "
+        "listant uniquement les codes DM réellement concernés.\n"
+        "9. Il est STRICTEMENT INTERDIT qu'une description figure dans une section dont l'un des "
+        "codes DM ne porte pas cette modification. En cas de doute sur un document, ne l'incluez "
+        "pas dans le regroupement : préférez une section séparée.\n\n"
+
+        "Règles de rédaction :\n"
+        "- Aucun emoji ni artifice de mise en forme.\n"
+        "- Factuel, neutre, technique. Aucune phrase d'explication ou de commentaire."
+    )),
+    ("user", (
+        "Voici les données structurées (Code DM -> Contenu md_out) du pack à traiter "
+        "(Pivot : {nom_pivot}) :\n\n{input_data}\n\n"
+        "Générez le compte rendu sous la structure Pydantic demandée."
+    ))
+])
+
+
+# ==============================================================================
+# PROMPTS V2 — fusion / condensation (deux modes)
+# La V2 ne voit QUE des descriptions déjà rédigées (pas le md_out).
+# ==============================================================================
+_REGLES_COMMUNES_V2 = (
+    "FIDÉLITÉ : le texte fusionné reste AU PLUS PRÈS DU LIBELLÉ D'ORIGINE. Reprenez mot pour mot "
+    "les formulations là où elles coïncident. Ne paraphrasez pas, n'introduisez pas de synonymes, "
+    "préservez le jargon technique exact (y compris anglais).\n"
+    "COUVERTURE EXHAUSTIVE : le texte fusionné couvre l'INTÉGRALITÉ de l'information de CHAQUE "
+    "description fusionnée. Aucune valeur, aucun élément ne doit être perdu. Si une valeur "
+    "n'apparaît que dans une seule des descriptions, elle DOIT figurer dans le texte fusionné.\n"
+    "N'INTERPRÉTEZ PAS : ni intention, ni cause, ni conséquence. Constatez.\n"
+    "Pour chaque texte fusionné, listez TOUS les [ID] d'origine qui le composent.\n"
+    "Aucun emoji ni artifice de mise en forme. Factuel, neutre, technique."
+)
+
+# --- Mode COMPACT : prudent (même nature ET même objet) ---
+PROMPT_V2_COMPACT = ChatPromptTemplate.from_messages([
+    ("system", (
+        "Vous êtes un assistant spécialisé dans la déduplication de modifications techniques.\n"
+        "On vous fournit un groupe (cluster) de descriptions proches, chacune précédée de son [ID].\n\n"
+        "OBJECTIF : condenser prudemment, sans aucune perte.\n\n"
+        "CRITÈRE DE REGROUPEMENT (STRICT) :\n"
+        "Ne fusionnez QUE les descriptions RIGOUREUSEMENT ÉQUIVALENTES : même nature de modification "
+        "ET même objet concerné. Si l'objet, la valeur ou la nuance diffèrent, GARDEZ SÉPARÉ, "
+        "chaque description conservant son [ID].\n\n"
+        + _REGLES_COMMUNES_V2
+    )),
+    ("user", "Voici les modifications du cluster courant à traiter :\n\n{input_data}")
+])
+
+# --- Mode ULTRA_COMPACT : agressif (même nature, objets différents autorisés) ---
+PROMPT_V2_ULTRA = ChatPromptTemplate.from_messages([
+    ("system", (
+        "Vous êtes un assistant spécialisé dans la SYNTHÈSE agressive de modifications techniques.\n"
+        "On vous fournit un groupe (cluster) de descriptions proches, chacune précédée de son [ID].\n\n"
+        "OBJECTIF : condenser AU MAXIMUM, en un minimum de modifications, SANS rien perdre.\n\n"
+        "CRITÈRE DE REGROUPEMENT (LARGE) :\n"
+        "Fusionnez toutes les descriptions de MÊME NATURE de modification, MÊME SI elles portent sur "
+        "des objets ou des valeurs DIFFÉRENTS. Produisez alors UNE modification englobante unique qui "
+        "ÉNUMÈRE EXHAUSTIVEMENT tous les objets / toutes les valeurs concernés (union complète, "
+        "aucun élément omis).\n"
+        "Exemple : 'ajout de rep. 4, 2' + 'ajout de rep. 1, 3' => 'ajout de rep. 1, 2, 3, 4'.\n"
+        "Ne séparez que ce qui relève de natures de modification VRAIMENT différentes "
+        "(par ex. un ajout et une suppression ne se fusionnent pas).\n\n"
+        + _REGLES_COMMUNES_V2
+    )),
+    ("user", "Voici les modifications du cluster courant à traiter :\n\n{input_data}")
+])
+
+
+
+
+
+"""
+==============================================================================
  PIPELINE V2 — CONDENSATION EN TROIS TEMPS
 ==============================================================================
  Entrée  : dictio (== resultat_analyse == V1), dict {node: FicheVersionGlobale}
