@@ -1,0 +1,361 @@
+"""
+==============================================================================
+ PIPELINE V2 — COMPRESSION PAR TRI ACP + FENÊTRE GLISSANTE
+==============================================================================
+ Remplace le clustering/LLM de groupement par une méthode DÉTERMINISTE :
+
+   0. Indexation à plat (une entrée par description V1)   [contrôle complétude]
+   1. Embedding des descriptions (instances RÉUTILISÉES)
+   2. ACP : projection sur les k premières composantes, score 1D
+      = moyenne (pondérée par la variance expliquée) des projections
+   3. TRI le long de cet axe (argsort, traçabilité conservée) [contrôle permutation]
+   4. FENÊTRE GLISSANTE sur la séquence triée : regroupe les voisins dont la
+      similarité cosinus (dans l'espace COMPLET des embeddings, pas le score 1D)
+      dépasse un seuil                                       [contrôle partition]
+   5. Fusion des groupes adjacents proches (rattrapage de coupes du tri)
+   6. Rédaction LLM par groupe FIGÉ (singletons sans appel)  [contrôle complétude]
+   7. Agrégation déterministe nodes / DM codes / chapitres   [contrôle DM codes]
+
+ Le LLM ne décide plus RIEN sur le périmètre des groupes : il ne fait que
+ rédiger. La complétude (chaque description, chaque DM code) est garantie
+ et VÉRIFIÉE par code à chaque étape.
+==============================================================================
+"""
+
+from typing import List, Dict, Any, Literal
+from collections import defaultdict
+import numpy as np
+from pydantic import BaseModel, Field
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import normalize
+from langchain_core.prompts import ChatPromptTemplate
+
+
+# ==============================================================================
+# 1. SCHÉMA PYDANTIC (rédaction uniquement)
+# ==============================================================================
+
+class TexteCondense(BaseModel):
+    texte: str = Field(
+        description=(
+            "Le texte condensé unique du groupe, fidèle au libellé d'origine et couvrant "
+            "l'intégralité de l'information de chaque description du groupe."
+        )
+    )
+
+
+# ==============================================================================
+# 2. PROMPT DE RÉDACTION (le périmètre des groupes est FIGÉ par le code)
+# ==============================================================================
+
+def _prompt_redaction(mode: str) -> ChatPromptTemplate:
+    exigence_mode = (
+        "Produisez UNE modification englobante unique qui ÉNUMÈRE EXHAUSTIVEMENT tous les "
+        "objets et toutes les valeurs concernés (union complète, aucun élément omis). "
+        "Exemple : 'ajout de rep. 4, 2' + 'ajout de rep. 1, 3' => 'ajout de rep. 1, 2, 3, 4'."
+        if mode == "ultra_compact" else
+        "Produisez le plus petit texte à la fois fidèle au libellé des sources et couvrant "
+        "de toute leur information."
+    )
+    return ChatPromptTemplate.from_messages([
+        ("system", (
+            "Vous êtes un rédacteur technique. On vous fournit un groupe de descriptions de "
+            "modifications DÉJÀ regroupées : votre unique tâche est d'en produire LE texte "
+            "condensé. Le périmètre du groupe est FIGÉ, ne le remettez pas en cause.\n\n"
+            + exigence_mode + "\n\n"
+            "RÈGLES (IMPÉRATIVES) :\n"
+            "1. FIDÉLITÉ : restez AU PLUS PRÈS DU LIBELLÉ D'ORIGINE. Reprenez mot pour mot les "
+            "formulations là où elles coïncident. Ne paraphrasez pas, pas de synonymes. Préservez "
+            "le jargon technique exact, y compris les termes anglais (GATM, GSE, GPS, Dorsal...).\n"
+            "2. COUVERTURE EXHAUSTIVE : le texte couvre l'INTÉGRALITÉ de l'information de CHAQUE "
+            "description. Toute valeur présente dans une seule description DOIT figurer au résultat.\n"
+            "3. N'INTERPRÉTEZ PAS : ni intention, ni cause, ni conséquence. Constatez.\n"
+            "4. Format régulier, clair pour un humain, sans emoji ni artifice de mise en forme."
+        )),
+        ("user", "Voici les descriptions du groupe à condenser :\n\n{input_data}")
+    ])
+
+
+# ==============================================================================
+# 3. BRIQUES DÉTERMINISTES
+# ==============================================================================
+
+def _score_axe_principal(
+    X_norm: np.ndarray,
+    n_composantes: int,
+    ponderer_par_variance: bool = True,
+) -> np.ndarray:
+    """
+    Projette sur les k premières composantes principales et combine en UN score 1D :
+    moyenne des projections, pondérée (ou non) par la variance expliquée.
+    """
+    k = max(1, min(n_composantes, X_norm.shape[0] - 1, X_norm.shape[1]))
+    pca = PCA(n_components=k)
+    projections = pca.fit_transform(X_norm)          # (n, k)
+
+    if ponderer_par_variance and k > 1:
+        poids = pca.explained_variance_ratio_
+        poids = poids / poids.sum()
+        scores = projections @ poids                 # moyenne pondérée
+    else:
+        scores = projections.mean(axis=1)            # moyenne simple
+
+    return scores.flatten()
+
+
+def _grouper_fenetre_glissante(
+    X_norm: np.ndarray,
+    ordre: np.ndarray,
+    seuil_similarite: float,
+    taille_fenetre: int,
+) -> List[List[int]]:
+    """
+    Parcourt la séquence TRIÉE et regroupe de proche en proche :
+    l'élément suivant rejoint le groupe courant si sa similarité cosinus
+    (espace complet des embeddings) avec AU MOINS UN des `taille_fenetre`
+    derniers membres du groupe dépasse le seuil. Sinon, nouveau groupe.
+
+    Retourne des groupes d'INDICES DE POSITION (0..n-1) dans X_norm.
+    """
+    groupes: List[List[int]] = []
+    courant: List[int] = [int(ordre[0])]
+
+    for pos in ordre[1:]:
+        pos = int(pos)
+        fenetre = courant[-taille_fenetre:]
+        # similarité cosinus = produit scalaire (vecteurs L2-normalisés)
+        sims = X_norm[fenetre] @ X_norm[pos]
+        if float(np.max(sims)) >= seuil_similarite:
+            courant.append(pos)
+        else:
+            groupes.append(courant)
+            courant = [pos]
+
+    groupes.append(courant)
+    return groupes
+
+
+def _fusionner_groupes_adjacents(
+    X_norm: np.ndarray,
+    groupes: List[List[int]],
+    seuil_similarite: float,
+) -> List[List[int]]:
+    """
+    Rattrapage : le tri 1D peut couper un paquet en deux groupes contigus.
+    On fusionne les groupes ADJACENTS dont les centroïdes sont plus proches
+    que le seuil. Une passe suffit (les groupes restent ordonnés).
+    """
+    if len(groupes) <= 1:
+        return groupes
+
+    centroides = [normalize(X_norm[g].mean(axis=0, keepdims=True))[0] for g in groupes]
+    fusionnes: List[List[int]] = [list(groupes[0])]
+    dernier_centroide = centroides[0]
+
+    for g, c in zip(groupes[1:], centroides[1:]):
+        if float(dernier_centroide @ c) >= seuil_similarite:
+            fusionnes[-1].extend(g)
+            dernier_centroide = normalize(
+                X_norm[fusionnes[-1]].mean(axis=0, keepdims=True))[0]
+        else:
+            fusionnes.append(list(g))
+            dernier_centroide = c
+
+    return fusionnes
+
+
+def _verifier_couverture(
+    etape: str,
+    groupes_positions: List[List[int]],
+    n_total: int,
+) -> None:
+    """Contrôle de complétude : les groupes forment une PARTITION exacte de 0..n-1."""
+    a_plat = sorted(p for g in groupes_positions for p in g)
+    if a_plat != list(range(n_total)):
+        manquants = set(range(n_total)) - set(a_plat)
+        doublons = [p for p in a_plat if a_plat.count(p) > 1]
+        raise AssertionError(
+            f"[{etape}] Violation de complétude — manquants: {sorted(manquants)}, "
+            f"doublons: {sorted(set(doublons))}"
+        )
+    print(f"   ✔ [{etape}] complétude vérifiée : {n_total} éléments, "
+          f"{len(groupes_positions)} groupes.")
+
+
+# ==============================================================================
+# 4. PIPELINE PRINCIPAL
+# ==============================================================================
+
+_SEUILS_DEFAUT = {"compact": 0.85, "ultra_compact": 0.75}
+
+def executer_pipeline_tri_fenetre(
+    dictio: Dict[Any, Any],
+    llm,
+    embeddings,
+    mode: Literal['compact', 'ultra_compact'] = 'ultra_compact',
+    n_composantes: int = 3,
+    ponderer_par_variance: bool = True,
+    seuil_similarite: float = None,
+    taille_fenetre: int = 5,
+) -> List[Dict[str, Any]]:
+    """
+    Compression de la V1 par tri ACP multi-directions + fenêtre glissante.
+
+    dictio        : sortie V1, dict {node: FicheVersionGlobale}.
+    llm           : instance ChatOpenAI DÉJÀ initialisée (rédaction uniquement).
+    embeddings    : instance OpenAIEmbeddings DÉJÀ initialisée.
+    mode          : 'compact' (seuil haut, groupes serrés) ou
+                    'ultra_compact' (seuil bas, groupes larges).
+    n_composantes : nombre de directions principales moyennées pour le score de tri.
+    ponderer_par_variance : pondère la moyenne par la variance expliquée de chaque axe.
+    seuil_similarite : override du seuil cosinus (défaut : compact=0.85, ultra=0.75).
+                       BAISSER = fusionne davantage.
+    taille_fenetre  : nb de derniers membres du groupe courant comparés au candidat.
+    """
+    if mode not in _SEUILS_DEFAUT:
+        raise ValueError(f"mode inconnu : '{mode}'. Choix : {list(_SEUILS_DEFAUT)}")
+    seuil = seuil_similarite if seuil_similarite is not None else _SEUILS_DEFAUT[mode]
+
+    chaine_redaction = _prompt_redaction(mode) | llm.with_structured_output(TexteCondense)
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 0 : Indexation à plat (une entrée PAR description) + contrôle initial
+    # --------------------------------------------------------------------------
+    toutes_les_phrases: List[Dict[str, Any]] = []
+    id_compteur = 0
+    for node, fiche in dictio.items():
+        for section in fiche.sections:
+            for description in section.modifications_apportees.descriptions:
+                if not description or not description.strip():
+                    continue
+                toutes_les_phrases.append({
+                    "id": id_compteur,
+                    "phrase": description.strip(),
+                    "node": node,
+                    "codes_dm": list(section.codes_dm),
+                    "chapitre": section.chapitre,
+                })
+                id_compteur += 1
+
+    n = len(toutes_les_phrases)
+    if n == 0:
+        print("⚠️ Aucune description à traiter.")
+        return []
+
+    dm_codes_entree = {dm for it in toutes_les_phrases for dm in it["codes_dm"]}
+    print(f"0️⃣  Indexation : {n} descriptions, {len(dm_codes_entree)} DM codes distincts.")
+
+    if n == 1:
+        seul = toutes_les_phrases[0]
+        return [{
+            "texte_synthese": seul["phrase"],
+            "noeuds_pivots": [seul["node"]],
+            "dm_codes": sorted(seul["codes_dm"]),
+            "chapitres": [seul["chapitre"]],
+            "ids_sources": [seul["id"]],
+        }]
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 1 : Embedding (instances réutilisées) + normalisation L2
+    # --------------------------------------------------------------------------
+    print(f"1️⃣  Vectorisation de {n} descriptions...")
+    X = np.array(embeddings.embed_documents([it["phrase"] for it in toutes_les_phrases]))
+    X_norm = normalize(X)
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 2 : Score 1D = moyenne (pondérée) des projections sur k composantes
+    # --------------------------------------------------------------------------
+    print(f"2️⃣  ACP sur {n_composantes} composante(s), "
+          f"pondération variance={ponderer_par_variance}...")
+    scores = _score_axe_principal(X_norm, n_composantes, ponderer_par_variance)
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 3 : Tri le long de l'axe — traçabilité par indices
+    # --------------------------------------------------------------------------
+    ordre = np.argsort(scores)                       # positions triées
+    assert sorted(ordre.tolist()) == list(range(n)), "Le tri a perdu des éléments."
+    print(f"3️⃣  Tri effectué (permutation vérifiée sur {n} éléments).")
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 4 : Fenêtre glissante sur la séquence triée
+    #           (décision de fusion = similarité cosinus PLEIN espace)
+    # --------------------------------------------------------------------------
+    print(f"4️⃣  Fenêtre glissante (seuil={seuil}, fenêtre={taille_fenetre})...")
+    groupes_pos = _grouper_fenetre_glissante(X_norm, ordre, seuil, taille_fenetre)
+    _verifier_couverture("fenêtre glissante", groupes_pos, n)
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 5 : Fusion des groupes adjacents proches (rattrape les coupes du tri)
+    # --------------------------------------------------------------------------
+    groupes_pos = _fusionner_groupes_adjacents(X_norm, groupes_pos, seuil)
+    _verifier_couverture("fusion adjacents", groupes_pos, n)
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 6 : Rédaction par groupe figé (singletons sans appel LLM)
+    # --------------------------------------------------------------------------
+    print(f"6️⃣  Rédaction de {len(groupes_pos)} groupes...")
+    resultat_final: List[Dict[str, Any]] = []
+
+    for groupe in groupes_pos:
+        membres = [toutes_les_phrases[p] for p in groupe]
+
+        if len(membres) == 1:
+            texte = membres[0]["phrase"]
+        else:
+            input_data = "\n".join(f"- {m['phrase']}" for m in membres)
+            try:
+                texte = chaine_redaction.invoke({"input_data": input_data}).texte
+            except Exception as e:
+                print(f"⚠️ Échec rédaction d'un groupe ({e}). Concaténation de repli.")
+                texte = " / ".join(m["phrase"] for m in membres)
+
+        # Agrégation déterministe : c'est le CODE qui unit, tous les DM sont cités.
+        resultat_final.append({
+            "texte_synthese": texte,
+            "noeuds_pivots": list({m["node"] for m in membres}),
+            "dm_codes": sorted({dm for m in membres for dm in m["codes_dm"]}),
+            "chapitres": sorted({m["chapitre"] for m in membres}),
+            "ids_sources": sorted(m["id"] for m in membres),
+        })
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 7 : Contrôles finaux — chaque description ET chaque DM code cités
+    # --------------------------------------------------------------------------
+    ids_couverts = sorted(i for r in resultat_final for i in r["ids_sources"])
+    assert ids_couverts == list(range(n)), "Des descriptions V1 manquent en sortie."
+
+    dm_codes_sortie = {dm for r in resultat_final for dm in r["dm_codes"]}
+    dm_manquants = dm_codes_entree - dm_codes_sortie
+    assert not dm_manquants, f"DM codes absents de la sortie : {sorted(dm_manquants)}"
+
+    print(f"✅ Compression terminée : {n} descriptions -> {len(resultat_final)} "
+          f"modifications ({mode}). {len(dm_codes_sortie)} DM codes cités "
+          f"({len(dm_codes_entree)} attendus) — complétude OK.")
+    return resultat_final
+
+
+# ==============================================================================
+# 5. UTILISATION
+# ==============================================================================
+if __name__ == "__main__":
+    # --- Tes instances DÉJÀ initialisées ailleurs ---
+    #   llm        = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    #   embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    #
+    # --- dictio provient de la V1 ---
+    #   dictio = generer_comptes_rendus_packs(
+    #                extraire_donnees_utiles(
+    #                    extraire_branches_optimales(racine, 200_000)))
+    #
+    # --- Compression, au choix ---
+    #   v2_soft  = executer_pipeline_tri_fenetre(dictio, llm, embeddings, mode='compact')
+    #   v2_ultra = executer_pipeline_tri_fenetre(dictio, llm, embeddings, mode='ultra_compact')
+    #
+    # --- Réglages ---
+    #   BAISSER seuil_similarite -> fusionne davantage (moins de modifs en sortie).
+    #   AUGMENTER n_composantes  -> tri plus fidèle à la structure des données.
+    #   AUGMENTER taille_fenetre -> chaînage plus tolérant dans un même groupe.
+    #   v2 = executer_pipeline_tri_fenetre(
+    #            dictio, llm, embeddings, mode='ultra_compact',
+    #            n_composantes=5, seuil_similarite=0.70, taille_fenetre=8)
+    pass
