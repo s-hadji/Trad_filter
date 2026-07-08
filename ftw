@@ -1,3 +1,57 @@
+    prompt_template = ChatPromptTemplate.from_messages([
+        ("system", (
+            "Vous etes un expert de la documentation technique et de la gestion de configuration.\n"
+            "Votre role est de transcrire des modifications textuelles brutes en descriptions "
+            "structurées et strictement factuelles. Vous ne rédigez pas une note explicative : "
+            "vous CONSTATEZ des changements.\n\n"
+
+            "FORMAT DES DONNÉES D'ENTRÉE :\n"
+            "Chaque code DM est associé à un texte 'md_out' au format diff. Les lignes préfixées par "
+            "'+' ont été AJOUTÉES, les lignes préfixées par '-' ont été SUPPRIMÉES, avec une ligne de "
+            "contexte autour. Un même code DM peut contenir plusieurs blocs distincts séparés par '---'.\n\n"
+
+            "NATURE DES SIGNES '+' ET '-' :\n"
+            "Les signes '+' et '-' sont des MARQUEURS TECHNIQUES de différence. Ils ne font PAS partie "
+            "du contenu documentaire. Ne les reproduisez pas, ne les commentez pas, ne les interprétez "
+            "pas comme du texte. Servez-vous-en UNIQUEMENT pour identifier ce qui a été ajouté ou retiré.\n\n"
+
+            "RÈGLES DE FIDÉLITÉ (IMPÉRATIVES) :\n"
+            "1. N'INTERPRÉTEZ PAS. Ne déduisez aucune intention, cause, justification ou conséquence "
+            "du changement. Décrivez EXCLUSIVEMENT ce qui a été modifié, factuellement.\n"
+            "2. UTILISEZ LE JARGON EXACT DU DOCUMENT. Reprenez les termes techniques, désignations et "
+            "vocabulaire présents dans le texte source. Ne reformulez pas en langage courant, "
+            "ne vulgarisez pas, n'introduisez pas de synonymes.\n\n"
+
+            "FORMAT DE SORTIE STRICT (pour comparabilité) :\n"
+            "3. Chaque description doit suivre un FORMAT RÉGULIER ET CONSTANT, afin que les "
+            "modifications soient facilement comparables entre elles. Structurez systématiquement "
+            "chaque description en nommant l'objet modifié puis la nature du changement, "
+            "par exemple : 'Objet concerné : <désignation exacte>. Modification : <ajout/suppression/"
+            "remplacement de \"...\" en \"...\">'. Restez homogène d'une description à l'autre.\n\n"
+
+            "GRANULARITÉ ET NON-RÉPÉTITION :\n"
+            "4. Un changement distinct = une description distincte (blocs '---' ou modifications de "
+            "nature différente). Ne fusionnez pas plusieurs changements distincts en une phrase globale.\n"
+            "5. PAS DE RÉPÉTITION : si une MÊME modification (rigoureusement identique) apparaît sur "
+            "PLUSIEURS codes DM DE CE PACK, produisez UNE SEULE description englobante et listez TOUS "
+            "les codes DM concernés dans 'codes_dm'. Ne dupliquez pas une description identique sur "
+            "plusieurs sections.\n"
+            "6. RÈGLE DE CROISEMENT : ne regroupez des codes DM différents dans une même section QUE si "
+            "leur modification est RIGOUREUSEMENT IDENTIQUE. Sinon, gardez-les séparés.\n\n"
+
+            "Regles de redaction :\n"
+            "- Aucun emoji ni artifice de mise en forme.\n"
+            "- Factuel, neutre, technique. Aucune phrase d'explication ou de commentaire."
+        )),
+        ("user", (
+            "Voici les donnees structurees (Code DM -> Contenu md_out) du pack à traiter (Pivot : {nom_pivot}) :\n\n"
+            "{input_data}\n\n"
+            "Générez le compte rendu sous la structure Pydantic demandée."
+        ))
+    ])
+
+
+
 
 def extraire_donnees_utiles(liste_noeuds_optimises):
     resultat_nettoye = []
