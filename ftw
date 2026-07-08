@@ -1,5 +1,458 @@
 """
 ==============================================================================
+ PIPELINE V2 — CONDENSATION EN TROIS TEMPS
+==============================================================================
+ Entrée  : dictio (== resultat_analyse == V1), dict {node: FicheVersionGlobale}
+           + instances llm / embeddings DÉJÀ initialisées (réutilisées telles quelles)
+ Sortie  : liste de modifications condensées, chacune traçable vers TOUS ses
+           nodes-pivots, codes DM et chapitres d'origine.
+
+ ARCHITECTURE (le LLM décide, le code garantit) :
+
+   Clustering (pré-tri grossier par embeddings)
+        |
+   TEMPS 1  - LLM par cluster : STRUCTURE de groupement pure ([[ids]]),
+              AUCUNE rédaction. Complétude vérifiée et réparée par code.
+        |
+   TEMPS 2  - Consolidation déterministe (union-find sur chevauchements)
+            + re-regroupement itératif : passes LLM globales sur les
+              représentants de groupes, par lots, jusqu'à stabilité.
+        |
+   TEMPS 3  - Rédaction LLM par groupe FIGÉ (fidèle + couvrant, format
+              standard). Singletons repris tels quels, sans appel LLM.
+        |
+   Agrégation déterministe : union nodes / DM codes / chapitres par groupe.
+   Garantie : chaque description de la V1 appartient à EXACTEMENT un groupe.
+==============================================================================
+"""
+
+from typing import List, Dict, Any, Literal
+from collections import defaultdict
+import numpy as np
+from pydantic import BaseModel, Field
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.preprocessing import normalize
+from langchain_core.prompts import ChatPromptTemplate
+
+
+# ==============================================================================
+# 1. SCHÉMAS PYDANTIC
+# ==============================================================================
+
+class StructureGroupement(BaseModel):
+    """Sortie des temps 1 et 2 : uniquement des groupes d'identifiants."""
+    groupes: List[List[int]] = Field(
+        description=(
+            "Liste de groupes. Chaque groupe est la liste des identifiants des éléments "
+            "regroupables ensemble. Un élément non regroupable forme un groupe à un seul "
+            "identifiant. CHAQUE identifiant d'entrée doit apparaître dans EXACTEMENT un groupe."
+        )
+    )
+
+class TexteCondense(BaseModel):
+    """Sortie du temps 3 : le texte unique d'un groupe figé."""
+    texte: str = Field(
+        description=(
+            "Le texte condensé unique du groupe, fidèle au libellé d'origine et couvrant "
+            "l'intégralité de l'information de chaque description du groupe."
+        )
+    )
+
+
+# ==============================================================================
+# 2. PROMPTS
+# ==============================================================================
+
+# --- Critère de regroupement selon le mode (partagé temps 1 et temps 2) ---
+_CRITERE_COMPACT = (
+    "CRITÈRE DE REGROUPEMENT (STRICT) : deux éléments sont regroupables UNIQUEMENT s'ils "
+    "décrivent la MÊME modification, de MÊME NATURE et portant sur le MÊME objet. "
+    "Si l'objet, la valeur ou la nuance diffèrent, ils ne sont PAS regroupables."
+)
+_CRITERE_ULTRA = (
+    "CRITÈRE DE REGROUPEMENT (LARGE) : deux éléments sont regroupables s'ils décrivent une "
+    "modification de MÊME NATURE (ex. un ajout avec un ajout, une suppression avec une "
+    "suppression), MÊME SI les objets ou valeurs concernés diffèrent. "
+    "Seules des natures VRAIMENT différentes (un ajout et une suppression) ne se regroupent pas."
+)
+
+def _prompt_groupement(critere: str) -> ChatPromptTemplate:
+    """TEMPS 1 : groupement intra-cluster. Structure pure, aucune rédaction."""
+    return ChatPromptTemplate.from_messages([
+        ("system", (
+            "Vous êtes un assistant de CLASSIFICATION. Votre unique tâche est de dire quels "
+            "éléments vont ensemble. Vous ne rédigez RIEN, vous ne reformulez RIEN, vous ne "
+            "produisez AUCUN texte : uniquement des groupes d'identifiants.\n\n"
+            + critere + "\n\n"
+            "RÈGLES DE SORTIE (IMPÉRATIVES) :\n"
+            "1. CHAQUE identifiant fourni en entrée doit apparaître dans EXACTEMENT UN groupe "
+            "de votre sortie. Aucun oubli, aucun doublon, aucun identifiant inventé.\n"
+            "2. Un élément non regroupable forme un groupe à lui seul.\n"
+            "3. Ne vous préoccupez PAS de la formulation future : seulement de QUI VA AVEC QUI."
+        )),
+        ("user", "Voici les éléments à classer :\n\n{input_data}")
+    ])
+
+def _prompt_regroupement_global(critere: str) -> ChatPromptTemplate:
+    """TEMPS 2 : re-regroupement entre groupes (sur leurs représentants)."""
+    return ChatPromptTemplate.from_messages([
+        ("system", (
+            "Vous êtes un assistant de CLASSIFICATION. On vous fournit des GROUPES déjà "
+            "constitués, chacun représenté par une description type et identifié par un numéro. "
+            "Votre unique tâche est de dire quels GROUPES doivent être fusionnés entre eux. "
+            "Vous ne rédigez RIEN : uniquement des groupes de numéros.\n\n"
+            + critere + "\n\n"
+            "RÈGLES DE SORTIE (IMPÉRATIVES) :\n"
+            "1. CHAQUE numéro de groupe fourni doit apparaître dans EXACTEMENT UN groupe de "
+            "votre sortie. Aucun oubli, aucun doublon, aucun numéro inventé.\n"
+            "2. Un groupe qui ne fusionne avec aucun autre reste seul.\n"
+            "3. En cas de doute, NE fusionnez PAS."
+        )),
+        ("user", "Voici les groupes à examiner :\n\n{input_data}")
+    ])
+
+def _prompt_redaction(mode: str) -> ChatPromptTemplate:
+    """TEMPS 3 : rédaction du texte condensé d'un groupe figé."""
+    exigence_mode = (
+        "Produisez UNE modification englobante unique qui ÉNUMÈRE EXHAUSTIVEMENT tous les "
+        "objets et toutes les valeurs concernés (union complète, aucun élément omis). "
+        "Exemple : 'ajout de rep. 4, 2' + 'ajout de rep. 1, 3' => 'ajout de rep. 1, 2, 3, 4'."
+        if mode == "ultra_compact" else
+        "Produisez le plus petit texte à la fois fidèle au libellé des sources et couvrant "
+        "de toute leur information."
+    )
+    return ChatPromptTemplate.from_messages([
+        ("system", (
+            "Vous êtes un rédacteur technique. On vous fournit un groupe de descriptions de "
+            "modifications qui ont DÉJÀ été jugées regroupables : votre tâche est d'en produire "
+            "LE texte condensé unique. Le périmètre du groupe est FIGÉ, ne le remettez pas en cause.\n\n"
+            + exigence_mode + "\n\n"
+            "RÈGLES (IMPÉRATIVES) :\n"
+            "1. FIDÉLITÉ : restez AU PLUS PRÈS DU LIBELLÉ D'ORIGINE. Reprenez mot pour mot les "
+            "formulations là où elles coïncident. Ne paraphrasez pas, pas de synonymes. Préservez "
+            "le jargon technique exact, y compris les termes anglais (GATM, GSE, GPS, Dorsal...).\n"
+            "2. COUVERTURE EXHAUSTIVE : le texte couvre l'INTÉGRALITÉ de l'information de CHAQUE "
+            "description. Toute valeur présente dans une seule description DOIT figurer au résultat.\n"
+            "3. N'INTERPRÉTEZ PAS : ni intention, ni cause, ni conséquence. Constatez.\n"
+            "4. Format régulier, clair pour un humain, sans emoji ni artifice de mise en forme."
+        )),
+        ("user", "Voici les descriptions du groupe à condenser :\n\n{input_data}")
+    ])
+
+_CRITERES = {"compact": _CRITERE_COMPACT, "ultra_compact": _CRITERE_ULTRA}
+_SEUILS_DEFAUT = {"compact": 0.15, "ultra_compact": 0.35}
+
+
+# ==============================================================================
+# 3. OUTILS DÉTERMINISTES
+# ==============================================================================
+
+def _controler_et_reparer_groupes(
+    groupes_llm: List[List[int]],
+    ids_attendus: List[int],
+) -> List[List[int]]:
+    """
+    Garantit par code la partition exacte des ids :
+      - id inventé (hors entrée)      -> supprimé ;
+      - id en double (plusieurs groupes) -> conservé dans son premier groupe ;
+      - id oublié                     -> réinjecté en singleton.
+    """
+    attendus = set(ids_attendus)
+    vus = set()
+    groupes_propres: List[List[int]] = []
+
+    for groupe in groupes_llm:
+        propre = []
+        for i in groupe:
+            if i in attendus and i not in vus:
+                propre.append(i)
+                vus.add(i)
+        if propre:
+            groupes_propres.append(propre)
+
+    oublies = attendus - vus
+    for i in sorted(oublies):
+        groupes_propres.append([i])
+
+    return groupes_propres
+
+
+def _union_find_fusion(groupes: List[List[int]]) -> List[List[int]]:
+    """Fusionne transitivement tout groupe partageant au moins un id."""
+    parent: Dict[int, int] = {}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for g in groupes:
+        for i in g:
+            parent.setdefault(i, i)
+    for g in groupes:
+        for autre in g[1:]:
+            union(g[0], autre)
+
+    par_racine: Dict[int, List[int]] = defaultdict(list)
+    for i in parent:
+        par_racine[find(i)].append(i)
+    return [sorted(v) for v in par_racine.values()]
+
+
+# ==============================================================================
+# 4. PIPELINE PRINCIPAL
+# ==============================================================================
+
+def executer_pipeline_condensation(
+    dictio: Dict[Any, Any],
+    llm,
+    embeddings,
+    mode: Literal['compact', 'ultra_compact'] = 'ultra_compact',
+    distance_threshold: float = None,
+    max_iterations_regroupement: int = 3,
+    taille_lot: int = 80,
+) -> List[Dict[str, Any]]:
+    """
+    Condense la V1 (dictio) en une vue par modification, en trois temps.
+
+    dictio      : sortie V1, dict {node: FicheVersionGlobale}.
+    llm         : instance ChatOpenAI DÉJÀ initialisée.
+    embeddings  : instance OpenAIEmbeddings DÉJÀ initialisée.
+    mode        : 'compact' (prudent) ou 'ultra_compact' (agressif).
+    distance_threshold : override du seuil de clustering (défaut selon mode).
+    max_iterations_regroupement : nb max de passes globales du temps 2.
+    taille_lot  : nb max de représentants par appel LLM au temps 2.
+    """
+    if mode not in _CRITERES:
+        raise ValueError(f"mode inconnu : '{mode}'. Choix : {list(_CRITERES)}")
+
+    critere = _CRITERES[mode]
+    seuil = distance_threshold if distance_threshold is not None else _SEUILS_DEFAUT[mode]
+
+    chaine_groupement = _prompt_groupement(critere) | llm.with_structured_output(StructureGroupement)
+    chaine_global = _prompt_regroupement_global(critere) | llm.with_structured_output(StructureGroupement)
+    chaine_redaction = _prompt_redaction(mode) | llm.with_structured_output(TexteCondense)
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 0 : Indexation à plat — UNE entrée PAR description, id traçable.
+    # --------------------------------------------------------------------------
+    toutes_les_phrases: List[Dict[str, Any]] = []
+    id_compteur = 0
+    for node, fiche in dictio.items():
+        for section in fiche.sections:
+            for description in section.modifications_apportees.descriptions:
+                if not description or not description.strip():
+                    continue
+                toutes_les_phrases.append({
+                    "id": id_compteur,
+                    "phrase": description.strip(),
+                    "node": node,
+                    "codes_dm": list(section.codes_dm),
+                    "chapitre": section.chapitre,
+                })
+                id_compteur += 1
+
+    if not toutes_les_phrases:
+        print("⚠️ Aucune description à traiter.")
+        return []
+
+    map_origine = {item["id"]: item for item in toutes_les_phrases}
+    tous_les_ids = [item["id"] for item in toutes_les_phrases]
+
+    if len(toutes_les_phrases) == 1:
+        seul = toutes_les_phrases[0]
+        return [{
+            "texte_synthese": seul["phrase"],
+            "noeuds_pivots": [seul["node"]],
+            "dm_codes": sorted(seul["codes_dm"]),
+            "chapitres": [seul["chapitre"]],
+            "ids_sources": [seul["id"]],
+        }]
+
+    # --------------------------------------------------------------------------
+    # PRÉ-TRI : clustering grossier par embeddings (limite la taille des appels
+    # du temps 1 ; le temps 2 rattrapera le trans-cluster).
+    # --------------------------------------------------------------------------
+    print(f"🧬 Vectorisation de {len(toutes_les_phrases)} descriptions...")
+    X = np.array(embeddings.embed_documents([it["phrase"] for it in toutes_les_phrases]))
+    X_norm = normalize(X)
+
+    print(f"🤖 Clustering (mode='{mode}', distance_threshold={seuil})...")
+    model = AgglomerativeClustering(
+        n_clusters=None, metric='cosine', linkage='average', distance_threshold=seuil,
+    )
+    labels = model.fit_predict(X_norm)
+
+    clusters: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for idx, label in enumerate(labels):
+        clusters[int(label)].append(toutes_les_phrases[idx])
+    print(f"📦 {len(clusters)} clusters de pré-tri.")
+
+    # --------------------------------------------------------------------------
+    # TEMPS 1 : groupement structurel intra-cluster (LLM ne rédige rien).
+    #           Complétude garantie par _controler_et_reparer_groupes.
+    # --------------------------------------------------------------------------
+    print("1️⃣  Temps 1 : groupement structurel par cluster...")
+    groupes_ids: List[List[int]] = []
+
+    for items in clusters.values():
+        if len(items) == 1:
+            groupes_ids.append([items[0]["id"]])
+            continue
+
+        input_data = "\n".join(f"[ID {it['id']}] : {it['phrase']}" for it in items)
+        ids_cluster = [it["id"] for it in items]
+        try:
+            structure = chaine_groupement.invoke({"input_data": input_data})
+            groupes_ids.extend(_controler_et_reparer_groupes(structure.groupes, ids_cluster))
+        except Exception as e:
+            print(f"⚠️ Échec groupement d'un cluster ({e}). Éléments conservés en singletons.")
+            groupes_ids.extend([[i] for i in ids_cluster])
+
+    print(f"   -> {len(groupes_ids)} groupes après temps 1.")
+
+    # --------------------------------------------------------------------------
+    # TEMPS 2 : consolidation déterministe + re-regroupement global itératif.
+    # --------------------------------------------------------------------------
+    print("2️⃣  Temps 2 : consolidation et re-regroupement global...")
+
+    # 2a. Union-find : fusionne tout chevauchement d'ids (déterministe, gratuit).
+    groupes_ids = _union_find_fusion(groupes_ids)
+
+    # 2b. Passes LLM globales sur les représentants, par lots, jusqu'à stabilité.
+    for iteration in range(max_iterations_regroupement):
+        nb_avant = len(groupes_ids)
+        if nb_avant <= 1:
+            break
+
+        # Représentant d'un groupe = sa description la plus longue (la plus riche).
+        representants = [
+            max((map_origine[i]["phrase"] for i in groupe), key=len)
+            for groupe in groupes_ids
+        ]
+
+        # Découpage en lots pour tenir dans le contexte.
+        nouveaux_groupes: List[List[int]] = []
+        for debut in range(0, len(groupes_ids), taille_lot):
+            lot_indices = list(range(debut, min(debut + taille_lot, len(groupes_ids))))
+            if len(lot_indices) == 1:
+                nouveaux_groupes.append(groupes_ids[lot_indices[0]])
+                continue
+
+            input_data = "\n".join(
+                f"[G {gi}] : {representants[gi]}" for gi in lot_indices
+            )
+            try:
+                structure = chaine_global.invoke({"input_data": input_data})
+                meta_groupes = _controler_et_reparer_groupes(structure.groupes, lot_indices)
+            except Exception as e:
+                print(f"⚠️ Échec re-regroupement d'un lot ({e}). Lot conservé tel quel.")
+                meta_groupes = [[gi] for gi in lot_indices]
+
+            for meta in meta_groupes:
+                fusion: List[int] = []
+                for gi in meta:
+                    fusion.extend(groupes_ids[gi])
+                nouveaux_groupes.append(sorted(set(fusion)))
+
+        groupes_ids = _union_find_fusion(nouveaux_groupes)
+        print(f"   itération {iteration + 1} : {nb_avant} -> {len(groupes_ids)} groupes.")
+
+        if len(groupes_ids) == nb_avant:
+            break  # stabilité atteinte
+
+    print(f"   -> {len(groupes_ids)} groupes finaux après temps 2.")
+
+    # --------------------------------------------------------------------------
+    # TEMPS 3 : rédaction par groupe figé (singletons sans appel LLM).
+    # --------------------------------------------------------------------------
+    print("3️⃣  Temps 3 : rédaction des textes condensés...")
+    resultat_final: List[Dict[str, Any]] = []
+
+    for groupe in groupes_ids:
+        membres = [map_origine[i] for i in groupe]
+
+        if len(membres) == 1:
+            texte = membres[0]["phrase"]
+        else:
+            input_data = "\n".join(f"- {m['phrase']}" for m in membres)
+            try:
+                texte = chaine_redaction.invoke({"input_data": input_data}).texte
+            except Exception as e:
+                # Garde-fou : à défaut de condensé, on concatène (rien n'est perdu).
+                print(f"⚠️ Échec rédaction d'un groupe ({e}). Concaténation de repli.")
+                texte = " / ".join(m["phrase"] for m in membres)
+
+        # Agrégation déterministe de la traçabilité : le CODE fait l'union,
+        # pas le LLM -> tous les DM sont cités, à coup sûr.
+        noeuds = {m["node"] for m in membres}
+        codes_dm = sorted({dm for m in membres for dm in m["codes_dm"]})
+        chapitres = sorted({m["chapitre"] for m in membres})
+
+        resultat_final.append({
+            "texte_synthese": texte,
+            "noeuds_pivots": list(noeuds),
+            "dm_codes": codes_dm,
+            "chapitres": chapitres,
+            "ids_sources": sorted(groupe),
+        })
+
+    # --------------------------------------------------------------------------
+    # CONTRÔLE FINAL DE COMPLÉTUDE (doit toujours passer, par construction).
+    # --------------------------------------------------------------------------
+    ids_couverts = sorted(i for r in resultat_final for i in r["ids_sources"])
+    assert ids_couverts == sorted(tous_les_ids), (
+        "Violation de complétude : certaines descriptions V1 ne sont pas couvertes."
+    )
+
+    print(f"✅ Condensation terminée : {len(toutes_les_phrases)} descriptions "
+          f"-> {len(resultat_final)} modifications ({mode}).")
+    return resultat_final
+
+
+# ==============================================================================
+# 5. UTILISATION
+# ==============================================================================
+if __name__ == "__main__":
+    # --- Tes instances DÉJÀ initialisées ailleurs ---
+    #   llm        = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    #   embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    #
+    # --- dictio provient de la V1 ---
+    #   dictio = generer_comptes_rendus_packs(
+    #                extraire_donnees_utiles(
+    #                    extraire_branches_optimales(racine, 200_000)))
+    #
+    # --- Les deux versions du document final ---
+    #   Version exhaustive : dictio lui-même (aucune fusion).
+    #   Version condensée, au choix :
+    #   v2_soft  = executer_pipeline_condensation(dictio, llm, embeddings, mode='compact')
+    #   v2_ultra = executer_pipeline_condensation(dictio, llm, embeddings, mode='ultra_compact')
+    #
+    # --- Réglages avancés ---
+    #   v2 = executer_pipeline_condensation(
+    #            dictio, llm, embeddings,
+    #            mode='ultra_compact',
+    #            distance_threshold=0.45,          # clustering plus large
+    #            max_iterations_regroupement=5,    # plus de passes globales
+    #            taille_lot=60)                    # lots plus petits si contexte serré
+    pass
+
+
+
+
+
+
+
+
+"""
+==============================================================================
  PIPELINE V2 — CONDENSATION PAR MODIFICATION
 ==============================================================================
  Entrée  : dictio  (== resultat_analyse == V1)
