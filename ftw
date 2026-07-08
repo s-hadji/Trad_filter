@@ -1,3 +1,301 @@
+"""
+==============================================================================
+ PIPELINE V2 — CONDENSATION PAR MODIFICATION
+==============================================================================
+ Entrée  : dictio  (== resultat_analyse == V1)
+           dict {node: FicheVersionGlobale}
+ Sortie  : liste de modifications uniques, chacune traçable vers ses
+           nodes-pivots, ses codes DM et ses chapitres d'origine.
+
+ Principe :
+   1. On indexe CHAQUE description individuellement (pas seulement [0]),
+      chaque entrée recevant un `id` qui est son fil d'Ariane vers son origine.
+   2. On vectorise, on clusterise (stratégie modulaire).
+   3. Un LLM fusionne les descriptions équivalentes d'un même cluster en
+      restant AU PLUS PRÈS du libellé d'origine (fidèle) tout en COUVRANT
+      l'intégralité de leur information. Il laisse séparé ce qui diffère.
+   4. On réagrège la traçabilité (nodes / DM / chapitres) en suivant les ids.
+==============================================================================
+"""
+
+from typing import List, Dict, Any, Literal
+import numpy as np
+from pydantic import BaseModel, Field
+from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
+from sklearn.preprocessing import normalize
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+
+
+# ==============================================================================
+# 1. SCHÉMAS PYDANTIC
+# ==============================================================================
+
+class ModificationFusionnee(BaseModel):
+    texte_fusionne: str = Field(
+        description=(
+            "Le texte condensé de la modification. Lorsqu'il fusionne plusieurs "
+            "descriptions équivalentes, il reste au plus près de leur libellé "
+            "d'origine tout en couvrant l'intégralité de leur information."
+        )
+    )
+    ids_sources: List[int] = Field(
+        description="Liste des IDs numériques originaux fusionnés dans ce texte."
+    )
+
+class RapportClusterFusion(BaseModel):
+    elements_fusionnes: List[ModificationFusionnee]
+
+
+# ==============================================================================
+# 2. PROMPT DE FUSION (fidèle + couvrant)
+# ==============================================================================
+
+_PROMPT_FUSION = ChatPromptTemplate.from_messages([
+    ("system", (
+        "Vous êtes un assistant spécialisé dans la déduplication de modifications techniques.\n"
+        "On vous fournit un groupe (cluster) de descriptions de modifications sémantiquement "
+        "proches, chacune précédée de son [ID].\n\n"
+
+        "OBJECTIF : condenser ce groupe sans perdre d'information et sans reformuler inutilement.\n\n"
+
+        "RÈGLES DE FUSION :\n"
+        "1. Regroupez ensemble UNIQUEMENT les descriptions équivalentes, c'est-à-dire celles qui "
+        "décrivent la même modification de même nature.\n"
+        "2. FIDÉLITÉ : pour un groupe équivalent, le texte fusionné doit rester STRICTEMENT AU PLUS "
+        "PRÈS DU LIBELLÉ D'ORIGINE. Reprenez mot pour mot les formulations là où elles coïncident. "
+        "Ne paraphrasez pas, ne réécrivez pas dans un autre style, n'introduisez pas de synonymes. "
+        "Conservez le jargon technique exact des descriptions sources.\n"
+        "3. COUVERTURE : le texte fusionné doit couvrir l'INTÉGRALITÉ de l'information présente dans "
+        "CHACUNE des descriptions du groupe. Si l'une contient une précision, une donnée ou une "
+        "nuance absente des autres, cette information DOIT être conservée. Ne supprimez jamais une "
+        "information au nom de la concision.\n"
+        "4. En résumé : le texte fusionné est le PLUS PETIT texte qui soit À LA FOIS fidèle au "
+        "libellé des sources ET couvrant de toute leur information.\n"
+        "5. N'INTERPRÉTEZ PAS : ne déduisez ni intention, ni cause, ni conséquence. Constatez.\n"
+        "6. Pour chaque texte fusionné, vous DEVEZ lister TOUS les [ID] d'origine qui le composent.\n"
+        "7. Si des descriptions expriment des modifications RÉELLEMENT DIFFÉRENTES (nuances métier "
+        "distinctes, objets différents, données divergentes), NE les fusionnez PAS : laissez chacune "
+        "comme élément séparé en conservant son [ID].\n\n"
+
+        "Règles de rédaction :\n"
+        "- Aucun emoji ni artifice de mise en forme.\n"
+        "- Factuel, neutre, technique."
+    )),
+    ("user", "Voici les modifications du cluster courant à traiter :\n\n{input_data}")
+])
+
+
+# ==============================================================================
+# 3. PIPELINE V2
+# ==============================================================================
+
+def executer_pipeline_clustering(
+    dictio: Dict[Any, Any],
+    strategy: Literal['kmeans', 'dbscan', 'agglomerative'] = 'agglomerative',
+    strategy_kwargs: Dict[str, Any] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Condense la V1 (dictio) en une vue par modification (V2).
+
+    strategy : 'kmeans' | 'dbscan' | 'agglomerative' (défaut : agglomerative,
+               le plus adapté quand on ignore le nombre de modifs distinctes).
+    """
+    if strategy_kwargs is None:
+        strategy_kwargs = {}
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 1 : Indexation à plat — UNE entrée PAR description
+    #           Chaque `id` mémorise l'origine complète (node / DM / chapitre).
+    # --------------------------------------------------------------------------
+    toutes_les_phrases = []
+    id_compteur = 0
+
+    for node, fiche in dictio.items():
+        for section in fiche.sections:
+            for description in section.modifications_apportees.descriptions:
+                if not description or not description.strip():
+                    continue
+                toutes_les_phrases.append({
+                    "id": id_compteur,
+                    "phrase": description.strip(),
+                    "node": node,
+                    "codes_dm": list(section.codes_dm),
+                    "chapitre": section.chapitre,
+                })
+                id_compteur += 1
+
+    if not toutes_les_phrases:
+        print("⚠️ Aucune description à traiter.")
+        return []
+
+    # Cas limite : une seule description -> pas de clustering ni de LLM.
+    if len(toutes_les_phrases) == 1:
+        seul = toutes_les_phrases[0]
+        return [{
+            "texte_synthese": seul["phrase"],
+            "noeuds_pivots": [seul["node"]],
+            "dm_codes": list(seul["codes_dm"]),
+            "chapitres": [seul["chapitre"]],
+            "ids_sources": [seul["id"]],
+        }]
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 2 : Vectorisation (similarité cosinus -> normalisation L2)
+    # --------------------------------------------------------------------------
+    print(f"🧬 Vectorisation de {len(toutes_les_phrases)} descriptions...")
+    embeddings_model = OpenAIEmbeddings(model="text-embedding-3-small")
+    phrases_textes = [item["phrase"] for item in toutes_les_phrases]
+    X = np.array(embeddings_model.embed_documents(phrases_textes))
+    X_norm = normalize(X)
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 3 : Clustering (stratégie modulaire)
+    # --------------------------------------------------------------------------
+    print(f"🤖 Clustering : strategy='{strategy}'...")
+
+    if strategy == 'kmeans':
+        n_clusters = strategy_kwargs.pop('n_clusters', max(2, len(phrases_textes) // 3))
+        model = KMeans(n_clusters=n_clusters, random_state=42, n_init=10, **strategy_kwargs)
+        labels = model.fit_predict(X_norm)
+
+    elif strategy == 'dbscan':
+        eps = strategy_kwargs.pop('eps', 0.3)
+        min_samples = strategy_kwargs.pop('min_samples', 1)
+        model = DBSCAN(eps=eps, min_samples=min_samples, metric='cosine', **strategy_kwargs)
+        labels = model.fit_predict(X_norm)
+
+    elif strategy == 'agglomerative':
+        # distance_threshold bas = fusionne seulement les très proches.
+        # 0.15 sur du cosinus est prudent (adapté à un format de sortie homogène).
+        distance_threshold = strategy_kwargs.pop('distance_threshold', 0.15)
+        model = AgglomerativeClustering(
+            n_clusters=None,
+            metric='cosine',
+            linkage='average',
+            distance_threshold=distance_threshold,
+            **strategy_kwargs
+        )
+        labels = model.fit_predict(X_norm)
+    else:
+        raise ValueError(f"Stratégie de clustering '{strategy}' inconnue.")
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 4 : Groupement par cluster (bruit DBSCAN -> cluster singleton)
+    # --------------------------------------------------------------------------
+    clusters: Dict[int, List[Dict[str, Any]]] = {}
+    noise_counter = -1
+    for idx, label in enumerate(labels):
+        if label == -1:                 # bruit DBSCAN = point isolé
+            cluster_id = noise_counter
+            noise_counter -= 1
+        else:
+            cluster_id = int(label)
+        clusters.setdefault(cluster_id, []).append(toutes_les_phrases[idx])
+
+    print(f"📦 {len(clusters)} clusters générés.")
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 5 : Fusion par cluster via LLM (singleton -> pas d'appel)
+    # --------------------------------------------------------------------------
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    chaine = _PROMPT_FUSION | llm.with_structured_output(RapportClusterFusion)
+
+    elements_fusionnes_llm: List[ModificationFusionnee] = []
+
+    for items in clusters.values():
+        # Optimisation : un seul élément -> rien à fusionner, on le reprend tel quel.
+        if len(items) == 1:
+            seul = items[0]
+            elements_fusionnes_llm.append(
+                ModificationFusionnee(texte_fusionne=seul["phrase"],
+                                      ids_sources=[seul["id"]])
+            )
+            continue
+
+        input_data = "\n".join(f"[ID {it['id']}] : {it['phrase']}" for it in items)
+        try:
+            resultat = chaine.invoke({"input_data": input_data})
+            elements_fusionnes_llm.extend(resultat.elements_fusionnes)
+        except Exception as e:
+            # Garde-fou : en cas d'échec LLM, on ne perd rien -> on garde les items bruts.
+            print(f"⚠️ Échec fusion d'un cluster ({e}). Items conservés séparément.")
+            for it in items:
+                elements_fusionnes_llm.append(
+                    ModificationFusionnee(texte_fusionne=it["phrase"],
+                                          ids_sources=[it["id"]])
+                )
+
+    # --------------------------------------------------------------------------
+    # ÉTAPE 6 : Réagrégation — on suit chaque id vers son origine
+    # --------------------------------------------------------------------------
+    print("🎯 Reconstruction de la traçabilité...")
+    map_origine = {item["id"]: item for item in toutes_les_phrases}
+    resultat_final: List[Dict[str, Any]] = []
+
+    for item_fusionne in elements_fusionnes_llm:
+        noeuds, codes_dm, chapitres = set(), set(), set()
+        ids_valides = []
+
+        for id_src in item_fusionne.ids_sources:
+            origine = map_origine.get(id_src)
+            if origine is None:                 # garde-fou : id halluciné par le LLM
+                continue
+            noeuds.add(origine["node"])
+            codes_dm.update(origine["codes_dm"])
+            chapitres.add(origine["chapitre"])
+            ids_valides.append(id_src)
+
+        if not ids_valides:                     # aucune source valide -> on saute
+            continue
+
+        resultat_final.append({
+            "texte_synthese": item_fusionne.texte_fusionne,
+            "noeuds_pivots": list(noeuds),
+            "dm_codes": list(codes_dm),
+            "chapitres": list(chapitres),
+            "ids_sources": ids_valides,
+        })
+
+    # --------------------------------------------------------------------------
+    # GARDE-FOU DE COMPLÉTUDE : aucune description d'origine ne doit disparaître.
+    # Tout id non couvert par le LLM est réinjecté tel quel.
+    # --------------------------------------------------------------------------
+    ids_couverts = {i for r in resultat_final for i in r["ids_sources"]}
+    ids_manquants = set(map_origine) - ids_couverts
+    if ids_manquants:
+        print(f"⚠️ {len(ids_manquants)} description(s) non couverte(s) réinjectée(s).")
+        for id_src in sorted(ids_manquants):
+            o = map_origine[id_src]
+            resultat_final.append({
+                "texte_synthese": o["phrase"],
+                "noeuds_pivots": [o["node"]],
+                "dm_codes": list(o["codes_dm"]),
+                "chapitres": [o["chapitre"]],
+                "ids_sources": [id_src],
+            })
+
+    print(f"✅ V2 terminée : {len(resultat_final)} modifications uniques.")
+    return resultat_final
+
+
+# ==============================================================================
+# 4. UTILISATION
+# ==============================================================================
+if __name__ == "__main__":
+    # dictio provient de la V1 :
+    #   dictio = generer_comptes_rendus_packs(
+    #                extraire_donnees_utiles(
+    #                    extraire_branches_optimales(racine, 200_000)))
+    #
+    # v2 = executer_pipeline_clustering(dictio)
+    # v2 = executer_pipeline_clustering(dictio, strategy='dbscan', strategy_kwargs={'eps': 0.25})
+    pass
+
+
+
+
+
     prompt_template = ChatPromptTemplate.from_messages([
         ("system", (
             "Vous etes un expert de la documentation technique et de la gestion de configuration.\n"
