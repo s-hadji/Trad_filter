@@ -1,330 +1,97 @@
 
 """
 ==============================================================================
- PIPELINE V2 — CONDENSATION PAR PASSES SUCCESSIVES (TRI ACP + FENÊTRES)
+ ÉTAPE 1 — LISTER, TRIER (ACP n composantes), TRACKER
 ==============================================================================
- Principe (simple, itératif) :
-
-   PASSE k :
-     1. Embedding des textes courants (instances RÉUTILISÉES)
-     2. Tri le long de l'axe principal ACP (plusieurs composantes moyennées)
-     3. Découpage de la séquence triée en FENÊTRES consécutives
-     4. Par fenêtre, le LLM regroupe UNIQUEMENT les modifications
-        sémantiquement IDENTIQUES (= une même modification unique) et
-        recopie le reste tel quel
-     5. Contrôle de complétude : chaque id d'origine et chaque DM code
-        doivent être présents — réparation automatique sinon
-   RÉPÉTER : le re-tri de la passe suivante fait se rencontrer ce que les
-   fenêtres précédentes avaient séparé. Arrêt à stabilité ou n_passes.
-
- Le code ne DÉCIDE jamais d'une fusion : il trie, découpe, trace, vérifie.
- Le LLM ne voit jamais plus d'une fenêtre à la fois.
+ Entrée : dictio (V1), dict {node: FicheVersionGlobale}
+          + instance embeddings DÉJÀ initialisée.
+ Sortie : liste TRIÉE de toutes les modifications, chaque élément portant sa
+          traçabilité complète (id, node, codes DM, chapitre) + son score de tri.
 ==============================================================================
 """
 
 from typing import List, Dict, Any
 import numpy as np
-from pydantic import BaseModel, Field
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import normalize
-from langchain_core.prompts import ChatPromptTemplate
 
 
-# ==============================================================================
-# 1. SCHÉMAS PYDANTIC
-# ==============================================================================
-
-class ElementFenetre(BaseModel):
-    texte: str = Field(
-        description=(
-            "Le texte de l'élément : soit le texte FUSIONNÉ (si plusieurs ids sont "
-            "regroupés), soit la recopie À L'IDENTIQUE de l'élément (si non regroupable)."
-        )
-    )
-    ids_sources: List[int] = Field(
-        description="Les [ID] de la fenêtre qui composent cet élément (1 si non regroupé)."
-    )
-
-class RapportFenetre(BaseModel):
-    elements: List[ElementFenetre]
-
-
-# ==============================================================================
-# 2. PROMPT DE FENÊTRE (fusion des identiques uniquement)
-# ==============================================================================
-
-_PROMPT_FENETRE = ChatPromptTemplate.from_messages([
-    ("system", (
-        "Vous êtes un assistant de déduplication de modifications techniques.\n"
-        "On vous fournit une liste de descriptions de modifications, chacune précédée "
-        "de son [ID].\n\n"
-        "VOTRE TÂCHE : regrouper UNIQUEMENT les descriptions SÉMANTIQUEMENT IDENTIQUES, "
-        "c'est-à-dire celles qui correspondent à UNE MÊME MODIFICATION UNIQUE (même nature, "
-        "même contenu de changement). Les descriptions différentes, même proches, restent "
-        "SÉPARÉES et sont recopiées À L'IDENTIQUE, sans aucune reformulation.\n\n"
-        "POUR UN GROUPE FUSIONNÉ :\n"
-        "- FIDÉLITÉ : restez au plus près du libellé d'origine, mot pour mot là où les "
-        "descriptions coïncident. Pas de paraphrase, pas de synonymes. Préservez le jargon "
-        "technique exact, y compris les termes anglais (GATM, GSE, GPS, Dorsal...).\n"
-        "- COUVERTURE : le texte fusionné couvre l'INTÉGRALITÉ de l'information de chaque "
-        "description du groupe (toute valeur présente dans une seule DOIT figurer au résultat).\n"
-        "- N'interprétez pas : ni intention, ni cause, ni conséquence.\n\n"
-        "RÈGLES DE SORTIE (IMPÉRATIVES) :\n"
-        "1. CHAQUE [ID] fourni doit apparaître dans EXACTEMENT UN élément de votre sortie. "
-        "Aucun oubli, aucun doublon, aucun [ID] inventé.\n"
-        "2. Un élément non regroupable = un élément de sortie avec son seul [ID] et son "
-        "texte recopié à l'identique.\n"
-        "3. En cas de doute sur l'identité de deux descriptions, NE les fusionnez PAS.\n"
-        "4. Aucun emoji ni artifice de mise en forme."
-    )),
-    ("user", "Voici les descriptions de la fenêtre courante :\n\n{input_data}")
-])
-
-
-# ==============================================================================
-# 3. BRIQUES DÉTERMINISTES
-# ==============================================================================
-
-def _tri_acp(textes: List[str], embeddings, n_composantes: int) -> np.ndarray:
-    """Embed + score 1D (moyenne des projections ACP pondérée par la variance) + argsort."""
-    X = np.array(embeddings.embed_documents(textes))
-    X_norm = normalize(X)
-
-    k = max(1, min(n_composantes, X_norm.shape[0] - 1, X_norm.shape[1]))
-    pca = PCA(n_components=k)
-    projections = pca.fit_transform(X_norm)
-    if k > 1:
-        poids = pca.explained_variance_ratio_
-        scores = projections @ (poids / poids.sum())
-    else:
-        scores = projections[:, 0]
-
-    ordre = np.argsort(scores.flatten())
-    assert sorted(ordre.tolist()) == list(range(len(textes))), "Tri : permutation invalide."
-    return ordre
-
-
-def _reparer_fenetre(
-    elements_llm: List[ElementFenetre],
-    ids_fenetre: List[int],
-    textes_par_id: Dict[int, str],
-) -> List[ElementFenetre]:
-    """
-    Garantit la partition exacte des ids de la fenêtre :
-      - id inventé  -> retiré ;
-      - id en double -> conservé dans son premier élément ;
-      - id oublié   -> réinjecté tel quel (texte d'origine) ;
-      - élément devenu vide -> supprimé ;
-      - élément à 1 seul id -> texte FORCÉ à l'original (anti-dérive de reformulation).
-    """
-    attendus = set(ids_fenetre)
-    vus: set = set()
-    propres: List[ElementFenetre] = []
-
-    for el in elements_llm:
-        ids = [i for i in el.ids_sources if i in attendus and i not in vus]
-        vus.update(ids)
-        if not ids:
-            continue
-        if len(ids) == 1:
-            propres.append(ElementFenetre(texte=textes_par_id[ids[0]], ids_sources=ids))
-        else:
-            propres.append(ElementFenetre(texte=el.texte, ids_sources=sorted(ids)))
-
-    for i in sorted(attendus - vus):
-        propres.append(ElementFenetre(texte=textes_par_id[i], ids_sources=[i]))
-
-    return propres
-
-
-def _verifier_completude(items: List[Dict[str, Any]],
-                         ids_attendus: set,
-                         dm_attendus: set,
-                         etiquette: str) -> None:
-    """Chaque description d'origine ET chaque DM code doivent être présents."""
-    ids = set()
-    for it in items:
-        ids.update(it["ids_origine"])
-    assert ids == ids_attendus, (
-        f"[{etiquette}] descriptions manquantes : {sorted(ids_attendus - ids)}"
-    )
-    dms = set()
-    for it in items:
-        dms.update(it["codes_dm"])
-    assert dms == dm_attendus, (
-        f"[{etiquette}] DM codes manquants : {sorted(dm_attendus - dms)}"
-    )
-    print(f"   ✔ [{etiquette}] complétude OK : {len(items)} éléments, "
-          f"{len(ids)} descriptions, {len(dms)} DM codes.")
-
-
-# ==============================================================================
-# 4. UNE PASSE DE CONDENSATION
-# ==============================================================================
-
-def _condensation_une_passe(
-    items: List[Dict[str, Any]],
-    chaine,
-    embeddings,
-    n_composantes: int,
-    taille_fenetre: int,
-) -> List[Dict[str, Any]]:
-    """
-    items : [{texte, ids_origine:set, nodes:set, codes_dm:set, chapitres:set}]
-    Retourne la liste condensée (mêmes clés), traçabilité fusionnée par union.
-    """
-    n = len(items)
-    if n <= 1:
-        return items
-
-    # Tri ACP des textes courants
-    ordre = _tri_acp([it["texte"] for it in items], embeddings, n_composantes)
-
-    nouveaux: List[Dict[str, Any]] = []
-
-    # Fenêtres consécutives sur la séquence triée
-    for debut in range(0, n, taille_fenetre):
-        positions = [int(p) for p in ordre[debut:debut + taille_fenetre]]
-
-        if len(positions) == 1:
-            nouveaux.append(items[positions[0]])
-            continue
-
-        textes_par_id = {p: items[p]["texte"] for p in positions}
-        input_data = "\n".join(f"[ID {p}] : {items[p]['texte']}" for p in positions)
-
-        try:
-            rapport = chaine.invoke({"input_data": input_data})
-            elements = _reparer_fenetre(rapport.elements, positions, textes_par_id)
-        except Exception as e:
-            print(f"⚠️ Échec LLM sur une fenêtre ({e}) : éléments conservés tels quels.")
-            elements = [ElementFenetre(texte=textes_par_id[p], ids_sources=[p])
-                        for p in positions]
-
-        # Reconstruction des items avec union de la traçabilité
-        for el in elements:
-            sources = [items[p] for p in el.ids_sources]
-            nouveaux.append({
-                "texte": el.texte,
-                "ids_origine": set().union(*(s["ids_origine"] for s in sources)),
-                "nodes": set().union(*(s["nodes"] for s in sources)),
-                "codes_dm": set().union(*(s["codes_dm"] for s in sources)),
-                "chapitres": set().union(*(s["chapitres"] for s in sources)),
-            })
-
-    return nouveaux
-
-
-# ==============================================================================
-# 5. PIPELINE PRINCIPAL
-# ==============================================================================
-
-def executer_pipeline_passes(
+def lister_et_trier_modifications(
     dictio: Dict[Any, Any],
-    llm,
     embeddings,
-    n_passes: int = 3,
-    taille_fenetre: int = 30,
     n_composantes: int = 3,
 ) -> List[Dict[str, Any]]:
     """
-    Condense la V1 (dictio) par passes successives tri-ACP + fenêtres + fusion LLM
-    des modifications sémantiquement identiques.
+    1. Liste à plat TOUTES les descriptions de dictio (une entrée par description).
+    2. Embedding + ACP : score 1D = moyenne des projections sur les n premières
+       composantes principales, pondérée par la variance expliquée de chaque axe.
+    3. Tri selon ce score, traçabilité conservée.
 
-    dictio         : sortie V1, dict {node: FicheVersionGlobale}.
-    llm            : instance ChatOpenAI DÉJÀ initialisée.
-    embeddings     : instance OpenAIEmbeddings DÉJÀ initialisée.
-    n_passes       : nombre maximal de passes (arrêt anticipé si stabilité).
-    taille_fenetre : nombre d'éléments montrés au LLM par fenêtre.
-    n_composantes  : nombre de directions principales moyennées pour le tri.
+    Retourne la liste triée : [{id, texte, node, codes_dm, chapitre, score}]
     """
-    chaine = _PROMPT_FENETRE | llm.with_structured_output(RapportFenetre)
-
-    # --------------------------------------------------------------------------
-    # ÉTAPE 0 : Indexation à plat — une entrée PAR description, traçabilité par id
-    # --------------------------------------------------------------------------
-    items: List[Dict[str, Any]] = []
+    # ---- 1. Listing à plat, id de traçabilité ------------------------------
+    modifications: List[Dict[str, Any]] = []
     id_compteur = 0
     for node, fiche in dictio.items():
         for section in fiche.sections:
             for description in section.modifications_apportees.descriptions:
                 if not description or not description.strip():
                     continue
-                items.append({
+                modifications.append({
+                    "id": id_compteur,
                     "texte": description.strip(),
-                    "ids_origine": {id_compteur},
-                    "nodes": {node},
-                    "codes_dm": set(section.codes_dm),
-                    "chapitres": {section.chapitre},
+                    "node": node,
+                    "codes_dm": list(section.codes_dm),
+                    "chapitre": section.chapitre,
                 })
                 id_compteur += 1
 
-    if not items:
-        print("⚠️ Aucune description à traiter.")
-        return []
+    n = len(modifications)
+    print(f"📋 {n} modifications listées.")
+    if n <= 1:
+        for m in modifications:
+            m["score"] = 0.0
+        return modifications
 
-    ids_attendus = set(range(id_compteur))
-    dm_attendus = set().union(*(it["codes_dm"] for it in items))
-    print(f"0️⃣  Indexation : {len(items)} descriptions, "
-          f"{len(dm_attendus)} DM codes distincts.")
-    _verifier_completude(items, ids_attendus, dm_attendus, "indexation")
+    # ---- 2. Embedding + score ACP ------------------------------------------
+    X = np.array(embeddings.embed_documents([m["texte"] for m in modifications]))
+    X_norm = normalize(X)
 
-    # --------------------------------------------------------------------------
-    # PASSES SUCCESSIVES
-    # --------------------------------------------------------------------------
-    for passe in range(1, n_passes + 1):
-        nb_avant = len(items)
-        if nb_avant <= 1:
-            break
+    k = max(1, min(n_composantes, n - 1, X_norm.shape[1]))
+    pca = PCA(n_components=k)
+    projections = pca.fit_transform(X_norm)          # (n, k)
 
-        print(f"🔁 Passe {passe} : {nb_avant} éléments...")
-        items = _condensation_une_passe(
-            items, chaine, embeddings, n_composantes, taille_fenetre
-        )
-        _verifier_completude(items, ids_attendus, dm_attendus, f"passe {passe}")
-        print(f"   -> {nb_avant} → {len(items)} éléments.")
+    if k > 1:
+        poids = pca.explained_variance_ratio_
+        scores = projections @ (poids / poids.sum()) # moyenne pondérée des k axes
+    else:
+        scores = projections[:, 0]
+    scores = scores.flatten()
 
-        if len(items) == nb_avant:
-            print("   (stabilité atteinte, arrêt anticipé)")
-            break
+    print(f"🧭 ACP : {k} composante(s), variance expliquée cumulée = "
+          f"{pca.explained_variance_ratio_.sum():.1%}")
 
-    # --------------------------------------------------------------------------
-    # MISE EN FORME FINALE
-    # --------------------------------------------------------------------------
-    resultat_final = [{
-        "texte_synthese": it["texte"],
-        "noeuds_pivots": list(it["nodes"]),
-        "dm_codes": sorted(it["codes_dm"]),
-        "chapitres": sorted(it["chapitres"]),
-        "ids_sources": sorted(it["ids_origine"]),
-    } for it in items]
+    # ---- 3. Tri + tracking ---------------------------------------------------
+    for m, s in zip(modifications, scores):
+        m["score"] = float(s)
 
-    print(f"✅ Condensation terminée : {len(ids_attendus)} descriptions "
-          f"-> {len(resultat_final)} modifications. "
-          f"{len(dm_attendus)} DM codes cités — complétude OK.")
-    return resultat_final
+    indices_de_tri = np.argsort(scores)
+    modifications_triees = [modifications[i] for i in indices_de_tri]
+
+    # Contrôle : rien perdu, rien dupliqué
+    assert sorted(m["id"] for m in modifications_triees) == list(range(n)), \
+        "Tri : des modifications ont été perdues ou dupliquées."
+    print(f"✅ {n} modifications triées, traçabilité vérifiée.")
+
+    return modifications_triees
 
 
-# ==============================================================================
-# 6. UTILISATION
-# ==============================================================================
 if __name__ == "__main__":
-    # --- Tes instances DÉJÀ initialisées ailleurs ---
-    #   llm        = ChatOpenAI(model="gpt-4o", temperature=0.0)
-    #   embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    # embeddings = OpenAIEmbeddings(model="text-embedding-3-small")  # ton instance
+    # modifs_triees = lister_et_trier_modifications(dictio, embeddings, n_composantes=3)
     #
-    # --- dictio provient de la V1 ---
-    #   dictio = generer_comptes_rendus_packs(
-    #                extraire_donnees_utiles(
-    #                    extraire_branches_optimales(racine, 200_000)))
-    #
-    # --- Condensation ---
-    #   v2 = executer_pipeline_passes(dictio, llm, embeddings)
-    #
-    # --- Réglages ---
-    #   Plus de passes / fenêtres plus grandes = plus de condensation :
-    #   v2 = executer_pipeline_passes(dictio, llm, embeddings,
-    #                                 n_passes=4, taille_fenetre=40)
+    # for m in modifs_triees[:10]:
+    #     print(f"[{m['score']:+.4f}] (id={m['id']}, DM={m['codes_dm']}) {m['texte']}")
     pass
 
 
