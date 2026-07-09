@@ -1,3 +1,217 @@
+"""
+==============================================================================
+ ÉTAPE 2 — FENÊTRES FIXES + LISTAGE DES ACTIONS UNIQUES PAR LE LLM
+==============================================================================
+ Entrée : modifs_triees (sortie de l'étape 1) + instance llm DÉJÀ initialisée.
+ Sortie : liste des ACTIONS UNIQUES, chacune avec sa traçabilité fusionnée
+          (ids d'origine, nodes, codes DM, chapitres).
+
+ Découpage en fenêtres FIXES (non chevauchantes). Pour chaque fenêtre, le LLM
+ liste les actions uniques observées et dit quels [ID] composent chacune.
+ Le CODE fait ensuite l'union des DM / nodes / chapitres, et vérifie que
+ chaque ID de la fenêtre apparaît dans exactement une action.
+==============================================================================
+"""
+
+from typing import List, Dict, Any
+from pydantic import BaseModel, Field
+from langchain_core.prompts import ChatPromptTemplate
+
+
+# ==============================================================================
+# 1. SCHÉMAS
+# ==============================================================================
+
+class ActionUnique(BaseModel):
+    texte: str = Field(
+        description=(
+            "L'action unique, exprimée de façon englobante : le point commun (nature et contenu "
+            "du changement) suivi de l'énumération exhaustive des cibles concernées. Si un seul "
+            "[ID] la compose, son texte est recopié à l'identique."
+        )
+    )
+    ids_sources: List[int] = Field(
+        description="Tous les [ID] du lot que cette action unique englobe."
+    )
+
+class RapportActions(BaseModel):
+    actions_uniques: List[ActionUnique]
+
+
+# ==============================================================================
+# 2. PROMPT
+# ==============================================================================
+
+PROMPT_ACTIONS_UNIQUES = ChatPromptTemplate.from_messages([
+    ("system", (
+        "Vous êtes un assistant d'analyse de modifications techniques documentaires.\n"
+        "On vous fournit un lot de modifications observées sur un ensemble de documents, "
+        "chacune précédée de son [ID].\n\n"
+
+        "VOTRE TÂCHE : effectuer un REGROUPEMENT PAR ACTION (« group by action »).\n"
+        "Ne regroupez PAS seulement les descriptions littéralement identiques. Cherchez, entre "
+        "les modifications du lot, LE DÉNOMINATEUR COMMUN : quelle EST L'ACTION qui a été "
+        "effectuée, indépendamment de l'endroit ou de l'objet sur lequel elle a été effectuée.\n"
+        "Une même ACTION appliquée à plusieurs cibles différentes = UNE SEULE action unique, "
+        "ENGLOBANTE, qui énumère ses cibles.\n\n"
+
+        "MÉTHODE :\n"
+        "1. Repérez les modifications qui partagent la même NATURE d'opération et le même "
+        "CONTENU de changement (ce qui est ajouté, supprimé ou remplacé).\n"
+        "2. Factorisez : extrayez ce qui est COMMUN, énumérez ce qui VARIE (les cibles, "
+        "les objets, les emplacements, les valeurs).\n"
+        "3. Formulez UNE action englobante qui exprime le point commun et liste exhaustivement "
+        "les cibles concernées.\n\n"
+
+        "EXEMPLES DE FACTORISATION ATTENDUE :\n"
+        "- 'ajout de la mention lentement au clapet d'isolement' + 'ajout de la mention "
+        "lentement au clapet de sécurité'\n"
+        "  => UNE action : 'ajout de la mention lentement aux clapets d'isolement et de sécurité'.\n"
+        "- 'ajout de rep. 4, 2' + 'ajout de rep. 1, 3'\n"
+        "  => UNE action : 'ajout de rep. 1, 2, 3, 4'.\n\n"
+
+        "CE QUI NE SE REGROUPE PAS :\n"
+        "- Des natures d'opération différentes (un ajout ne se regroupe jamais avec une suppression).\n"
+        "- Des contenus de changement différents (ajouter 'lentement' n'est pas ajouter 'rapidement').\n\n"
+
+        "POUR CHAQUE ACTION UNIQUE :\n"
+        "- Indiquez TOUS les [ID] du lot qu'elle englobe.\n"
+        "- FIDÉLITÉ : reprenez mot pour mot le libellé commun des descriptions d'origine. "
+        "Ne paraphrasez pas, pas de synonymes. Préservez le jargon technique exact, y compris "
+        "les termes anglais (GATM, GSE, GPS, Dorsal...).\n"
+        "- COUVERTURE EXHAUSTIVE : aucune cible, aucune valeur ne doit être perdue. Toute cible "
+        "présente dans une seule description DOIT figurer dans l'action englobante.\n"
+        "- Si une modification est seule de son espèce, recopiez son texte À L'IDENTIQUE.\n"
+        "- N'INTERPRÉTEZ PAS : ni intention, ni cause, ni conséquence. Constatez.\n\n"
+
+        "RÈGLES DE SORTIE (IMPÉRATIVES) :\n"
+        "1. CHAQUE [ID] fourni doit apparaître dans EXACTEMENT UNE action unique. "
+        "Aucun oubli, aucun doublon, aucun [ID] inventé.\n"
+        "2. Aucun emoji ni artifice de mise en forme. Factuel, neutre, technique."
+    )),
+    ("user", "Voici le lot de modifications à analyser :\n\n{input_data}")
+])
+
+
+# ==============================================================================
+# 3. RÉPARATION (garantit la partition exacte des ids de la fenêtre)
+# ==============================================================================
+
+def _reparer_actions(
+    actions_llm: List[ActionUnique],
+    ids_fenetre: List[int],
+    textes_par_id: Dict[int, str],
+) -> List[ActionUnique]:
+    """
+      - id inventé          -> retiré ;
+      - id en double        -> gardé dans sa première action ;
+      - id oublié           -> réinjecté comme action solo (texte d'origine) ;
+      - action à 1 seul id  -> texte FORCÉ à l'original (anti-reformulation).
+    """
+    attendus = set(ids_fenetre)
+    vus: set = set()
+    propres: List[ActionUnique] = []
+
+    for action in actions_llm:
+        ids = [i for i in action.ids_sources if i in attendus and i not in vus]
+        vus.update(ids)
+        if not ids:
+            continue
+        if len(ids) == 1:
+            propres.append(ActionUnique(texte=textes_par_id[ids[0]], ids_sources=ids))
+        else:
+            propres.append(ActionUnique(texte=action.texte, ids_sources=sorted(ids)))
+
+    for i in sorted(attendus - vus):
+        propres.append(ActionUnique(texte=textes_par_id[i], ids_sources=[i]))
+
+    return propres
+
+
+# ==============================================================================
+# 4. ÉTAPE 2
+# ==============================================================================
+
+def lister_actions_uniques(
+    modifs_triees: List[Dict[str, Any]],
+    llm,
+    taille_fenetre: int = 30,
+) -> List[Dict[str, Any]]:
+    """
+    Découpe modifs_triees en fenêtres FIXES et demande au LLM les actions uniques
+    de chaque fenêtre. Le code fait l'union de la traçabilité et vérifie la complétude.
+
+    Retourne : [{texte, ids_origine:set, nodes:set, codes_dm:set, chapitres:set}]
+    """
+    chaine = PROMPT_ACTIONS_UNIQUES | llm.with_structured_output(RapportActions)
+
+    n = len(modifs_triees)
+    if n == 0:
+        return []
+
+    # Traçabilité attendue, pour contrôle final
+    ids_attendus = {m["id"] for m in modifs_triees}
+    dm_attendus = {dm for m in modifs_triees for dm in m["codes_dm"]}
+    par_id = {m["id"]: m for m in modifs_triees}
+
+    actions: List[Dict[str, Any]] = []
+    nb_fenetres = (n + taille_fenetre - 1) // taille_fenetre
+    print(f"🪟 {n} modifications -> {nb_fenetres} fenêtre(s) de {taille_fenetre}.")
+
+    for num, debut in enumerate(range(0, n, taille_fenetre), start=1):
+        lot = modifs_triees[debut:debut + taille_fenetre]
+        ids_lot = [m["id"] for m in lot]
+        textes_par_id = {m["id"]: m["texte"] for m in lot}
+
+        if len(lot) == 1:
+            resultats = [ActionUnique(texte=lot[0]["texte"], ids_sources=[lot[0]["id"]])]
+        else:
+            input_data = "\n".join(f"[ID {m['id']}] : {m['texte']}" for m in lot)
+            try:
+                rapport = chaine.invoke({"input_data": input_data})
+                resultats = _reparer_actions(rapport.actions_uniques, ids_lot, textes_par_id)
+            except Exception as e:
+                print(f"⚠️ Fenêtre {num} : échec LLM ({e}). Modifications conservées telles quelles.")
+                resultats = [ActionUnique(texte=textes_par_id[i], ids_sources=[i]) for i in ids_lot]
+
+        # Union de la traçabilité : c'est le CODE qui l'établit, pas le LLM.
+        for action in resultats:
+            sources = [par_id[i] for i in action.ids_sources]
+            actions.append({
+                "texte": action.texte,
+                "ids_origine": set(action.ids_sources),
+                "nodes": {s["node"] for s in sources},
+                "codes_dm": {dm for s in sources for dm in s["codes_dm"]},
+                "chapitres": {s["chapitre"] for s in sources},
+            })
+
+        print(f"   fenêtre {num}/{nb_fenetres} : {len(lot)} modifs -> "
+              f"{len(resultats)} action(s) unique(s).")
+
+    # ---- Contrôles de complétude -------------------------------------------
+    ids_couverts = set().union(*(a["ids_origine"] for a in actions))
+    assert ids_couverts == ids_attendus, \
+        f"Modifications manquantes : {sorted(ids_attendus - ids_couverts)}"
+
+    dm_couverts = set().union(*(a["codes_dm"] for a in actions))
+    assert dm_couverts == dm_attendus, \
+        f"DM codes manquants : {sorted(dm_attendus - dm_couverts)}"
+
+    print(f"✅ {n} modifications -> {len(actions)} actions uniques. "
+          f"{len(dm_couverts)}/{len(dm_attendus)} DM codes cités — complétude OK.")
+    return actions
+
+
+if __name__ == "__main__":
+    # modifs_triees = lister_et_trier_modifications(dictio, embeddings, n_composantes=3)
+    # actions = lister_actions_uniques(modifs_triees, llm, taille_fenetre=30)
+    #
+    # for a in actions:
+    #     print(f"- {a['texte']}  [DM: {sorted(a['codes_dm'])}]")
+    pass
+
+
+
 
 """
 ==============================================================================
