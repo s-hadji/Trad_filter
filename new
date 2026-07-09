@@ -75,6 +75,582 @@ PROMPT_ACTIONS_UNIQUES = ChatPromptTemplate.from_messages([
         "englobante ENUMERE. Ne creez JAMAIS deux actions distinctes au seul motif que les "
         "figures, les composants ou les numeros de reperes ne coincident pas.\n\n"
 
+        "METHODE - CHERCHEZ D'ABORD LES MOTIFS TRANSVERSAUX :\n"
+        "Ne procedez PAS en comparant les modifications deux a deux. Commencez par PRENDRE DU "
+        "RECUL sur l'ensemble du lot et demandez-vous : quels sont LES MOTIFS COMMUNS qui "
+        "traversent ces modifications ? Quelle transformation d'ensemble a ete appliquee au "
+        "document ? Votre but est de trouver LA ou LES modifications qui ENGLOBENT TOUT.\n"
+        "1. Balayez tout le lot et identifiez les motifs recurrents (voir types ci-dessous).\n"
+        "2. Formulez chaque motif comme UNE action unique englobante, au bon niveau "
+        "d'abstraction : assez general pour couvrir toutes ses occurrences, assez precis pour "
+        "rester informatif.\n"
+        "3. Rattachez CHAQUE modification du lot au motif qui la couvre.\n"
+        "4. Une modification qui ne releve d'aucun motif reste seule.\n"
+        "Si vous produisez beaucoup d'actions qui se ressemblent, c'est que vous n'avez pas "
+        "trouve le motif qui les englobe : remontez d'un cran d'abstraction.\n\n"
+
+        "TYPES DE MOTIFS TRANSVERSAUX A DETECTER (liste non exhaustive) :\n"
+        "- Harmonisation terminologique : un meme terme remplace partout par un autre "
+        "(par ex. 'Depose/Pose' remplace par 'Removal/Installation').\n"
+        "- Changement de langue : passage systematique du francais a l'anglais (ou l'inverse) "
+        "dans les intitules, les references ou les libelles de figures.\n"
+        "- Ajout systematique d'un meme type d'element : reperes numeriques, references de "
+        "figures, mises en garde, notes, unites.\n"
+        "- Renommage ou reference systematique d'un meme objet a travers plusieurs sections.\n"
+        "- Uniformisation de format : numerotation, ponctuation, casse, structure des etapes.\n"
+        "- Suppression systematique d'un meme type de contenu.\n"
+        "Quand un tel motif est present, il constitue UNE SEULE action unique englobante, "
+        "quelles que soient ses occurrences.\n\n"
+
+        "EXEMPLE 1 - FACTORISATION PAR CIBLE (cas reel) :\n"
+        "  [ID 1] Ajout des reperes rep. 1, rep. 2, rep. 3, rep. 4 dans les references a la "
+        "figure Right/left protector (Removal/installation)\n"
+        "  [ID 2] Ajout des reperes rep. 1, rep. 2, rep. 5, rep. 6 dans les references a la "
+        "figure Right/left flange (Removal/installation)\n"
+        "  [ID 3] Ajout des reperes (rep. 2) pour les vis, (rep. 1) pour les rondelles et "
+        "(rep. 4) pour les goujons de centrage sur la figure RS on RS/turbine\n"
+        "  => UNE SEULE action unique, ids_sources = [1, 2, 3] :\n"
+        "  'Ajout de reperes numeriques dans les references aux figures : Right/left protector "
+        "(Removal/installation) (rep. 1 a 4), Right/left flange (Removal/installation) "
+        "(rep. 1, 2, 5, 6), RS on RS/turbine (rep. 2 pour les vis, rep. 1 pour les rondelles, "
+        "rep. 4 pour les goujons de centrage).'\n"
+        "Les trois descriptions font LA MEME ACTION (ajouter des reperes dans des references de "
+        "figures). Seules les figures et les numeros varient : ils sont ENUMERES, pas separes.\n\n"
+
+        "EXEMPLE 2 - MOTIF TRANSVERSAL (harmonisation linguistique) :\n"
+        "  [ID 4] Remplacement de la reference Figure Doigt de blocage (Depose/Pose) par "
+        "Figure Reinforced locking pin (Removal/Installation)\n"
+        "  [ID 5] Remplacement des references a la Figure Bride par Figure Flange "
+        "(Removal/Installation)\n"
+        "  [ID 6] Remplacement de la Figure Chariot par Figure RS trolley (Removal/Installation)\n"
+        "  => UNE SEULE action unique, ids_sources = [4, 5, 6] :\n"
+        "  'Harmonisation linguistique des references de figures, remplacees par leur intitule "
+        "anglais avec la mention (Removal/Installation) : Doigt de blocage -> Reinforced locking "
+        "pin, Bride -> Flange, Chariot -> RS trolley.'\n"
+        "Le motif commun est le PASSAGE DU FRANCAIS A L'ANGLAIS des intitules de figures. "
+        "Ne produisez pas trois actions 'remplacement de reference' : identifiez la "
+        "transformation d'ensemble et enumerez ses occurrences.\n\n"
+
+        "CE QUI NE SE REGROUPE PAS (seuls criteres de separation valides) :\n"
+        "- Des NATURES d'operation differentes : un ajout ne se regroupe jamais avec une "
+        "suppression ni avec un remplacement.\n"
+        "- Des TYPES d'element differents : ajouter un repere n'est pas ajouter une mise en garde.\n"
+        "Tout le reste (figures, composants, etapes, numeros) se regroupe et s'enumere.\n\n"
+
+        "LES [ID] SONT DES REPERES TECHNIQUES INTERNES :\n"
+        "Les mentions '[ID N]' sont des identifiants que NOUS ajoutons pour la tracabilite. "
+        "Ils ne font PAS partie du contenu documentaire. Servez-vous-en UNIQUEMENT pour remplir "
+        "le champ 'ids_sources'. Ne les recopiez JAMAIS dans le texte de l'action, ne les citez "
+        "pas, n'y faites aucune reference (ni 'ID 3', ni 'les elements 3 et 7', ni 'cette "
+        "modification et la precedente'). Le texte de l'action doit se lire seul, comme s'il "
+        "n'y avait jamais eu d'identifiants.\n\n"
+
+        "POUR CHAQUE ACTION UNIQUE :\n"
+        "- Indiquez TOUS les [ID] du lot qu'elle englobe, dans le champ 'ids_sources' uniquement.\n"
+        "- FIDELITE DU VOCABULAIRE : les DESIGNATIONS reprises des documents (noms de figures, "
+        "de composants, termes techniques, valeurs, numeros de reperes) doivent etre citees MOT "
+        "POUR MOT, sans paraphrase ni synonyme. Preservez le jargon exact, y compris les termes "
+        "anglais (GATM, GSE, GPS, Dorsal...). En revanche, la formulation de l'action englobante "
+        "elle-meme peut nommer le motif commun (par ex. 'harmonisation linguistique', 'ajout "
+        "systematique de reperes') : c'est necessaire pour exprimer ce qui unit les occurrences.\n"
+        "- COUVERTURE EXHAUSTIVE : aucune cible, aucune valeur ne doit etre perdue. Toute cible "
+        "presente dans une seule description DOIT figurer dans l'action englobante.\n"
+        "- Si une modification ne releve d'aucun motif et reste seule, recopiez son texte "
+        "A L'IDENTIQUE. Mais ne vous servez PAS de cette regle pour eviter de chercher les "
+        "motifs : un lot ne doit pas ressortir majoritairement en actions solitaires.\n"
+        "- N'INTERPRETEZ PAS : ni intention, ni cause, ni consequence. Constatez ce qui a change, "
+        "sans expliquer pourquoi.\n\n"
+
+        "REGLES DE SORTIE (IMPERATIVES) :\n"
+        "1. CHAQUE [ID] fourni doit apparaitre dans EXACTEMENT UNE action unique. "
+        "Aucun oubli, aucun doublon, aucun [ID] invente.\n"
+        "2. Le champ 'texte' ne contient AUCUN identifiant [ID], aucun numero d'element interne.\n"
+        "3. Aucun emoji ni artifice de mise en forme. Factuel, neutre, technique."
+    )),
+    ("user", "Voici le lot de modifications a analyser :\n\n{input_data}")
+])
+
+
+# ==============================================================================
+# 3. ETAPE 0 - INDEXATION A PLAT
+# ==============================================================================
+
+def indexer_modifications(dictio: Dict[Any, Any]) -> List[Dict[str, Any]]:
+    """dictio -> liste d'items (une entree par description, tracabilite complete)."""
+    items: List[Dict[str, Any]] = []
+    compteur = 0
+    for node, fiche in dictio.items():
+        for section in fiche.sections:
+            for description in section.modifications_apportees.descriptions:
+                if not description or not description.strip():
+                    continue
+                items.append({
+                    "texte": description.strip(),
+                    "ids_origine": {compteur},
+                    "nodes": {node},
+                    "codes_dm": set(section.codes_dm),
+                    "chapitres": {section.chapitre},
+                })
+                compteur += 1
+    return items
+
+
+# ==============================================================================
+# 4. ETAPE 1 - TRI ACP
+# ==============================================================================
+
+def trier_par_acp(
+    items: List[Dict[str, Any]],
+    embeddings,
+    n_composantes: int = 3,
+) -> List[Dict[str, Any]]:
+    """Embedding + score 1D (moyenne ponderee des projections ACP) + tri."""
+    n = len(items)
+    if n <= 1:
+        return items
+
+    X = np.array(embeddings.embed_documents([it["texte"] for it in items]))
+    X_norm = normalize(X)
+
+    k = max(1, min(n_composantes, n - 1, X_norm.shape[1]))
+    pca = PCA(n_components=k)
+    projections = pca.fit_transform(X_norm)
+
+    if k > 1:
+        poids = pca.explained_variance_ratio_
+        scores = projections @ (poids / poids.sum())
+    else:
+        scores = projections[:, 0]
+    scores = scores.flatten()
+
+    ordre = np.argsort(scores)
+    assert sorted(ordre.tolist()) == list(range(n)), "Tri : permutation invalide."
+
+    variance = float(pca.explained_variance_ratio_.sum())
+    print(f"    tri ACP : {k} composante(s), variance expliquee cumulee = {variance:.1%}")
+    return [items[i] for i in ordre]
+
+
+# ==============================================================================
+# 5. ETAPE 2 - ACTIONS UNIQUES PAR FENETRES FIXES
+# ==============================================================================
+
+def _nettoyer_references_ids(texte: str) -> str:
+    """
+    Filet de securite : retire toute reference aux identifiants internes que le LLM
+    aurait pu recopier malgre la consigne ('[ID 3]', 'ID 3', '(ids 3, 7)', ...).
+    Les [ID] sont nos reperes de tracabilite, jamais du contenu documentaire.
+    """
+    if not texte:
+        return texte
+
+    nettoye = texte
+    # '[ID 3]' ou '[ID 3, 7]'
+    nettoye = re.sub(r"\[\s*ID[Ss]?\s*[:\s]?\s*[\d\s,et&]+\]", "", nettoye, flags=re.IGNORECASE)
+    # '(ID 3)' / '(ids 3, 7)' / '(id : 3)'
+    nettoye = re.sub(r"\(\s*ID[Ss]?\s*[:\s]?\s*[\d\s,et&]+\)", "", nettoye, flags=re.IGNORECASE)
+    # 'ID 3' / 'IDs 3, 7' hors parentheses
+    nettoye = re.sub(r"\bID[Ss]?\s*[:\s]?\s*\d+(?:\s*(?:,|et|&)\s*\d+)*", "", nettoye,
+                     flags=re.IGNORECASE)
+    # Espaces et ponctuation orphelins laisses par la suppression
+    nettoye = re.sub(r"\s{2,}", " ", nettoye)
+    nettoye = re.sub(r"\s+([,.;:])", r"\1", nettoye)
+    nettoye = re.sub(r"\(\s*\)", "", nettoye)
+    nettoye = re.sub(r"^[\s,;:-]+", "", nettoye)
+
+    return nettoye.strip()
+
+
+def calculer_taille_fenetre(
+    n_items: int,
+    nb_fenetres_cible: int = 12,
+    fenetre_min: int = 10,
+    fenetre_max: int = 60,
+) -> int:
+    """
+    Adapte la taille de fenetre a la taille COURANTE de la liste.
+
+    A mesure que les passes condensent, la liste retrecit. Garder une taille fixe
+    finit par produire des fenetres trop etroites pour que les actions similaires
+    encore separees puissent se rencontrer. On veut donc l'effet inverse : quand la
+    liste diminue, la fenetre doit S'ELARGIR (relativement), quitte a ne faire qu'une
+    ou deux fenetres a la fin.
+
+    Regle :
+      - si tout tient sous le plafond, UNE seule fenetre (fusion maximale possible) ;
+      - sinon, on vise nb_fenetres_cible fenetres, borne par [fenetre_min, fenetre_max].
+
+    fenetre_max protege le contexte et l'attention du LLM : au dela, la qualite du
+    regroupement se degrade.
+    """
+    if n_items <= fenetre_max:
+        return n_items  # une seule fenetre : tous les elements se voient
+
+    taille = (n_items + nb_fenetres_cible - 1) // nb_fenetres_cible  # ceil
+    return max(fenetre_min, min(taille, fenetre_max))
+
+
+def _reparer_actions(
+    actions_llm: List[ActionUnique],
+    ids_fenetre: List[int],
+    textes_par_id: Dict[int, str],
+) -> List[ActionUnique]:
+    """
+    Garantit la partition exacte des ids de la fenetre :
+      - id invente         -> retire ;
+      - id en double       -> garde dans sa premiere action ;
+      - id oublie          -> reinjecte en action solo (texte d'origine) ;
+      - action a 1 seul id -> texte FORCE a l'original (anti-reformulation).
+    """
+    attendus = set(ids_fenetre)
+    vus: set = set()
+    propres: List[ActionUnique] = []
+
+    for action in actions_llm:
+        ids = [i for i in action.ids_sources if i in attendus and i not in vus]
+        vus.update(ids)
+        if not ids:
+            continue
+        if len(ids) == 1:
+            propres.append(ActionUnique(texte=textes_par_id[ids[0]], ids_sources=ids))
+        else:
+            # Texte englobant produit par le LLM : on retire toute reference aux [ID].
+            propres.append(ActionUnique(texte=_nettoyer_references_ids(action.texte),
+                                        ids_sources=sorted(ids)))
+
+    for i in sorted(attendus - vus):
+        propres.append(ActionUnique(texte=textes_par_id[i], ids_sources=[i]))
+
+    return propres
+
+
+def regrouper_en_actions(
+    items_tries: List[Dict[str, Any]],
+    chaine,
+    taille_fenetre: int,
+) -> List[Dict[str, Any]]:
+    """Fenetres fixes sur la liste triee ; le LLM regroupe par action ; union par le code."""
+    n = len(items_tries)
+    if n <= 1:
+        return items_tries
+
+    # Indices locaux presentes au LLM (positions dans la liste triee)
+    resultat: List[Dict[str, Any]] = []
+    nb_fenetres = (n + taille_fenetre - 1) // taille_fenetre
+
+    for num, debut in enumerate(range(0, n, taille_fenetre), start=1):
+        positions = list(range(debut, min(debut + taille_fenetre, n)))
+
+        if len(positions) == 1:
+            resultat.append(items_tries[positions[0]])
+            continue
+
+        textes_par_id = {p: items_tries[p]["texte"] for p in positions}
+        input_data = "\n".join(f"[ID {p}] : {items_tries[p]['texte']}" for p in positions)
+
+        try:
+            rapport = chaine.invoke({"input_data": input_data})
+            actions = _reparer_actions(rapport.actions_uniques, positions, textes_par_id)
+        except Exception as e:
+            print(f"    fenetre {num}/{nb_fenetres} : echec LLM ({e}), items conserves tels quels.")
+            actions = [ActionUnique(texte=textes_par_id[p], ids_sources=[p]) for p in positions]
+
+        # Union deterministe de la tracabilite : c'est le CODE qui unit.
+        for action in actions:
+            sources = [items_tries[p] for p in action.ids_sources]
+            resultat.append({
+                "texte": action.texte,
+                "ids_origine": set().union(*(s["ids_origine"] for s in sources)),
+                "nodes": set().union(*(s["nodes"] for s in sources)),
+                "codes_dm": set().union(*(s["codes_dm"] for s in sources)),
+                "chapitres": set().union(*(s["chapitres"] for s in sources)),
+            })
+
+    return resultat
+
+
+# ==============================================================================
+# 6. COMPLETUDE ET METRIQUES
+# ==============================================================================
+
+def verifier_completude(
+    items: List[Dict[str, Any]],
+    ids_attendus: set,
+    dm_attendus: set,
+    etiquette: str,
+) -> None:
+    """Chaque description d'origine ET chaque DM code doivent rester presents."""
+    ids = set().union(*(it["ids_origine"] for it in items)) if items else set()
+    dms = set().union(*(it["codes_dm"] for it in items)) if items else set()
+
+    manquants_ids = ids_attendus - ids
+    manquants_dm = dm_attendus - dms
+    assert not manquants_ids, f"[{etiquette}] descriptions manquantes : {sorted(manquants_ids)}"
+    assert not manquants_dm, f"[{etiquette}] DM codes manquants : {sorted(manquants_dm)}"
+
+    # Une description ne doit pas se retrouver dans deux actions.
+    compte = Counter(i for it in items for i in it["ids_origine"])
+    doublons = [i for i, c in compte.items() if c > 1]
+    assert not doublons, f"[{etiquette}] descriptions dupliquees : {sorted(doublons)}"
+
+    print(f"    completude [{etiquette}] : {len(items)} actions, "
+          f"{len(ids)}/{len(ids_attendus)} descriptions, {len(dms)}/{len(dm_attendus)} DM codes.")
+
+
+def calculer_metriques(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Metriques de condensation et index inverse DM -> actions.
+    Repere les DM cites dans PLUSIEURS actions uniques distinctes.
+    """
+    dm_vers_actions: Dict[str, List[int]] = defaultdict(list)
+    for idx, it in enumerate(items):
+        for dm in it["codes_dm"]:
+            dm_vers_actions[dm].append(idx)
+
+    dm_multi = {dm: idxs for dm, idxs in dm_vers_actions.items() if len(idxs) > 1}
+    tailles = [len(it["ids_origine"]) for it in items]
+    nb_solitaires = sum(1 for t in tailles if t == 1)
+
+    return {
+        "nb_actions": len(items),
+        "nb_descriptions": sum(tailles),
+        "nb_dm_cites": len(dm_vers_actions),
+        "nb_dm_multi_actions": len(dm_multi),
+        "nb_actions_solitaires": nb_solitaires,
+        "taux_solitaires": (nb_solitaires / len(items)) if items else 0.0,
+        "taille_action_max": max(tailles) if tailles else 0,
+        "taille_action_moyenne": (sum(tailles) / len(tailles)) if tailles else 0.0,
+        "dm_vers_actions": dict(dm_vers_actions),
+        "dm_multi_actions": dm_multi,
+    }
+
+
+def afficher_metriques(
+    items: List[Dict[str, Any]],
+    metriques: Dict[str, Any],
+    top_dm: int = 10,
+    largeur_texte: int = 90,
+) -> None:
+    """Affiche les metriques et, pour les DM presents dans plusieurs actions, lesquelles."""
+    print("\n" + "=" * 78)
+    print("METRIQUES DE CONDENSATION")
+    print("=" * 78)
+    print(f"  actions uniques          : {metriques['nb_actions']}")
+    print(f"  descriptions d'origine   : {metriques['nb_descriptions']}")
+    print(f"  taux de condensation     : "
+          f"{100 * (1 - metriques['nb_actions'] / max(1, metriques['nb_descriptions'])):.1f}%")
+    print(f"  DM codes cites           : {metriques['nb_dm_cites']}")
+    print(f"  taille moyenne d'action  : {metriques['taille_action_moyenne']:.2f} descriptions")
+    print(f"  plus grosse action       : {metriques['taille_action_max']} descriptions")
+    print(f"  actions solitaires       : {metriques['nb_actions_solitaires']} "
+          f"({100 * metriques['taux_solitaires']:.1f}%)")
+    if metriques["taux_solitaires"] > 0.5:
+        print("    -> taux eleve : des motifs transversaux n'ont probablement pas ete detectes "
+              "(elargir la fenetre ou augmenter n_passes).")
+
+    dm_multi = metriques["dm_multi_actions"]
+    print(f"\n  DM codes presents dans PLUSIEURS actions uniques : {len(dm_multi)}")
+
+    if not dm_multi:
+        print("  (aucun DM ne se repartit sur plusieurs actions)")
+        print("=" * 78 + "\n")
+        return
+
+    classes = sorted(dm_multi.items(), key=lambda kv: len(kv[1]), reverse=True)
+    print(f"  detail des {min(top_dm, len(classes))} DM les plus disperses "
+          f"(quel DM contient quelles modifications) :\n")
+
+    for dm, idxs in classes[:top_dm]:
+        print(f"  - {dm}  ({len(idxs)} actions)")
+        for i in idxs:
+            texte = items[i]["texte"]
+            if len(texte) > largeur_texte:
+                texte = texte[:largeur_texte - 3] + "..."
+            print(f"      [action {i}] {texte}")
+        print()
+
+    if len(classes) > top_dm:
+        print(f"  ... et {len(classes) - top_dm} autres DM disperses "
+              f"(voir metriques['dm_multi_actions']).")
+    print("=" * 78 + "\n")
+
+
+# ==============================================================================
+# 7. PIPELINE : N PASSES
+# ==============================================================================
+
+def executer_passes(
+    dictio: Dict[Any, Any],
+    llm,
+    embeddings,
+    n_passes: int = 3,
+    nb_fenetres_cible: int = 12,
+    fenetre_min: int = 10,
+    fenetre_max: int = 60,
+    n_composantes: int = 3,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Repete n_passes fois : tri ACP (etape 1) puis actions uniques (etape 2).
+    Verifie la completude a chaque passe et retourne (actions, metriques).
+
+    La taille de fenetre est ADAPTATIVE : recalculee a chaque passe en fonction du
+    nombre d'elements restants, pour viser nb_fenetres_cible fenetres. A mesure que
+    la liste se condense, la fenetre s'elargit, ce qui permet aux actions similaires
+    encore separees de se rencontrer.
+
+    dictio            : sortie V1, dict {node: FicheVersionGlobale}
+    llm               : instance ChatOpenAI deja initialisee
+    embeddings        : instance OpenAIEmbeddings deja initialisee
+    n_passes          : nombre maximal de passes (arret anticipe si stabilite)
+    nb_fenetres_cible : nombre de fenetres vise a chaque passe
+    fenetre_min       : taille plancher d'une fenetre
+    fenetre_max       : taille plafond (protege le contexte du LLM)
+    n_composantes     : directions principales moyennees pour le tri
+    """
+    chaine = PROMPT_ACTIONS_UNIQUES | llm.with_structured_output(RapportActions)
+
+    # ---- Indexation -----------------------------------------------------
+    items = indexer_modifications(dictio)
+    if not items:
+        print("Aucune description a traiter.")
+        return [], {}
+
+    ids_attendus = set().union(*(it["ids_origine"] for it in items))
+    dm_attendus = set().union(*(it["codes_dm"] for it in items))
+    print(f"Indexation : {len(items)} modifications, {len(dm_attendus)} DM codes distincts.")
+    verifier_completude(items, ids_attendus, dm_attendus, "indexation")
+
+    # ---- Passes ---------------------------------------------------------
+    for passe in range(1, n_passes + 1):
+        nb_avant = len(items)
+        if nb_avant <= 1:
+            print(f"\nPasse {passe} : un seul element, arret.")
+            break
+
+        taille_fenetre = calculer_taille_fenetre(
+            nb_avant, nb_fenetres_cible, fenetre_min, fenetre_max
+        )
+        nb_fenetres = (nb_avant + taille_fenetre - 1) // taille_fenetre
+        print(f"\nPasse {passe}/{n_passes} : {nb_avant} elements en entree, "
+              f"fenetre adaptative = {taille_fenetre} ({nb_fenetres} fenetre(s)).")
+
+        items_tries = trier_par_acp(items, embeddings, n_composantes)
+        items = regrouper_en_actions(items_tries, chaine, taille_fenetre)
+        verifier_completude(items, ids_attendus, dm_attendus, f"passe {passe}")
+        print(f"    resultat : {nb_avant} -> {len(items)} actions "
+              f"(reduction {100 * (nb_avant - len(items)) / nb_avant:.1f}%).")
+
+        if len(items) == nb_avant:
+            print("    stabilite atteinte, arret anticipe.")
+            break
+
+    # ---- Metriques finales ----------------------------------------------
+    metriques = calculer_metriques(items)
+    afficher_metriques(items, metriques)
+
+    print(f"Condensation terminee : {len(ids_attendus)} modifications -> "
+          f"{len(items)} actions uniques. "
+          f"{metriques['nb_dm_cites']}/{len(dm_attendus)} DM codes cites.")
+    return items, metriques
+
+
+if __name__ == "__main__":
+    # llm        = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    # embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    # dictio     = generer_comptes_rendus_packs(...)
+    #
+    # La fenetre s'adapte seule a chaque passe (vise nb_fenetres_cible fenetres) :
+    # actions, metriques = executer_passes(dictio, llm, embeddings, n_passes=3)
+    #
+    # Reglages : viser moins de fenetres = fenetres plus larges = plus de fusion
+    # actions, metriques = executer_passes(dictio, llm, embeddings, n_passes=3,
+    #                                      nb_fenetres_cible=8, fenetre_max=80)
+    #
+    # for a in actions:
+    #     print(f"- {a['texte']}  [DM: {sorted(a['codes_dm'])}]")
+    #
+    # Index inverse complet : quel DM contient quelles actions
+    # for dm, idxs in sorted(metriques["dm_vers_actions"].items()):
+    #     print(dm, "->", idxs)
+    pass
+
+
+"""
+==============================================================================
+ ETAPE 3 - BOUCLE DE N PASSES (TRI ACP + ACTIONS UNIQUES)
+==============================================================================
+ Repete le processus : etape 1 (tri ACP) puis etape 2 (actions uniques),
+ sur la liste reduite issue de la passe precedente.
+
+   PASSE k :
+     1. Embedding des textes courants + tri ACP (n composantes moyennees)
+     2. Fenetres fixes + LLM : regroupement par action ("group by action")
+     3. Union deterministe de la tracabilite (ids, nodes, DM, chapitres)
+     4. Verification de completude (ids et DM codes)
+     5. Metriques de passe
+
+ Le re-tri de la passe suivante rapproche ce que les frontieres de fenetre
+ avaient separe : c'est ce qui fait converger la condensation.
+
+ Format d'item unique, stable d'une passe a l'autre :
+   {texte, ids_origine: set, nodes: set, codes_dm: set, chapitres: set}
+==============================================================================
+"""
+
+from typing import List, Dict, Any, Tuple
+from collections import Counter, defaultdict
+import re
+import numpy as np
+from pydantic import BaseModel, Field
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import normalize
+from langchain_core.prompts import ChatPromptTemplate
+
+
+# ==============================================================================
+# 1. SCHEMAS
+# ==============================================================================
+
+class ActionUnique(BaseModel):
+    texte: str = Field(
+        description=(
+            "L'action unique, exprimee de facon englobante : le point commun (nature et contenu "
+            "du changement) suivi de l'enumeration exhaustive des cibles concernees. Si un seul "
+            "[ID] la compose, son texte est recopie a l'identique."
+        )
+    )
+    ids_sources: List[int] = Field(
+        description="Tous les [ID] du lot que cette action unique englobe."
+    )
+
+class RapportActions(BaseModel):
+    actions_uniques: List[ActionUnique]
+
+
+# ==============================================================================
+# 2. PROMPT (group by action - la cible n'est pas un critere de separation)
+# ==============================================================================
+
+PROMPT_ACTIONS_UNIQUES = ChatPromptTemplate.from_messages([
+    ("system", (
+        "Vous etes un assistant d'analyse de modifications techniques documentaires.\n"
+        "On vous fournit un lot de modifications observees sur un ensemble de documents, "
+        "chacune precedee de son [ID].\n\n"
+
+        "VOTRE TACHE : effectuer un REGROUPEMENT PAR ACTION (« group by action »).\n"
+        "Ne regroupez PAS seulement les descriptions litteralement identiques. Cherchez, entre "
+        "les modifications du lot, LE DENOMINATEUR COMMUN : quelle EST L'ACTION qui a ete "
+        "effectuee, independamment de l'endroit ou de l'objet sur lequel elle a ete effectuee.\n"
+        "Une meme ACTION appliquee a plusieurs cibles differentes = UNE SEULE action unique, "
+        "ENGLOBANTE, qui enumere ses cibles.\n\n"
+
+        "PRINCIPE FONDAMENTAL - LA CIBLE N'EST PAS UN CRITERE DE SEPARATION :\n"
+        "Deux modifications qui font LA MEME CHOSE sur des cibles DIFFERENTES (figures, "
+        "composants, etapes, emplacements, numeros de reperes differents) constituent UNE SEULE "
+        "action unique. La cible n'est pas ce qui distingue les actions : c'est ce que l'action "
+        "englobante ENUMERE. Ne creez JAMAIS deux actions distinctes au seul motif que les "
+        "figures, les composants ou les numeros de reperes ne coincident pas.\n\n"
+
         "METHODE :\n"
         "1. Identifiez la NATURE de l'operation (ajout / suppression / remplacement) et le TYPE "
         "d'element concerne (repere, reference, mention, bloc...). C'est cela, l'action.\n"
