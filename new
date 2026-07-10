@@ -1,4 +1,14 @@
 
+description="""
+Analyse les modifications en suivant ces étapes strictes :
+1. CLASSIFICATION : Identifie les récurrences. Une 'modification répétée' est un pattern (ex: ajout d'un mot spécifique, changement de langue systématique, insertion de repère).
+2. SYNTHÈSE DES PATTERNS : Si un pattern existe, décris-le une seule fois en indiquant le type de changement et les endroits concernés (ex: 'Ajout de "rep. X" en début de chaque chapitre').
+3. MODIFICATIONS ISOLÉES : Si une modification est unique et ne fait partie d'aucun pattern, liste-la individuellement.
+4. EXCLUSION : Ne liste jamais les modifications qui sont déjà couvertes par un pattern.
+"""
+
+
+
 """
 ==============================================================================
  ETAPE 3 - BOUCLE DE N PASSES (TRI ACP + ACTIONS UNIQUES)
