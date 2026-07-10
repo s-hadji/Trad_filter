@@ -1,3 +1,52 @@
+import numpy as np
+from scipy.spatial.distance import cdist
+
+# On définit une fonction pour construire le chemin
+def get_nearest_neighbor_order(embeddings, docs):
+    n = len(embeddings)
+    # On commence par le premier élément (index 0)
+    current_idx = 0
+    sorted_indices = [current_idx]
+    
+    # On garde une trace des indices restants
+    remaining_indices = list(range(1, n))
+    
+    while remaining_indices:
+        # On récupère le vecteur actuel
+        current_vec = embeddings[current_idx].reshape(1, -1)
+        
+        # On récupère les vecteurs restants
+        remaining_vecs = embeddings[remaining_indices]
+        
+        # Calcul des distances cosinus entre le courant et tous les restants
+        # cdist renvoie une matrice de distances
+        distances = cdist(current_vec, remaining_vecs, metric='cosine')[0]
+        
+        # On trouve l'index dans 'remaining_indices' qui est le plus proche
+        min_dist_idx = np.argmin(distances)
+        
+        # On récupère l'index réel de l'élément dans la liste originale
+        next_idx = remaining_indices[min_dist_idx]
+        
+        # Mise à jour
+        sorted_indices.append(next_idx)
+        remaining_indices.pop(min_dist_idx)
+        current_idx = next_idx
+        
+    return sorted_indices
+
+# --- Application à votre projet ---
+# Utilisez 'embeded_doc' (vos vecteurs) et 'doc_to_embedd' (vos textes)
+indices_nearest = get_nearest_neighbor_order(embeded_doc, doc_to_embedd)
+
+# Reconstruction de la liste triée
+X_trie_nearest = [doc_to_embedd[i] for i in indices_nearest]
+
+
+
+
+
+
 
 description="""
 Analyse les modifications en suivant ces étapes strictes :
