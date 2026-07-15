@@ -1,3 +1,45 @@
+
+
+
+import difflib
+import re
+
+
+def diff_unifie(v1: str, v2: str) -> str:
+    """
+    Compare deux versions d'un texte et renvoie une sortie UNIFIEE :
+    ce qui est identique est conserve tel quel, ce qui change est marque
+    en ligne avec la version v1, la version v2 et le type de modification.
+
+    Types : MODIFIE (remplacement), SUPPRIME (present en v1 seulement),
+            AJOUTE (present en v2 seulement).
+    """
+    # Split intelligent : on decoupe en mots en gardant les separateurs,
+    # pour que les blocs marques restent lisibles (pas du caractere a caractere).
+    decoupe = lambda t: re.findall(r"\S+|\s+", t)
+    a, b = decoupe(v1), decoupe(v2)
+
+    sortie = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b).get_opcodes():
+        avant, apres = "".join(a[i1:i2]), "".join(b[j1:j2])
+
+        if tag == "equal":
+            sortie.append(avant)                       # commun : inchange
+        elif tag == "replace":
+            sortie.append(f"[MODIFIE | avant: {avant.strip()} | apres: {apres.strip()}]")
+        elif tag == "delete":
+            sortie.append(f"[SUPPRIME | avant: {avant.strip()}]")
+        elif tag == "insert":
+            sortie.append(f"[AJOUTE | apres: {apres.strip()}]")
+
+    return "".join(sortie)
+
+
+
+
+
+
+
 """
 ==============================================================================
  ETAPE 3 - BOUCLE DE N PASSES (TRI ACP + ACTIONS UNIQUES)
