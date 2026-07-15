@@ -1,3 +1,72 @@
+import difflib
+import re
+
+
+def diff_unifie(v1: str, v2: str, seuil_fusion: int = 30, contexte_mots: int = 20) -> str:
+    """
+    Compare deux versions et renvoie une sortie unifiee.
+
+    seuil_fusion  : si deux changements sont separes par une partie commune de
+                    moins de seuil_fusion caracteres, on considere que TOUT le bloc
+                    (changement + commun + changement) est modifie.
+    contexte_mots : dans les parties communes conservees, on ne garde que ce nombre
+                    de mots apres le changement precedent et avant le suivant ;
+                    le milieu est elide.
+    """
+    decoupe = lambda t: re.findall(r"\S+|\s+", t)
+    a, b = decoupe(v1), decoupe(v2)
+    opcodes = difflib.SequenceMatcher(None, a, b).get_opcodes()
+
+    # --- 1. FUSION : absorber les 'equal' trop courts entre deux changements ---
+    fusionnes = []
+    for op in opcodes:
+        tag, i1, i2, j1, j2 = op
+        taille = len("".join(a[i1:i2]))
+
+        # Un 'equal' court, coince entre deux changements -> on l'absorbe.
+        est_court = tag == "equal" and taille < seuil_fusion
+        entre_deux = bool(fusionnes) and fusionnes[-1][0] != "equal"
+        if est_court and entre_deux:
+            fusionnes.append(("replace", i1, i2, j1, j2))
+        else:
+            fusionnes.append(op)
+
+    # Recoller les changements consecutifs en un seul bloc
+    compacts = []
+    for tag, i1, i2, j1, j2 in fusionnes:
+        if compacts and tag != "equal" and compacts[-1][0] != "equal":
+            t0, pi1, _, pj1, _ = compacts[-1]
+            compacts[-1] = ("replace", pi1, i2, pj1, j2)
+        else:
+            compacts.append((tag, i1, i2, j1, j2))
+
+    # --- 2. RENDU avec elagage du contexte ---
+    sortie = []
+    for idx, (tag, i1, i2, j1, j2) in enumerate(compacts):
+        avant, apres = "".join(a[i1:i2]), "".join(b[j1:j2])
+
+        if tag == "equal":
+            mots = a[i1:i2]
+            debut = idx > 0                      # un changement precede
+            fin = idx < len(compacts) - 1        # un changement suit
+            # 2*contexte_mots jetons mots (+ separateurs) : on compte large
+            limite = contexte_mots * 2
+            if debut and fin and len(mots) > 2 * limite:
+                sortie.append("".join(mots[:limite]) + " [...] " + "".join(mots[-limite:]))
+            elif fin and not debut and len(mots) > limite:
+                sortie.append("[...] " + "".join(mots[-limite:]))
+            elif debut and not fin and len(mots) > limite:
+                sortie.append("".join(mots[:limite]) + " [...]")
+            else:
+                sortie.append("".join(mots))
+        elif tag == "replace":
+            sortie.append(f"[MODIFIE | avant: {avant.strip()} | apres: {apres.strip()}]")
+        elif tag == "delete":
+            sortie.append(f"[SUPPRIME | avant: {avant.strip()}]")
+        elif tag == "insert":
+            sortie.append(f"[AJOUTE | apres: {apres.strip()}]")
+
+    return "".join(sortie)
 
 
 
