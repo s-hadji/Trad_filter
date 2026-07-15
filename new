@@ -2,40 +2,64 @@ import difflib
 import re
 
 
-def diff_unifie(v1: str, v2: str, seuil_fusion: int = 30, contexte_mots: int = 20) -> str:
+def diff_unifie(
+    v1: str,
+    v2: str,
+    seuil_fusion: int = 30,
+    contexte_mots: int = 20,
+    skip_characters: str = " \t\n\r\f\v.,;:!?-_/\\|()[]{}'\"`~^*+=<>&#@$%°",
+) -> str:
     """
     Compare deux versions et renvoie une sortie unifiee.
 
-    seuil_fusion  : si deux changements sont separes par une partie commune de
-                    moins de seuil_fusion caracteres, on considere que TOUT le bloc
-                    (changement + commun + changement) est modifie.
-    contexte_mots : dans les parties communes conservees, on ne garde que ce nombre
-                    de mots apres le changement precedent et avant le suivant ;
-                    le milieu est elide.
+    seuil_fusion    : si deux changements sont separes par une partie commune de
+                      moins de seuil_fusion caracteres, tout le bloc est modifie.
+    contexte_mots   : nombre de mots de contexte conserves de part et d'autre.
+    skip_characters : jeu de caracteres sans valeur metier (blancs, ponctuation,
+                      symboles). Un changement dont l'avant ET l'apres ne sont
+                      composes QUE de ces caracteres (ou sont vides) est IGNORE :
+                      on rend le texte v2 tel quel, comme une partie commune.
     """
+    skip = set(skip_characters)
+    est_negligeable = lambda t: all(c in skip for c in t)  # vrai aussi si t == ""
+
     decoupe = lambda t: re.findall(r"\S+|\s+", t)
     a, b = decoupe(v1), decoupe(v2)
     opcodes = difflib.SequenceMatcher(None, a, b).get_opcodes()
+
+    # --- 0. NEUTRALISATION des changements sans valeur metier ---
+    # Fait AVANT la fusion : sinon un changement negligeable servirait de pont
+    # et ferait fusionner a tort deux vrais changements eloignes.
+    nettoyes = []
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag != "equal":
+            avant, apres = "".join(a[i1:i2]), "".join(b[j1:j2])
+            if est_negligeable(avant) and est_negligeable(apres):
+                tag = "equal"   # on l'assimile a du commun : il sera rendu tel quel
+        nettoyes.append((tag, i1, i2, j1, j2))
+
+    # Recoller les 'equal' devenus consecutifs
+    opcodes = []
+    for op in nettoyes:
+        if opcodes and op[0] == "equal" and opcodes[-1][0] == "equal":
+            t, pi1, _, pj1, _ = opcodes[-1]
+            opcodes[-1] = ("equal", pi1, op[2], pj1, op[4])
+        else:
+            opcodes.append(op)
 
     # --- 1. FUSION : absorber les 'equal' trop courts entre deux changements ---
     fusionnes = []
     for op in opcodes:
         tag, i1, i2, j1, j2 = op
         taille = len("".join(a[i1:i2]))
-
-        # Un 'equal' court, coince entre deux changements -> on l'absorbe.
         est_court = tag == "equal" and taille < seuil_fusion
         entre_deux = bool(fusionnes) and fusionnes[-1][0] != "equal"
-        if est_court and entre_deux:
-            fusionnes.append(("replace", i1, i2, j1, j2))
-        else:
-            fusionnes.append(op)
+        fusionnes.append(("replace", i1, i2, j1, j2) if (est_court and entre_deux) else op)
 
-    # Recoller les changements consecutifs en un seul bloc
     compacts = []
     for tag, i1, i2, j1, j2 in fusionnes:
         if compacts and tag != "equal" and compacts[-1][0] != "equal":
-            t0, pi1, _, pj1, _ = compacts[-1]
+            _, pi1, _, pj1, _ = compacts[-1]
             compacts[-1] = ("replace", pi1, i2, pj1, j2)
         else:
             compacts.append((tag, i1, i2, j1, j2))
@@ -46,10 +70,10 @@ def diff_unifie(v1: str, v2: str, seuil_fusion: int = 30, contexte_mots: int = 2
         avant, apres = "".join(a[i1:i2]), "".join(b[j1:j2])
 
         if tag == "equal":
-            mots = a[i1:i2]
-            debut = idx > 0                      # un changement precede
-            fin = idx < len(compacts) - 1        # un changement suit
-            # 2*contexte_mots jetons mots (+ separateurs) : on compte large
+            # Un 'equal' issu d'un changement neutralise peut differer entre v1 et v2
+            # (ex. espacement) : on rend la version v2, qui est la plus recente.
+            mots = b[j1:j2] if apres else a[i1:i2]
+            debut, fin = idx > 0, idx < len(compacts) - 1
             limite = contexte_mots * 2
             if debut and fin and len(mots) > 2 * limite:
                 sortie.append("".join(mots[:limite]) + " [...] " + "".join(mots[-limite:]))
@@ -67,6 +91,7 @@ def diff_unifie(v1: str, v2: str, seuil_fusion: int = 30, contexte_mots: int = 2
             sortie.append(f"[AJOUTE | apres: {apres.strip()}]")
 
     return "".join(sortie)
+
 
 
 
