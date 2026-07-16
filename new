@@ -1,4 +1,29 @@
 
+
+def has_changes(
+    v1: str,
+    v2: str,
+    skip_characters: str = " \t\n\r\f\v.,;:!?-_/\\|()[]{}'\"`~^*+=<>&#@$%°",
+) -> bool:
+    """
+    Renvoie True s'il existe au moins un changement ayant une valeur metier
+    entre v1 et v2, selon les memes regles que diff_unifie.
+    """
+    skip = set(skip_characters)
+    est_negligeable = lambda t: all(c in skip for c in t)
+
+    decoupe = lambda t: re.findall(r"\S+|\s+", t)
+    a, b = decoupe(v1), decoupe(v2)
+
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b).get_opcodes():
+        if tag == "equal":
+            continue
+        avant, apres = "".join(a[i1:i2]), "".join(b[j1:j2])
+        if not (est_negligeable(avant) and est_negligeable(apres)):
+            return True
+    return False
+
+
 from collections import defaultdict
 
 def construire_trie(entrees, parent):
