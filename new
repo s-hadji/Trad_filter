@@ -1,3 +1,4 @@
+print({c: {v: len(d) for v, d in docs.items()} for c, docs in par_code.items()})
 
 from collections import defaultdict
 
