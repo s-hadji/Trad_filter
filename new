@@ -1,3 +1,31 @@
+
+
+def get_paths(node, prefix=""):
+    # On construit le chemin actuel
+    current = f"{prefix}/{node['name']}".lstrip('/')
+    
+    # On renvoie le chemin
+    yield current
+    
+    # On descend dans les enfants s'ils existent
+    for child in node.get('children', []):
+        yield from get_paths(child, current)
+
+# --- Utilisation ---
+# Supposons que votre XML parsé ressemble à ça :
+arbre = {
+    'name': 'Racine',
+    'children': [
+        {'name': 'Enfant1', 'children': [{'name': 'PetitEnfant'}]},
+        {'name': 'Enfant2', 'children': []}
+    ]
+}
+
+# Pour afficher les chemins :
+for path in get_paths(arbre):
+    print(path)
+
+
 import difflib
 import re
 
