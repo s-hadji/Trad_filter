@@ -1,3 +1,170 @@
+
+import json
+from typing import List, Dict
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
+
+
+# --- Schémas : un DM = une fiche. Patterns INTERNES au DM uniquement ---
+class ModificationRecurrente(BaseModel):
+    """Un pattern de modification repete plusieurs fois DANS ce meme document."""
+    description: str = Field(
+        description="Description generique de l'evolution repetee (ancienne valeur -> nouvelle valeur)."
+    )
+    occurrences: List[str] = Field(
+        description="Liste des emplacements (chapitres, chemins, sections) ou ce pattern se repete dans le document."
+    )
+    nombre_occurrences: int = Field(description="Nombre total d'occurrences du pattern dans le document.")
+
+class ModificationPonctuelle(BaseModel):
+    """Une modification unique, non repetee dans le document."""
+    chapitre: str = Field(description="Chapitre ou chemin cible de cette modification.")
+    description: str = Field(
+        description="Description humaine, claire et technique de l'evolution entre l'ancienne et la nouvelle valeur."
+    )
+
+class FicheDM(BaseModel):
+    """Fiche d'UN seul code DM."""
+    code_dm: str = Field(description="Le code DM analyse, recopie a l'identique.")
+    modifications_recurrentes: List[ModificationRecurrente] = Field(
+        default_factory=list,
+        description="Patterns de modification repetes a plusieurs endroits DANS ce document."
+    )
+    modifications_ponctuelles: List[ModificationPonctuelle] = Field(
+        default_factory=list,
+        description="Modifications isolees de ce document, n'appartenant a aucun pattern."
+    )
+
+class FicheVersionGlobale(BaseModel):
+    titre_fiche: str = Field(description="Intitule formel de la note de version.")
+    resume_macro: str = Field(description="Explication globale de haut niveau synthetisant l'impact technique.")
+    fiches_dm: List[FicheDM] = Field(description="Une fiche par code DM, sans regroupement inter-documents.")
+
+
+# --- Prompt 1 : analyse d'un DM isolé, avec detection de patterns internes ---
+prompt_dm = ChatPromptTemplate.from_messages([
+    ("system",
+     "Vous etes un expert de la documentation technique et de la gestion de configuration.\n"
+     "Vous analysez UN SEUL document (un code DM) et son condensat brut de modifications.\n\n"
+     "METHODE D'ANALYSE EN DEUX TEMPS :\n"
+     "Temps 1 - Inventaire : relevez mentalement CHAQUE modification du texte, sans exception, "
+     "avec son emplacement (chapitre, chemin, section).\n"
+     "Temps 2 - Detection de patterns INTERNES : comparez ces modifications entre elles. Si une meme "
+     "evolution se repete a plusieurs emplacements DIFFERENTS du document (meme nature de changement, "
+     "meme ancienne valeur vers meme nouvelle valeur, ou meme regle appliquee mecaniquement), "
+     "factorisez-la dans 'modifications_recurrentes' :\n"
+     "  - 'description' : formulation generique du pattern, une seule fois.\n"
+     "  - 'occurrences' : la liste COMPLETE des emplacements concernes.\n"
+     "  - 'nombre_occurrences' : le compte exact, egal a la longueur de 'occurrences'.\n"
+     "Toute modification qui n'apparait qu'une seule fois va dans 'modifications_ponctuelles'.\n\n"
+     "REGLES IMPERATIVES :\n"
+     "1. Recopiez le code DM fourni a l'identique dans 'code_dm'.\n"
+     "2. La detection de patterns est STRICTEMENT INTERNE a ce document. Ne comparez jamais avec un "
+     "autre code DM et n'evoquez aucun autre document.\n"
+     "3. Un pattern exige au minimum 2 occurrences a des emplacements distincts. En dessous, c'est une "
+     "modification ponctuelle.\n"
+     "4. Un pattern requiert une identite reelle de la nature du changement, pas une simple ressemblance "
+     "thematique. En cas de doute, classez en ponctuel.\n"
+     "5. EXHAUSTIVITE : chaque modification du texte doit apparaitre exactement une fois, soit comme "
+     "occurrence d'un pattern, soit comme modification ponctuelle. Jamais les deux, jamais aucune.\n"
+     "6. Si aucune modification n'est identifiable, retournez deux listes vides.\n\n"
+     "Regles de redaction strictes :\n"
+     "- Aucun emoji, icone ou artifice de mise en forme.\n"
+     "- Phrases fluides, orientees metier, factuelles, neutres et concises."),
+    ("user",
+     "Code DM : {code_dm}\n\n"
+     "Contenu md_out :\n{md_out}\n\n"
+     "Generez la fiche de ce document : patterns internes factorises, le reste en ponctuel.")
+])
+
+# --- Prompt 2 : titre + résumé macro uniquement ---
+prompt_synthese = ChatPromptTemplate.from_messages([
+    ("system",
+     "Vous etes un expert de la gestion de configuration. On vous fournit les fiches deja analysees, "
+     "document par document. Produisez uniquement un intitule formel de note de version et un resume "
+     "macro synthetisant l'impact technique global.\n"
+     "N'inventez aucune modification. Aucun emoji. Style factuel, neutre et concis."),
+    ("user",
+     "Pivot : {nom_pivot}\n\nFiches par document :\n{fiches_json}")
+])
+
+class _Synthese(BaseModel):
+    titre_fiche: str
+    resume_macro: str
+
+
+def _normaliser(fiche: FicheDM, code_dm: str) -> FicheDM:
+    """Garde-fous deterministes post-LLM."""
+    fiche.code_dm = code_dm  # anti-hallucination
+
+    conserves: List[ModificationRecurrente] = []
+    for p in fiche.modifications_recurrentes:
+        # Deduplication des emplacements
+        p.occurrences = list(dict.fromkeys(o for o in p.occurrences if o and o.strip()))
+        if len(p.occurrences) < 2:
+            # Faux pattern : retrograde en ponctuel
+            fiche.modifications_ponctuelles.append(ModificationPonctuelle(
+                chapitre=p.occurrences[0] if p.occurrences else "Non precise",
+                description=p.description,
+            ))
+            continue
+        p.nombre_occurrences = len(p.occurrences)  # recompte force
+        conserves.append(p)
+    fiche.modifications_recurrentes = conserves
+    return fiche
+
+
+def generer_comptes_rendus_packs(packs_nettoyes, max_retries: int = 2) -> Dict[object, FicheVersionGlobale]:
+    dictionnaire_final = {}
+
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
+    chaine_dm = prompt_dm | llm.with_structured_output(FicheDM)
+    chaine_synthese = prompt_synthese | llm.with_structured_output(_Synthese)
+
+    for pack in packs_nettoyes:
+        noeud_pivot = pack["node"]
+        donnees_feuilles = pack["donnees"]
+        nom_pivot = getattr(noeud_pivot, "name", "Noeud_Anonyme")
+
+        print(f"Analyse du pack : {nom_pivot} ({len(donnees_feuilles)} documents)...")
+
+        fiches_par_dm: List[FicheDM] = []
+        for code_dm, md_out in donnees_feuilles.items():
+            texte = str(md_out)
+            fiche = None
+            for tentative in range(max_retries + 1):
+                fiche = _normaliser(chaine_dm.invoke({"code_dm": code_dm, "md_out": texte}), code_dm)
+                if fiche.modifications_recurrentes or fiche.modifications_ponctuelles or not texte.strip():
+                    break
+                print(f"   ! DM {code_dm} : tentative {tentative + 1} vide, relance")
+            nb_p = sum(p.nombre_occurrences for p in fiche.modifications_recurrentes)
+            print(f"   - DM {code_dm} : {len(fiche.modifications_recurrentes)} pattern(s) "
+                  f"({nb_p} occurrences), {len(fiche.modifications_ponctuelles)} ponctuelle(s)")
+            fiches_par_dm.append(fiche)
+
+        # Completude : un DM en entree = une fiche en sortie, dans l'ordre d'entree
+        codes_attendus = list(donnees_feuilles.keys())
+        index = {f.code_dm: f for f in fiches_par_dm}
+        for c in codes_attendus:
+            index.setdefault(c, FicheDM(code_dm=c))
+        fiches_par_dm = [index[c] for c in codes_attendus]
+
+        fiches_json = json.dumps([f.model_dump() for f in fiches_par_dm], indent=2, ensure_ascii=False)
+        synthese = chaine_synthese.invoke({"nom_pivot": nom_pivot, "fiches_json": fiches_json})
+
+        dictionnaire_final[noeud_pivot] = FicheVersionGlobale(
+            titre_fiche=synthese.titre_fiche,
+            resume_macro=synthese.resume_macro,
+            fiches_dm=fiches_par_dm,
+        )
+
+    return dictionnaire_final
+
+
+
+
+
 """
 ==============================================================================
  PROMPTS DÉFINITIFS — V1 (comptes rendus par pack) & V2 (fusion / condensation)
