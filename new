@@ -1,3 +1,60 @@
+
+from collections import defaultdict
+
+def construire_trie(entrees, parent):
+    # --- 1. Appariement global par dm_code, indépendant du chemin ---
+    paires = defaultdict(lambda: {"v1": [], "v2": [], "tokens": None})
+    for tokens, code, doc, version in entrees:
+        p = paires[code]
+        p[version].append(doc)
+        if p["tokens"] is None:
+            p["tokens"] = tokens        # chemin de référence = premier vu
+
+    # --- 2. Ré-explosion en entrées appariées ---
+    appariees = []
+    for code, p in paires.items():
+        v1, v2 = p["v1"], p["v2"]
+        for i in range(max(len(v1), len(v2))):
+            appariees.append((
+                p["tokens"], code, i,
+                v1[i] if i < len(v1) else None,
+                v2[i] if i < len(v2) else None,
+            ))
+
+    _construire(appariees, parent)
+
+
+def _construire(entrees, parent):
+    # Feuilles
+    for tokens, code, i, d1, d2 in entrees:
+        if tokens:
+            continue
+        feuille = Node(code if i == 0 else f"{code}_{i + 1}", parent=parent)
+        feuille.dm_code = code
+        feuille.feuille = True
+        feuille.statut = "FEUILLE"
+        feuille.doc_v1 = d1
+        feuille.doc_v2 = d2
+
+    # Branches
+    groupes = defaultdict(list)
+    for e in entrees:
+        if e[0]:
+            groupes[e[0][0].lower()].append(e)
+
+    for _, groupe in sorted(groupes.items()):
+        chemins = [e[0] for e in groupe]
+        n = 0
+        for i in range(min(len(c) for c in chemins)):
+            if len({c[i].lower() for c in chemins}) > 1:
+                break
+            n = i + 1
+        branche = Node(".".join(chemins[0][:n]), parent=parent)
+        _construire([(t[n:], c, i, d1, d2) for t, c, i, d1, d2 in groupe], branche)
+
+
+
+
 print({c: {v: len(d) for v, d in docs.items()} for c, docs in par_code.items()})
 
 from collections import defaultdict
