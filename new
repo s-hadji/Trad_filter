@@ -15,30 +15,43 @@ def get_full_path(root, target_node, path=""):
     return None
 
 
-def get_paths(node, prefix=""):
-    # On construit le chemin actuel
-    current = f"{prefix}/{node['name']}".lstrip('/')
-    
-    # On renvoie le chemin
-    yield current
-    
-    # On descend dans les enfants s'ils existent
-    for child in node.get('children', []):
-        yield from get_paths(child, current)
+def construire_tree(racine, entrees):
+    """
+    entrees: liste de tuples (tokens, code, doc, version)
+    tokens: liste des noms de nœuds (ex: ['com', 'google', 'maps'])
+    """
+    for tokens, code, doc, version in entrees:
+        current = racine
+        
+        # 1. On parcourt les tokens pour naviguer ou créer le chemin
+        for token in tokens:
+            # Chercher si l'enfant existe déjà
+            enfant_existant = next((c for c in current.children if c.name == token), None)
+            
+            if enfant_existant:
+                current = enfant_existant
+            else:
+                # Création automatique : la classe Node s'occupe de l'ajouter au parent
+                current = Node(token, parent=current)
+        
+        # 2. Une fois arrivé au bout, on remplit les données du nœud feuille
+        current.feuille = True
+        current.dm_code = code
+        
+        # Gestion des versions (remplace ta logique v1/v2)
+        if version == "v1":
+            current.doc_v1 = doc
+        elif version == "v2":
+            current.doc_v2 = doc
 
-# --- Utilisation ---
-# Supposons que votre XML parsé ressemble à ça :
-arbre = {
-    'name': 'Racine',
-    'children': [
-        {'name': 'Enfant1', 'children': [{'name': 'PetitEnfant'}]},
-        {'name': 'Enfant2', 'children': []}
-    ]
-}
-
-# Pour afficher les chemins :
-for path in get_paths(arbre):
-    print(path)
+# --- Exemple d'utilisation ---
+# racine = Node("Root")
+# mes_donnees = [
+#     (['com', 'google', 'maps'], 'CODE1', 'doc_A', 'v1'),
+#     (['com', 'google', 'maps'], 'CODE1', 'doc_B', 'v2'),
+#     (['com', 'google', 'search'], 'CODE2', 'doc_C', 'v1')
+# ]
+# construire_tree(racine, mes_donnees)
 
 
 import difflib
