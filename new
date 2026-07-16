@@ -1,3 +1,18 @@
+def get_full_path(root, target_node, path=""):
+    # Construction du nom du chemin à ce niveau
+    current_path = f"{path}/{root['name']}".lstrip('/')
+    
+    # Si c'est le nœud qu'on cherche, on retourne le chemin
+    if root is target_node:
+        return current_path
+    
+    # Sinon, on cherche récursivement dans les enfants
+    for child in root.get('children', []):
+        result = get_full_path(child, target_node, current_path)
+        if result:
+            return result
+            
+    return None
 
 
 def get_paths(node, prefix=""):
