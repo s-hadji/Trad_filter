@@ -1,3 +1,23 @@
+def construire_feuilles(entrees, parent):
+    par_code = defaultdict(lambda: {"v1": [], "v2": []})
+    for _, code, doc, version in entrees:
+        par_code[code][version].append(doc)
+
+    for code, docs in par_code.items():
+        v1, v2 = docs["v1"], docs["v2"]
+        n = max(len(v1), len(v2))
+        for i in range(n):
+            nom = code if n == 1 else f"{code}_{i+1}"
+            noeud = Node(nom, parent=parent)
+            noeud.dm_code = code
+            noeud.feuille = True
+            noeud.doc_v1 = v1[i] if i < len(v1) else None
+            noeud.doc_v2 = v2[i] if i < len(v2) else None
+
+
+
+
+
 def get_full_path(root, target_node, path=""):
     # Construction du nom du chemin à ce niveau
     current_path = f"{path}/{root['name']}".lstrip('/')
