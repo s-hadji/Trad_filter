@@ -1,3 +1,55 @@
+
+from collections import defaultdict
+
+
+def construire_trie(entrees, parent):
+    """
+    entrees : liste de (tokens_chemin, dm_code, doc, version)
+    Crée les feuilles (chemin épuisé) puis récurse sur les branches.
+    """
+
+    # --- 1. Feuilles : une par paire (v1, v2) d'un même dm_code ---
+    par_code = defaultdict(lambda: {"v1": [], "v2": []})
+    for tokens, code, doc, version in entrees:
+        if not tokens:
+            par_code[code][version].append(doc)
+
+    for code, docs in par_code.items():
+        v1, v2 = docs["v1"], docs["v2"]
+        nb = max(len(v1), len(v2))
+        for i in range(nb):
+            feuille = Node(code if nb == 1 else f"{code}_{i + 1}", parent=parent)
+            feuille.dm_code = code
+            feuille.feuille = True
+            feuille.statut = "FEUILLE"
+            feuille.doc_v1 = v1[i] if i < len(v1) else None
+            feuille.doc_v2 = v2[i] if i < len(v2) else None
+
+    # --- 2. Branches : regroupement par premier token ---
+    groupes = defaultdict(list)
+    for entree in entrees:
+        tokens = entree[0]
+        if tokens:
+            groupes[tokens[0].lower()].append(entree)
+
+    for _, groupe in sorted(groupes.items()):
+        chemins = [e[0] for e in groupe]
+
+        # longueur du préfixe commun à tout le groupe (insensible à la casse)
+        n = 0
+        for i in range(min(len(c) for c in chemins)):
+            if len({c[i].lower() for c in chemins}) > 1:
+                break
+            n = i + 1
+
+        branche = Node(".".join(chemins[0][:n]), parent=parent)
+        construire_trie([(t[n:], c, d, v) for t, c, d, v in groupe], branche)
+
+
+
+
+
+
 def construire_feuilles(entrees, parent):
     par_code = defaultdict(lambda: {"v1": [], "v2": []})
     for _, code, doc, version in entrees:
