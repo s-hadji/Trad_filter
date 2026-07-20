@@ -1,3 +1,48 @@
+
+import numpy as np
+from scipy.spatial.distance import cdist
+
+
+def get_nearest_neighbor_order(embeddings):
+    n = len(embeddings)
+    current_idx = 0
+    sorted_indices = [current_idx]
+    remaining_indices = list(range(1, n))
+
+    while remaining_indices:
+        current_vec = embeddings[current_idx].reshape(1, -1)
+        remaining_vecs = embeddings[remaining_indices]
+        distances = cdist(current_vec, remaining_vecs, metric="cosine")[0]
+        min_dist_idx = np.argmin(distances)
+        next_idx = remaining_indices[min_dist_idx]
+        sorted_indices.append(next_idx)
+        remaining_indices.pop(min_dist_idx)
+        current_idx = next_idx
+
+    return sorted_indices
+
+
+# --- Tri des DMC par proximité sémantique ---
+# On reprend les listes parallèles codes / contenus / vecteurs
+vecteurs_np = np.array(vecteurs)
+
+if len(codes) < 2:
+    ordre = list(range(len(codes)))
+else:
+    ordre = get_nearest_neighbor_order(vecteurs_np)
+
+# Dictionnaire final, réordonné (l'ordre d'insertion est conservé)
+documents_tries = {
+    codes[i]: {"contenu": contenus[i], "vecteur": vecteurs[i]}
+    for i in ordre
+}
+
+# Vérif : l'ordre des DMC après tri
+for rang, i in enumerate(ordre, 1):
+    print(f"{rang}. {codes[i]}")
+
+
+
 import re
 
 # 1. Regrouper par DMC réel et merger les résumés
