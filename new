@@ -1,3 +1,173 @@
+from typing import List, Dict, Optional
+from pydantic import BaseModel, Field
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+
+
+# =================================================================== #
+#  Un "élément" de fusion : contenu + liste de DMC accumulés          #
+# =================================================================== #
+class ElementMerge(BaseModel):
+    dmcodes: List[str]       # tous les DMC couverts par ce contenu
+    contenu: str             # texte (résumé ou fusion de résumés)
+
+
+# =================================================================== #
+#  Schéma de décision du LLM                                          #
+# =================================================================== #
+class DecisionMerge(BaseModel):
+    dmcodes: List[str] = Field(
+        description="UNION de TOUS les codes DM des documents du lot, recopies a l'identique."
+    )
+    mergeable: bool = Field(
+        description="True si les documents du lot peuvent etre fusionnes en un seul, sinon False."
+    )
+    output_of_merge: Optional[str] = Field(
+        default=None,
+        description="Si mergeable=True : le contenu fusionne. Sinon null."
+    )
+    why_not_mergeable: Optional[str] = Field(
+        default=None,
+        description="Si mergeable=False : pourquoi la fusion n'est pas pertinente. Sinon null."
+    )
+
+
+PROMPT_MERGE = ChatPromptTemplate.from_messages([
+    ("system",
+     "Vous etes un expert de la documentation technique et de la gestion de configuration.\n"
+     "On vous fournit un lot de documents. Chaque document couvre DEJA un ou plusieurs codes DM "
+     "et decrit des modifications. Votre role est de decider si ces documents peuvent etre FUSIONNES "
+     "en un seul, c'est-a-dire s'ils portent sur des modifications assez proches ou complementaires "
+     "pour etre presentees ensemble de maniere coherente.\n\n"
+     "CONSIGNES :\n"
+     "1. Dans 'dmcodes', recopiez l'UNION de TOUS les codes DM de TOUS les documents du lot, a "
+     "l'identique, sans en oublier ni en ajouter.\n"
+     "2. Decidez 'mergeable' : true si la fusion a du sens, false sinon.\n"
+     "3. Si mergeable=true : redigez dans 'output_of_merge' le contenu fusionne, clair et sans "
+     "redondance, couvrant les modifications de tous les documents. Laissez 'why_not_mergeable' vide.\n"
+     "4. Si mergeable=false : expliquez dans 'why_not_mergeable' pourquoi. Laissez 'output_of_merge' vide.\n\n"
+     "Aucun emoji. Style factuel, neutre et concis."),
+    ("user",
+     "Lot de {nb} document(s) a evaluer :\n\n{documents}\n\n"
+     "Codes DM attendus dans votre reponse (union) : {codes_attendus}")
+])
+
+
+# =================================================================== #
+#  Une passe de fusion sur une liste d'éléments                       #
+# =================================================================== #
+def une_passe(elements: List[ElementMerge], chaine, taille_lot: int = 5,
+              nombre_essais: int = 3) -> List[ElementMerge]:
+    """
+    Parcourt les elements par fenetres de 'taille_lot'. Chaque lot fusionnable
+    devient UN element (dmcodes = union). Chaque lot non fusionnable est conserve
+    tel quel (ses elements repassent individuellement).
+    Renvoie la nouvelle liste d'elements + verifie la completude des DMC.
+    """
+    total = len(elements)
+    nb_lots = (total + taille_lot - 1) // taille_lot
+    print(f"  {total} element(s), {nb_lots} lot(s) de {taille_lot}")
+
+    resultat: List[ElementMerge] = []
+
+    for numero_lot, debut in enumerate(range(0, total, taille_lot), 1):
+        lot = elements[debut: debut + taille_lot]
+        codes_lot = [c for el in lot for c in el.dmcodes]  # union attendue
+
+        bloc = "\n\n".join(
+            f"--- Document {i+1} (DM : {', '.join(el.dmcodes)}) ---\n{el.contenu}"
+            for i, el in enumerate(lot)
+        )
+
+        decision = _demander(chaine, bloc, codes_lot, nombre_essais)
+
+        # Completude du lot : la reponse doit couvrir exactement les DMC envoyes
+        attendus, obtenus = set(codes_lot), set(decision.dmcodes)
+        if attendus != obtenus:
+            print(f"    ! Lot {numero_lot} ecart DMC "
+                  f"(manquants={sorted(attendus - obtenus)}, en_trop={sorted(obtenus - attendus)}) "
+                  f"-> correction forcee")
+            decision.dmcodes = codes_lot
+
+        if decision.mergeable and decision.output_of_merge:
+            # Le lot fusionne devient un seul element accumulant tous les DMC
+            resultat.append(ElementMerge(dmcodes=codes_lot, contenu=decision.output_of_merge))
+            print(f"    Lot {numero_lot}/{nb_lots} : MERGE ({len(codes_lot)} DMC)")
+        else:
+            # Non fusionnable : on conserve les elements du lot tels quels
+            resultat.extend(lot)
+            print(f"    Lot {numero_lot}/{nb_lots} : NON merge — {decision.why_not_mergeable}")
+
+    return resultat
+
+
+def _demander(chaine, bloc, codes_lot, nombre_essais):
+    for essai in range(1, nombre_essais + 1):
+        try:
+            return chaine.invoke({
+                "nb": bloc.count("--- Document"),
+                "documents": bloc,
+                "codes_attendus": ", ".join(codes_lot),
+            })
+        except Exception as erreur:
+            print(f"    ! Essai {essai} echoue ({type(erreur).__name__}: {erreur})")
+    return DecisionMerge(dmcodes=codes_lot, mergeable=False,
+                         why_not_mergeable="[Echec d'appel LLM sur ce lot]")
+
+
+# =================================================================== #
+#  Fusion hiérarchique : plusieurs passes jusqu'à stabilisation       #
+# =================================================================== #
+def fusion_hierarchique(documents_tries: Dict[str, dict], taille_lot: int = 5,
+                        max_passes: int = 5) -> List[ElementMerge]:
+    """
+    Passe 1 sur les DMC individuels, puis passes successives sur les resultats
+    merges, jusqu'a ce que plus rien ne fusionne (ou max_passes atteint).
+    """
+    # Élément initial = un DMC = un contenu
+    elements = [
+        ElementMerge(dmcodes=[dmc], contenu=doc["contenu"])
+        for dmc, doc in documents_tries.items()
+    ]
+    tous_les_dmc = {c for el in elements for c in el.dmcodes}
+
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.1, max_tokens=4000)
+    chaine = PROMPT_MERGE | llm.with_structured_output(DecisionMerge)
+
+    for passe in range(1, max_passes + 1):
+        print(f"\n=== PASSE {passe} ===")
+        avant = len(elements)
+        elements = une_passe(elements, chaine, taille_lot)
+        apres = len(elements)
+
+        # Completude globale a chaque passe : aucun DMC ne doit disparaitre
+        dmc_courants = {c for el in elements for c in el.dmcodes}
+        manquants = tous_les_dmc - dmc_courants
+        if manquants:
+            print(f"  ATTENTION : DMC perdus a la passe {passe} : {sorted(manquants)}")
+        else:
+            print(f"  Completude OK : {len(dmc_courants)}/{len(tous_les_dmc)} DMC preserves")
+
+        print(f"  {avant} -> {apres} element(s)")
+        if apres == avant:      # plus aucune fusion : on s'arrete
+            print("  Stabilise, arret.")
+            break
+
+    return elements
+
+
+# =================================================================== #
+#  Exemple d'utilisation                                              #
+# =================================================================== #
+# resultat_final = fusion_hierarchique(documents_tries, taille_lot=5)
+# for el in resultat_final:
+#     print(f"\nDMC ({len(el.dmcodes)}) : {el.dmcodes}")
+#     print(el.contenu)
+
+
+
+
+
 
 from typing import List, Dict, Optional
 from pydantic import BaseModel, Field
