@@ -1,3 +1,9 @@
+if len(doc_to_embedd) < 2:
+    X_trie_nearest = list(doc_to_embedd)
+else:
+    embeded_doc = np.array(embedding.embed_documents(doc_to_embedd))
+    indices_nearest = get_nearest_neighbor_order(embeded_doc, doc_to_embedd)
+    X_trie_nearest = [doc_to_embedd[i] for i in indices_nearest]
 
 
 import numpy as np
