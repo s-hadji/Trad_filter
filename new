@@ -1,7 +1,7 @@
 
 import re
-from typing import Dict, List, Optional
-from dataclasses import dataclass, field
+from typing import Dict, List
+from dataclasses import dataclass
 
 
 # =================================================================== #
@@ -9,16 +9,32 @@ from dataclasses import dataclass, field
 # =================================================================== #
 def nettoyer_dmc(code_dm: str) -> str:
     """
-    Retire le suffixe repère ' _X' (espace + underscore + numero) que tu as
-    ajoute manuellement, pour retrouver le vrai code DMC.
-    Exemple : 'EG-G-05-00A-000A-A _3' -> 'EG-G-05-00A-000A-A'
+    Retire le suffixe repère ' _X' ajoute manuellement.
+    'EG-G-05-00A-000A-A _3' -> 'EG-G-05-00A-000A-A'
     """
-    return re.sub(r"\s*_\d+\s*$", "", code_dm).strip()
+    return re.sub(r"\s*_\d+\s*$", "", str(code_dm)).strip()
 
 
-def dmc_uniques(resumes: Dict[str, "ResumeDM"]) -> set:
-    """Ensemble des DMC nettoyes presents dans les resumes."""
-    return {nettoyer_dmc(code) for code in resumes.keys()}
+# =================================================================== #
+#  ÉTAPE CLÉ : regrouper les resumes par DMC réel                     #
+# =================================================================== #
+def regrouper_resumes_par_dmc(resumes: Dict[str, "ResumeDM"]) -> Dict[str, List[str]]:
+    """
+    Plusieurs cles de 'resumes' peuvent designer le MEME vrai DMC (suffixes _1,
+    _2...). On les regroupe et on fusionne leurs resumes, en supprimant les
+    doublons exacts. Renvoie {dmc_reel: [resumes distincts]}.
+    """
+    regroupes: Dict[str, List[str]] = {}
+
+    for code, resume_obj in resumes.items():
+        dmc = nettoyer_dmc(code)
+        texte = resume_obj.resume.strip()
+
+        liste = regroupes.setdefault(dmc, [])
+        if texte and texte not in liste:  # anti-doublon exact
+            liste.append(texte)
+
+    return regroupes
 
 
 # =================================================================== #
@@ -26,9 +42,9 @@ def dmc_uniques(resumes: Dict[str, "ResumeDM"]) -> set:
 # =================================================================== #
 @dataclass
 class FeuilleTrouvee:
-    dm_code: str                 # DMC nettoye
-    chemin: List[str]            # noms des nodes, de la racine jusqu'a la feuille
-    modifications: str           # le resume associe a ce DMC
+    dm_code: str                 # DMC nettoye (unique)
+    chemin: List[str]            # noms des nodes, racine -> feuille
+    modifications: List[str]     # resumes fusionnes de ce DMC
 
     def chemin_texte(self) -> str:
         return " > ".join(self.chemin)
@@ -39,29 +55,25 @@ class FeuilleTrouvee:
 # =================================================================== #
 def parcourir_arbre(racine, resumes: Dict[str, "ResumeDM"]) -> Dict[str, FeuilleTrouvee]:
     """
-    Descend depuis la racine via l'attribut 'children'. Pour chaque node dont le
-    DMC nettoye figure dans 'resumes', enregistre son chemin et ses modifications.
-    Renvoie {dm_code_nettoye: FeuilleTrouvee}.
+    Regroupe d'abord les resumes par DMC reel, puis descend l'arbre depuis la
+    racine. Chaque DMC recherche n'est associe qu'UNE fois a son chemin.
     """
-    # On indexe les resumes par DMC nettoye pour un acces direct
-    resumes_par_dmc = {nettoyer_dmc(code): r for code, r in resumes.items()}
-
+    modifs_par_dmc = regrouper_resumes_par_dmc(resumes)  # {dmc: [modifs]}
     trouvees: Dict[str, FeuilleTrouvee] = {}
 
     def descendre(node, chemin_courant: List[str]):
         nom = getattr(node, "name", "?")
         chemin = chemin_courant + [nom]
 
-        # Ce node correspond-il a un DMC qu'on cherche ?
-        dm_code = nettoyer_dmc(str(getattr(node, "dm_code", "") or ""))
-        if dm_code and dm_code in resumes_par_dmc:
-            trouvees[dm_code] = FeuilleTrouvee(
-                dm_code=dm_code,
+        dmc = nettoyer_dmc(getattr(node, "dm_code", "") or "")
+        # On enregistre une seule fois par DMC (le premier node rencontre)
+        if dmc and dmc in modifs_par_dmc and dmc not in trouvees:
+            trouvees[dmc] = FeuilleTrouvee(
+                dm_code=dmc,
                 chemin=chemin,
-                modifications=resumes_par_dmc[dm_code].resume,
+                modifications=modifs_par_dmc[dmc],
             )
 
-        # On continue la descente sur les enfants
         for enfant in getattr(node, "children", []) or []:
             descendre(enfant, chemin)
 
@@ -70,55 +82,26 @@ def parcourir_arbre(racine, resumes: Dict[str, "ResumeDM"]) -> Dict[str, Feuille
 
 
 # =================================================================== #
-#  Affichage en arborescence                                          #
+#  Affichage                                                          #
 # =================================================================== #
-def afficher_arbre(racine, resumes: Dict[str, "ResumeDM"]) -> None:
-    """
-    Affiche l'arbre depuis la racine. Chaque node est indente selon sa profondeur ;
-    les feuilles presentes dans 'resumes' affichent leur DMC et leurs modifications.
-    """
-    resumes_par_dmc = {nettoyer_dmc(code): r for code, r in resumes.items()}
-
-    def afficher(node, profondeur: int):
-        indentation = "    " * profondeur
-        nom = getattr(node, "name", "?")
-        dm_code = nettoyer_dmc(str(getattr(node, "dm_code", "") or ""))
-
-        if dm_code and dm_code in resumes_par_dmc:
-            # Node concerne par une modification
-            print(f"{indentation}• {nom}  [{dm_code}]")
-            resume = resumes_par_dmc[dm_code].resume
-            for ligne in resume.splitlines() or [resume]:
-                print(f"{indentation}      {ligne}")
-        else:
-            # Node de structure (branche intermediaire)
-            print(f"{indentation}• {nom}")
-
-        for enfant in getattr(node, "children", []) or []:
-            afficher(enfant, profondeur + 1)
-
-    afficher(racine, 0)
+def afficher_feuilles(feuilles_trouvees: Dict[str, FeuilleTrouvee]) -> None:
+    """Affiche chaque DMC une seule fois : son chemin et ses modifications."""
+    for feuille in feuilles_trouvees.values():
+        print(f"\n{'=' * 70}")
+        print(f"DMC    : {feuille.dm_code}")
+        print(f"Chemin : {feuille.chemin_texte()}")
+        print("Modifications :")
+        for i, modif in enumerate(feuille.modifications, 1):
+            prefixe = f"  {i}. " if len(feuille.modifications) > 1 else "  "
+            for j, ligne in enumerate(modif.splitlines() or [modif]):
+                print(f"{prefixe if j == 0 else '     '}{ligne}")
 
 
 # =================================================================== #
 #  Exemple d'utilisation                                              #
 # =================================================================== #
-# 1) DMC uniques présents dans les résumés
-# uniques = dmc_uniques(resumes)
-# print("DMC uniques :", uniques)
-#
-# 2) Dictionnaire {dm_code: chemin + modifications}
-# feuilles_trouvees = parcourir_arbre(racine, resumes)
-# for dm_code, feuille in feuilles_trouvees.items():
-#     print(f"\n{dm_code}")
-#     print(f"  chemin : {feuille.chemin_texte()}")
-#     print(f"  modifs : {feuille.modifications}")
-#
-# 3) Affichage en arborescence
-# afficher_arbre(racine, resumes)
-
-
-
+# feuilles = parcourir_arbre(racine, resumes)
+# afficher_feuilles(feuilles)
 
 
 import re
