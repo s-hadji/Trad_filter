@@ -1,4 +1,56 @@
 
+def _extraire_code_dm(node) -> str:
+    """Recupere le code DM du node. ADAPTE les noms d'attributs a ta structure."""
+    for attr in ("code_dm", "dmc", "name"):
+        val = getattr(node, attr, None)
+        if val:
+            return str(val)
+    return "DM_INCONNU"
+
+
+def _extraire_contenu(doc) -> str:
+    """Recupere le texte depuis un dict doc (cle 'content')."""
+    if isinstance(doc, dict):
+        return str(doc.get("content", "") or "")
+    return str(doc or "")
+
+
+def generer_rapport_condense(
+    feuille,                 # liste de nodes, chacun avec doc_v1, doc_v2, et un code DM
+    **kwargs,                # seuil_fusion, skip_characters...
+) -> str:
+    """
+    Parcourt les nodes de 'feuille', detecte les changements de chaque document,
+    puis regroupe les changements IDENTIQUES en listant tous les codes DM concernes.
+    """
+    regroupes: Dict[Tuple[str, str, str], Tuple[Changement, List[str]]] = {}
+
+    for node in feuille:
+        code_dm = _extraire_code_dm(node)
+        v1 = _extraire_contenu(getattr(node, "doc_v1", None))
+        v2 = _extraire_contenu(getattr(node, "doc_v2", None))
+
+        # Rien a comparer
+        if not v1 and not v2:
+            continue
+
+        for ch in detecter_changements(v1, v2, **kwargs):
+            cle = ch.cle()
+            if cle not in regroupes:
+                regroupes[cle] = (ch, [])
+            _, dms = regroupes[cle]
+            if code_dm not in dms:            # deduplication des DM
+                dms.append(code_dm)
+
+    # Rendu : une ligne par changement distinct
+    lignes = ["RAPPORT DES MODIFICATIONS AUTOMATIQUEMENT CONDENSE", ""]
+    for ch, dms in regroupes.values():
+        lignes.append(f"- {ch.phrase()} dans le(s) DM : {', '.join(sorted(dms))}")
+
+    return "\n".join(lignes)
+
+
+
 import json
 import re
 from typing import List, Dict
