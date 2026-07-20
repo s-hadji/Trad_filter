@@ -1,4 +1,143 @@
 
+from typing import List, Dict, Optional
+from pydantic import BaseModel, Field
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+
+
+# =================================================================== #
+#  Schéma de sortie du LLM                                            #
+# =================================================================== #
+class DecisionMerge(BaseModel):
+    dmcodes: List[str] = Field(
+        description="Liste des codes DM traites dans ce lot, recopies a l'identique."
+    )
+    mergeable: bool = Field(
+        description="True si les documents du lot peuvent etre fusionnes en un seul, sinon False."
+    )
+    output_of_merge: Optional[str] = Field(
+        default=None,
+        description="Si mergeable=True : le contenu fusionne des documents. Sinon null."
+    )
+    why_not_mergeable: Optional[str] = Field(
+        default=None,
+        description="Si mergeable=False : explication de pourquoi les documents ne sont pas fusionnables. Sinon null."
+    )
+
+
+PROMPT_MERGE = ChatPromptTemplate.from_messages([
+    ("system",
+     "Vous etes un expert de la documentation technique et de la gestion de configuration.\n"
+     "On vous fournit un lot de documents (chacun identifie par son code DM) decrivant des "
+     "modifications. Votre role est de decider si ces documents peuvent etre FUSIONNES en un seul, "
+     "c'est-a-dire s'ils portent sur des modifications suffisamment proches ou complementaires "
+     "pour etre presentees ensemble de maniere coherente.\n\n"
+     "CONSIGNES :\n"
+     "1. Recopiez dans 'dmcodes' TOUS les codes DM du lot, a l'identique, sans en oublier ni en ajouter.\n"
+     "2. Decidez 'mergeable' : true si la fusion a du sens, false sinon.\n"
+     "3. Si mergeable=true : redigez dans 'output_of_merge' le contenu fusionne, clair et sans "
+     "redondance, couvrant les modifications de tous les documents du lot. Laissez 'why_not_mergeable' vide.\n"
+     "4. Si mergeable=false : expliquez dans 'why_not_mergeable' pourquoi la fusion n'est pas pertinente. "
+     "Laissez 'output_of_merge' vide.\n\n"
+     "Aucun emoji. Style factuel, neutre et concis."),
+    ("user",
+     "Lot de {nb} document(s) a evaluer :\n\n{documents}\n\n"
+     "Codes DM attendus dans votre reponse : {codes_attendus}")
+])
+
+
+# =================================================================== #
+#  Passe de merge, 5 documents à la fois                             #
+# =================================================================== #
+def passe_de_merge(documents_tries: Dict[str, dict], taille_lot: int = 5,
+                   nombre_essais: int = 3) -> List[DecisionMerge]:
+    """
+    Parcourt les DMC dans l'ordre trie, par lots de 'taille_lot', et demande au
+    LLM de decider du merge de chaque lot. Verifie la completude des dmcodes a
+    chaque etape.
+    """
+    codes = list(documents_tries.keys())
+    total = len(codes)
+    nb_lots = (total + taille_lot - 1) // taille_lot
+    print(f"[Merge] {total} DMC, {nb_lots} lot(s) de {taille_lot}\n")
+
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.1, max_tokens=4000)
+    chaine = PROMPT_MERGE | llm.with_structured_output(DecisionMerge)
+
+    decisions: List[DecisionMerge] = []
+    codes_traites_total = []
+
+    for numero_lot, debut in enumerate(range(0, total, taille_lot), 1):
+        lot_codes = codes[debut: debut + taille_lot]
+
+        # Texte du lot : un bloc par DMC
+        bloc = "\n\n".join(
+            f"--- DM {dmc} ---\n{documents_tries[dmc]['contenu']}"
+            for dmc in lot_codes
+        )
+
+        print(f"[Merge] Lot {numero_lot}/{nb_lots} — DMC : {', '.join(lot_codes)}")
+        decision = demander_decision(chaine, bloc, lot_codes, nombre_essais)
+
+        # --- Contrôle de complétude du lot ---
+        attendus = set(lot_codes)
+        obtenus = set(decision.dmcodes)
+        manquants = attendus - obtenus
+        en_trop = obtenus - attendus
+        if manquants or en_trop:
+            print(f"          ! Ecart dmcodes (manquants={sorted(manquants)}, "
+                  f"en_trop={sorted(en_trop)}) -> correction forcee")
+            decision.dmcodes = lot_codes  # on force les vrais codes du lot
+
+        print(f"          mergeable={decision.mergeable}")
+        decisions.append(decision)
+        codes_traites_total.extend(lot_codes)
+
+    # --- Contrôle de complétude global ---
+    manquants_global = set(codes) - set(codes_traites_total)
+    if manquants_global:
+        print(f"\n[Merge] ATTENTION : DMC jamais traites : {sorted(manquants_global)}")
+    else:
+        print(f"\n[Merge] Complet : {len(codes_traites_total)}/{total} DMC traites")
+
+    return decisions
+
+
+def demander_decision(chaine, bloc, lot_codes, nombre_essais):
+    """Appelle le LLM avec quelques tentatives en cas d'erreur passagère."""
+    for essai in range(1, nombre_essais + 1):
+        try:
+            return chaine.invoke({
+                "nb": len(lot_codes),
+                "documents": bloc,
+                "codes_attendus": ", ".join(lot_codes),
+            })
+        except Exception as erreur:
+            print(f"          ! Essai {essai} echoue ({type(erreur).__name__}: {erreur})")
+    # Echec : décision de repli, non mergeable, mais dmcodes préservés
+    return DecisionMerge(
+        dmcodes=lot_codes,
+        mergeable=False,
+        output_of_merge=None,
+        why_not_mergeable="[Echec d'appel LLM sur ce lot]",
+    )
+
+
+# =================================================================== #
+#  Exemple d'utilisation                                              #
+# =================================================================== #
+# decisions = passe_de_merge(documents_tries, taille_lot=5)
+# for d in decisions:
+#     print(f"\nDMC : {d.dmcodes}")
+#     print(f"mergeable : {d.mergeable}")
+#     if d.mergeable:
+#         print(f"fusion : {d.output_of_merge}")
+#     else:
+#         print(f"raison : {d.why_not_mergeable}")
+
+
+
+
 import numpy as np
 from scipy.spatial.distance import cdist
 
