@@ -1,4 +1,23 @@
 
+for noeud_pivot, fiche in dictio.items():
+    nom_pivot = getattr(noeud_pivot, "name", "Noeud_Anonyme")
+    print(f"\n{'=' * 70}")
+    print(f"PACK : {nom_pivot}")
+    print(f"{'=' * 70}")
+
+    print(f"\nTitre    : {fiche.titre_fiche}")
+    print(f"\nResume macro :\n{fiche.resume_macro}")
+
+    print(f"\nSections ({len(fiche.sections)}) :")
+    for i, section in enumerate(fiche.sections, 1):
+        codes = ", ".join(section.codes_dm) if section.codes_dm else "(aucun)"
+        print(f"\n  {i}. {section.theme}")
+        print(f"     Codes DM : {codes}")
+        print(f"     {section.description}")
+
+
+
+
 import json
 from typing import List, Dict
 from langchain_openai import ChatOpenAI
