@@ -1,3 +1,50 @@
+
+
+import numpy as np
+from scipy.spatial.distance import cdist
+
+
+def get_nearest_neighbor_order(embeddings, docs):
+    n = len(embeddings)
+    current_idx = 0
+    sorted_indices = [current_idx]
+    remaining_indices = list(range(1, n))
+
+    while remaining_indices:
+        current_vec = embeddings[current_idx].reshape(1, -1)
+        remaining_vecs = embeddings[remaining_indices]
+        distances = cdist(current_vec, remaining_vecs, metric="cosine")[0]
+        min_dist_idx = np.argmin(distances)
+        next_idx = remaining_indices[min_dist_idx]
+        sorted_indices.append(next_idx)
+        remaining_indices.pop(min_dist_idx)
+        current_idx = next_idx
+
+    return sorted_indices
+
+
+# --- 1. Génération des lignes ---
+doc_to_embedd = generer_lignes_condensees(feuille)
+print(f"{len(doc_to_embedd)} lignes de changement a embedder")
+
+# --- 2. Embedding via LangChain (embed_documents attend une liste de str) ---
+embeded_doc = np.array(embedding.embed_documents(doc_to_embedd))
+
+# --- 3. Tri par plus proche voisin ---
+indices_nearest = get_nearest_neighbor_order(embeded_doc, doc_to_embedd)
+
+# --- 4. Reconstruction des lignes triées ---
+X_trie_nearest = [doc_to_embedd[i] for i in indices_nearest]
+
+# --- 5. Rapport final trié ---
+rapport_trie = "RAPPORT DES MODIFICATIONS AUTOMATIQUEMENT CONDENSE\n\n" + "\n".join(X_trie_nearest)
+print(rapport_trie)
+
+
+
+
+
+
 import re
 import difflib
 from typing import List, Tuple, Dict
