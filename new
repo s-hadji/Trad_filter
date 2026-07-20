@@ -1,4 +1,57 @@
 
+from dataclasses import dataclass, field
+from typing import Dict, List
+
+
+@dataclass
+class DocumentDMC:
+    dm_code: str            # DMC réel (sans suffixe _X)
+    contenu: str            # tout le texte balisé du DMC, mergé en un bloc
+    vecteur: List[float] = field(default_factory=list)  # embedding du contenu
+
+
+def construire_documents_embeddes(feuille, embedding) -> Dict[str, DocumentDMC]:
+    """
+    Part de 'feuille', merge le texte balisé par DMC réel (un seul bloc par DMC),
+    puis embedde chaque bloc. Renvoie {dmc: DocumentDMC(dm_code, contenu, vecteur)}.
+    """
+    # 1. Merge : un seul bloc de texte balisé par DMC réel
+    textes_par_dmc = baliser_par_dmc(feuille)   # {dmc: contenu mergé}
+    codes = list(textes_par_dmc.keys())
+    contenus = [textes_par_dmc[dmc] for dmc in codes]
+    total = len(codes)
+    print(f"[Embedding] {total} DMC à embedder")
+
+    if total == 0:
+        return {}
+
+    # 2. Embedding en une passe (embed_documents attend une liste de str)
+    vecteurs = embedding.embed_documents(contenus)
+
+    # 3. Association {dmc: contenu + vecteur}
+    documents = {}
+    for indice, dmc in enumerate(codes, 1):
+        documents[dmc] = DocumentDMC(
+            dm_code=dmc,
+            contenu=textes_par_dmc[dmc],
+            vecteur=vecteurs[indice - 1],
+        )
+        print(f"[Embedding] {indice}/{total} — DMC {dmc} "
+              f"({compter_balises(textes_par_dmc[dmc])} modif., "
+              f"vecteur dim {len(vecteurs[indice - 1])})")
+
+    print(f"[Embedding] Termine : {len(documents)}/{total}")
+    return documents
+documents = construire_documents_embeddes(feuille, embedding)
+
+# Accès par DMC
+for dmc, doc in documents.items():
+    print(f"\n=== {dmc} ===")
+    print(f"contenu : {doc.contenu[:120]}...")
+    print(f"vecteur : dim {len(doc.vecteur)}")
+
+
+
 import re
 from typing import Dict, List
 from dataclasses import dataclass
