@@ -1,6 +1,4 @@
 
-
-
 import json
 import re
 from typing import List, Dict
@@ -84,6 +82,7 @@ def generer_comptes_rendus_packs(packs_nettoyes, max_retries: int = 2) -> Dict[o
         attendus_par_dm = {c: _compter_balises(str(donnees_feuilles[c])) for c in codes_attendus}
         total_attendu = sum(attendus_par_dm.values())
         print(f"Analyse du pack :
+
 
 
 
