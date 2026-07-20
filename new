@@ -1,3 +1,131 @@
+
+import json
+from typing import List, Dict
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
+
+
+class SectionFiche(BaseModel):
+    theme: str = Field(description="Theme ou nature commune des modifications regroupees.")
+    description: str = Field(
+        description="Explication metier de ce qui a change pour ce theme, avec les valeurs avant/apres."
+    )
+    codes_dm: List[str] = Field(
+        description="Liste des codes DM dont proviennent les modifications de cette section."
+    )
+
+class FicheVersionGlobale(BaseModel):
+    titre_fiche: str = Field(description="Intitule formel de la note de version.")
+    resume_macro: str = Field(description="Synthese de haut niveau de l'impact technique global.")
+    sections: List[SectionFiche] = Field(description="Analyse thematique des modifications du pack.")
+
+
+prompt_synthese = ChatPromptTemplate.from_messages([
+    ("system",
+     "Vous etes un expert de la documentation technique et de la gestion de configuration.\n"
+     "On vous fournit la liste COMPLETE et DEJA EXTRAITE des modifications d'un pack de documents. "
+     "Chaque modification provient d'une balise typee du document source :\n"
+     "  - MODIFIER : une valeur passe de 'avant' a 'apres'.\n"
+     "  - SUPPRIME : la valeur 'avant' a ete retiree.\n"
+     "  - AJOUTE : la valeur 'apres' a ete ajoutee.\n"
+     "Tout ce qui n'est pas dans une balise etait identique entre les deux versions.\n\n"
+     "Cette liste est exhaustive et fait AUTORITE : n'en inventez aucune, n'en ignorez aucune.\n\n"
+     "Redigez une fiche de version en analysant ces modifications ENSEMBLE :\n"
+     "- 'titre_fiche' : un intitule formel.\n"
+     "- 'resume_macro' : l'impact technique global.\n"
+     "- 'sections' : regroupez les modifications par theme et expliquez chaque theme en langage metier, "
+     "en vous appuyant sur le type et les valeurs avant/apres.\n\n"
+     "REGLE DE COUVERTURE IMPERATIVE :\n"
+     "- CHAQUE code DM fourni ayant au moins une modification DOIT apparaitre dans le champ 'codes_dm' "
+     "d'au moins une section. N'oubliez aucun code DM.\n"
+     "- Dans 'codes_dm', n'indiquez que les codes DM reellement a l'origine des modifications de la section.\n\n"
+     "Regles de redaction : aucun emoji, style factuel, neutre et concis."),
+    ("user",
+     "Pivot : {nom_pivot}\n\n"
+     "Codes DM ayant des modifications (tous doivent etre couverts) : {codes_attendus}\n\n"
+     "Modifications extraites (par code DM) :\n{modifications_json}\n\n"
+     "Redigez la fiche de version.")
+])
+
+
+def generer_fiches_version(dictio_extractions, max_retries: int = 2) -> Dict[object, FicheVersionGlobale]:
+    dictionnaire_final = {}
+
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.1, max_tokens=8000)
+    chaine = prompt_synthese | llm.with_structured_output(FicheVersionGlobale)
+
+    for noeud_pivot, extraction in dictio_extractions.items():
+        nom_pivot = getattr(noeud_pivot, "name", "Noeud_Anonyme")
+
+        # Codes DM à couvrir = ceux qui ont effectivement au moins une modification
+        codes_attendus = {f.code_dm for f in extraction.fiches_dm if f.modifications}
+        total = sum(len(f.modifications) for f in extraction.fiches_dm)
+        print(f"Synthese du pack : {nom_pivot} "
+              f"({len(codes_attendus)} DM a couvrir, {total} modifications)...")
+
+        modifications_json = json.dumps(
+            [f.model_dump() for f in extraction.fiches_dm], ensure_ascii=False, indent=2
+        )
+
+        fiche = None
+        manquants = set(codes_attendus)
+        for tentative in range(max_retries + 1):
+            fiche = chaine.invoke({
+                "nom_pivot": nom_pivot,
+                "codes_attendus": ", ".join(sorted(codes_attendus)) or "(aucun)",
+                "modifications_json": modifications_json,
+            })
+
+            # Vérification de couverture
+            couverts = {c for s in fiche.sections for c in s.codes_dm}
+            manquants = codes_attendus - couverts
+            hallucines = couverts - codes_attendus
+
+            if hallucines:
+                print(f"   ! Codes DM inconnus cites, purge : {sorted(hallucines)}")
+                for s in fiche.sections:
+                    s.codes_dm = [c for c in s.codes_dm if c in codes_attendus]
+
+            if not manquants:
+                break
+            print(f"   ! Tentative {tentative + 1} : DM non couverts = {sorted(manquants)}, relance")
+
+        if manquants:
+            # Filet de sécurité : on rattache explicitement les DM oubliés
+            print(f"   ! Rattachement force des DM oublies : {sorted(manquants)}")
+            index = {f.code_dm: f for f in extraction.fiches_dm}
+            for code in sorted(manquants):
+                f = index[code]
+                lignes = []
+                for m in f.modifications:
+                    if m.type == "MODIFIER":
+                        lignes.append(f"« {m.avant} » remplace par « {m.apres} »")
+                    elif m.type == "SUPPRIME":
+                        lignes.append(f"suppression de « {m.avant} »")
+                    else:
+                        lignes.append(f"ajout de « {m.apres} »")
+                fiche.sections.append(SectionFiche(
+                    theme=f"Modifications du document {code}",
+                    description="; ".join(lignes) + ".",
+                    codes_dm=[code],
+                ))
+
+        # Contrôle final
+        couverts_final = {c for s in fiche.sections for c in s.codes_dm}
+        assert codes_attendus <= couverts_final, \
+            f"DM toujours manquants apres rattachement : {codes_attendus - couverts_final}"
+        print(f"   OK : {len(couverts_final & codes_attendus)}/{len(codes_attendus)} DM couverts")
+
+        dictionnaire_final[noeud_pivot] = fiche
+
+    return dictionnaire_final
+
+
+
+
+
+
 import json
 from typing import List, Dict
 from langchain_openai import ChatOpenAI
