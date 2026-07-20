@@ -1,4 +1,336 @@
 
+import re
+import difflib
+import json
+import numpy as np
+from typing import List, Tuple, Dict
+from dataclasses import dataclass
+from collections import defaultdict
+from scipy.spatial.distance import cdist
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
+
+
+# ------------------------------------------------------------------ #
+#  Modèle d'un changement (avec contexte)                            #
+# ------------------------------------------------------------------ #
+@dataclass(frozen=True)
+class Changement:
+    type: str            # "MODIFIE", "SUPPRIME", "AJOUTE"
+    avant: str
+    apres: str
+    ctx_avant: str = ""  # mots communs precedant le changement
+    ctx_apres: str = ""  # mots communs suivant le changement
+
+    def cle(self) -> Tuple[str, str, str]:
+        """Cle d'identite : SANS le contexte, pour regrouper les memes changements."""
+        return (self.type, self.avant.strip(), self.apres.strip())
+
+    def phrase(self) -> str:
+        ca = f"...{self.ctx_avant.strip()} " if self.ctx_avant.strip() else ""
+        cp = f" {self.ctx_apres.strip()}..." if self.ctx_apres.strip() else ""
+        if self.type == "MODIFIE":
+            corps = f"un element '{self.avant.strip()}' a ete remplace par '{self.apres.strip()}'"
+        elif self.type == "SUPPRIME":
+            corps = f"un element '{self.avant.strip()}' a ete supprime"
+        else:
+            corps = f"un element '{self.apres.strip()}' a ete insere"
+        if ca or cp:
+            return f"{corps} (contexte : {ca}[...]{cp})"
+        return corps
+
+
+# ------------------------------------------------------------------ #
+#  Détection des changements entre deux versions d'un même document  #
+# ------------------------------------------------------------------ #
+def detecter_changements(
+    v1: str,
+    v2: str,
+    seuil_fusion: int = 30,
+    contexte_mots: int = 4,
+    skip_characters: str = " \t\n\r.,;:!?()[]{}'\"/-",
+) -> List[Changement]:
+    """
+    Compare v1 et v2 et renvoie la liste des changements reels.
+    Les changements sans valeur metier (avant ET apres composes uniquement de
+    skip_characters, ou vides) sont ignores.
+    seuil_fusion  : deux changements separes par une partie commune de moins de
+                    seuil_fusion caracteres sont fusionnes en un seul bloc modifie.
+    contexte_mots : nombre de mots communs conserves de part et d'autre du
+                    changement, pour situer la modification.
+    """
+    skip = set(skip_characters)
+    est_negligeable = lambda t: all(c in skip for c in t)  # vrai aussi si t == ""
+
+    decoupe = lambda t: re.findall(r"\S+|\s+", t)
+    a, b = decoupe(v1), decoupe(v2)
+    opcodes = difflib.SequenceMatcher(None, a, b).get_opcodes()
+
+    # --- 0. NEUTRALISATION des changements sans valeur metier ---
+    # Fait AVANT la fusion : sinon un changement negligeable servirait de pont
+    # et ferait fusionner a tort deux vrais changements eloignes.
+    nettoyes = []
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag != "equal":
+            avant, apres = "".join(a[i1:i2]), "".join(b[j1:j2])
+            if est_negligeable(avant) and est_negligeable(apres):
+                tag = "equal"  # assimile a du commun
+        nettoyes.append((tag, i1, i2, j1, j2))
+
+    # Recoller les 'equal' devenus consecutifs
+    opcodes = []
+    for op in nettoyes:
+        if opcodes and op[0] == "equal" and opcodes[-1][0] == "equal":
+            _, pi1, _, pj1, _ = opcodes[-1]
+            opcodes[-1] = ("equal", pi1, op[2], pj1, op[4])
+        else:
+            opcodes.append(op)
+
+    # --- 1. FUSION : absorber les 'equal' trop courts entre deux changements ---
+    fusionnes = []
+    for op in opcodes:
+        tag, i1, i2, j1, j2 = op
+        taille = len("".join(a[i1:i2]))
+        est_court = tag == "equal" and taille < seuil_fusion
+        entre_deux = bool(fusionnes) and fusionnes[-1][0] != "equal"
+        fusionnes.append(("replace", i1, i2, j1, j2) if (est_court and entre_deux) else op)
+
+    compacts = []
+    for tag, i1, i2, j1, j2 in fusionnes:
+        if compacts and tag != "equal" and compacts[-1][0] != "equal":
+            _, pi1, _, pj1, _ = compacts[-1]
+            compacts[-1] = ("replace", pi1, i2, pj1, j2)
+        else:
+            compacts.append((tag, i1, i2, j1, j2))
+
+    # --- 2. EXTRACTION des changements avec contexte ---
+    def mots_significatifs(tokens, cote, n):
+        """Recupere n 'mots' (tokens non-blancs) du cote demande d'un segment."""
+        mots = [t for t in tokens if t.strip()]  # on ignore les tokens d'espaces
+        if n <= 0 or not mots:
+            return ""
+        return " ".join(mots[-n:]) if cote == "fin" else " ".join(mots[:n])
+
+    changements: List[Changement] = []
+    for pos, (tag, i1, i2, j1, j2) in enumerate(compacts):
+        if tag == "equal":
+            continue
+        avant, apres = "".join(a[i1:i2]), "".join(b[j1:j2])
+
+        # Contexte avant = fin du segment 'equal' precedent (v2 de preference)
+        ctx_avant = ""
+        if pos > 0 and compacts[pos - 1][0] == "equal":
+            _, pi1, pi2, pj1, pj2 = compacts[pos - 1]
+            src = b[pj1:pj2] if (pj2 > pj1) else a[pi1:pi2]
+            ctx_avant = mots_significatifs(src, "fin", contexte_mots)
+
+        # Contexte apres = debut du segment 'equal' suivant
+        ctx_apres = ""
+        if pos < len(compacts) - 1 and compacts[pos + 1][0] == "equal":
+            _, ni1, ni2, nj1, nj2 = compacts[pos + 1]
+            src = b[nj1:nj2] if (nj2 > nj1) else a[ni1:ni2]
+            ctx_apres = mots_significatifs(src, "debut", contexte_mots)
+
+        if tag == "replace":
+            changements.append(Changement("MODIFIE", avant, apres, ctx_avant, ctx_apres))
+        elif tag == "delete":
+            changements.append(Changement("SUPPRIME", avant, "", ctx_avant, ctx_apres))
+        elif tag == "insert":
+            changements.append(Changement("AJOUTE", "", apres, ctx_avant, ctx_apres))
+    return changements
+
+
+# ------------------------------------------------------------------ #
+#  Extraction depuis la structure de node                            #
+# ------------------------------------------------------------------ #
+def _extraire_code_dm(node) -> str:
+    """Recupere le code DM du node. ADAPTE les noms d'attributs a ta structure."""
+    for attr in ("code_dm", "dmc", "name"):
+        val = getattr(node, attr, None)
+        if val:
+            return str(val)
+    return "DM_INCONNU"
+
+
+def _extraire_contenu(doc) -> str:
+    """Recupere le texte depuis un doc (dict avec cle 'content', ou chaine)."""
+    if isinstance(doc, dict):
+        return str(doc.get("content", "") or "")
+    return str(doc or "")
+
+
+# ------------------------------------------------------------------ #
+#  Génération des lignes condensées (regroupées par changement)      #
+# ------------------------------------------------------------------ #
+def generer_lignes_condensees(feuille, **kwargs) -> List[str]:
+    """
+    Regroupe les changements IDENTIQUES en listant tous les DM concernes.
+    Renvoie une liste de lignes (une par changement distinct).
+    Le contexte affiche est celui de la premiere occurrence rencontree.
+    """
+    regroupes: Dict[Tuple[str, str, str], Tuple[Changement, List[str]]] = {}
+
+    for node in feuille:
+        code_dm = _extraire_code_dm(node)
+        v1 = _extraire_contenu(getattr(node, "doc_v1", None))
+        v2 = _extraire_contenu(getattr(node, "doc_v2", None))
+        if not v1 and not v2:
+            continue
+        for ch in detecter_changements(v1, v2, **kwargs):
+            cle = ch.cle()
+            if cle not in regroupes:
+                regroupes[cle] = (ch, [])
+            _, dms = regroupes[cle]
+            if code_dm not in dms:  # deduplication des DM
+                dms.append(code_dm)
+
+    return [
+        f"- {ch.phrase()} dans le(s) DM : {', '.join(sorted(dms))}"
+        for ch, dms in regroupes.values()
+    ]
+
+
+# ------------------------------------------------------------------ #
+#  Tri par plus proche voisin (chemin glouton en distance cosinus)   #
+# ------------------------------------------------------------------ #
+def get_nearest_neighbor_order(embeddings, docs):
+    n = len(embeddings)
+    current_idx = 0
+    sorted_indices = [current_idx]
+    remaining_indices = list(range(1, n))
+
+    while remaining_indices:
+        current_vec = embeddings[current_idx].reshape(1, -1)
+        remaining_vecs = embeddings[remaining_indices]
+        distances = cdist(current_vec, remaining_vecs, metric="cosine")[0]
+        min_dist_idx = np.argmin(distances)
+        next_idx = remaining_indices[min_dist_idx]
+        sorted_indices.append(next_idx)
+        remaining_indices.pop(min_dist_idx)
+        current_idx = next_idx
+
+    return sorted_indices
+
+
+def generer_rapport_trie(feuille, embedding, **kwargs) -> str:
+    """
+    Lignes condensees -> embedding -> tri par plus proche voisin -> rapport texte.
+    """
+    doc_to_embedd = generer_lignes_condensees(feuille, **kwargs)
+    print(f"{len(doc_to_embedd)} lignes de changement generees")
+
+    if len(doc_to_embedd) < 2:
+        X_trie_nearest = list(doc_to_embedd)
+    else:
+        embeded_doc = np.array(embedding.embed_documents(doc_to_embedd))
+        indices_nearest = get_nearest_neighbor_order(embeded_doc, doc_to_embedd)
+        X_trie_nearest = [doc_to_embedd[i] for i in indices_nearest]
+
+    return "RAPPORT DES MODIFICATIONS AUTOMATIQUEMENT CONDENSE\n\n" + "\n".join(X_trie_nearest)
+
+
+# ------------------------------------------------------------------ #
+#  Reconstruction des modifications PAR DM                           #
+# ------------------------------------------------------------------ #
+def construire_packs_par_dm(feuille, **kwargs) -> Dict[str, List[str]]:
+    """
+    Renvoie {code_dm: [phrase (avec contexte) de chaque modification de ce DM]}.
+    Repart des changements bruts, deduplique par DM.
+    """
+    packs: Dict[str, List[str]] = defaultdict(list)
+    vus: Dict[str, set] = defaultdict(set)
+
+    for node in feuille:
+        code_dm = _extraire_code_dm(node)
+        v1 = _extraire_contenu(getattr(node, "doc_v1", None))
+        v2 = _extraire_contenu(getattr(node, "doc_v2", None))
+        if not v1 and not v2:
+            continue
+        for ch in detecter_changements(v1, v2, **kwargs):
+            cle = ch.cle()
+            if cle not in vus[code_dm]:
+                vus[code_dm].add(cle)
+                packs[code_dm].append(ch.phrase())
+
+    return dict(packs)
+
+
+# ------------------------------------------------------------------ #
+#  Résumé LLM par DM                                                 #
+# ------------------------------------------------------------------ #
+class ResumeDM(BaseModel):
+    code_dm: str = Field(description="Le code DM, recopie a l'identique.")
+    resume: str = Field(description="Resume metier des modifications apportees a ce document.")
+
+
+prompt_resume = ChatPromptTemplate.from_messages([
+    ("system",
+     "Vous etes un expert de la documentation technique et de la gestion de configuration.\n"
+     "On vous fournit, pour UN SEUL document (un code DM), la liste COMPLETE et DEJA EXTRAITE "
+     "de ses modifications. Chaque entree indique un element remplace, supprime ou insere, "
+     "parfois accompagne d'un court contexte (mots communs autour du changement) pour situer "
+     "la modification.\n"
+     "Cette liste fait autorite : n'en inventez aucune, n'en ignorez aucune.\n\n"
+     "Redigez un resume metier clair et concis des modifications apportees a ce document. "
+     "Appuyez-vous sur le contexte pour situer les changements, regroupez ceux de meme nature, "
+     "degagez les tendances, mais ne perdez aucune information significative.\n\n"
+     "Regles de redaction : aucun emoji, style factuel, neutre et concis. "
+     "Ne parlez que de CE document, n'evoquez aucun autre code DM."),
+    ("user",
+     "Code DM : {code_dm}\n\n"
+     "Modifications ({nb}) :\n{modifications}\n\n"
+     "Redigez le resume des modifications de ce document.")
+])
+
+
+def resumer_packs_par_dm(feuille, max_retries: int = 2, **kwargs) -> Dict[str, ResumeDM]:
+    """
+    Construit les packs par DM puis envoie chaque pack au LLM pour un resume.
+    kwargs (seuil_fusion, contexte_mots, skip_characters) transmis a la detection.
+    """
+    packs = construire_packs_par_dm(feuille, **kwargs)
+    print(f"{len(packs)} DM a resumer")
+
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.1, max_tokens=4000)
+    chaine = prompt_resume | llm.with_structured_output(ResumeDM)
+
+    resultats: Dict[str, ResumeDM] = {}
+    for code_dm, modifs in packs.items():
+        modifications_txt = "\n".join(f"- {m}" for m in modifs)
+        print(f"   - DM {code_dm} : {len(modifs)} modification(s)")
+
+        resume = None
+        for tentative in range(max_retries + 1):
+            try:
+                resume = chaine.invoke({
+                    "code_dm": code_dm,
+                    "nb": len(modifs),
+                    "modifications": modifications_txt,
+                })
+                resume.code_dm = code_dm  # anti-hallucination
+                break
+            except Exception as e:
+                print(f"     ! Tentative {tentative + 1} erreur ({type(e).__name__}: {e})")
+                if tentative == max_retries:
+                    resume = ResumeDM(code_dm=code_dm, resume="[Echec de generation du resume]")
+
+        resultats[code_dm] = resume
+
+    return resultats
+
+
+# ------------------------------------------------------------------ #
+#  Exemple d'utilisation                                             #
+# ------------------------------------------------------------------ #
+# # Rapport global trie (sans LLM)
+# rapport = generer_rapport_trie(feuille, embedding, contexte_mots=4)
+# print(rapport)
+#
+# # Resume par DM (avec LLM)
+# resumes = resumer_packs_par_dm(feuille, contexte_mots=4)
+# for code_dm, r in resumes.items():
+#     print(f"\n=== {code_dm} ===\n{r.resume}")
 
 
     # --- 2. EXTRACTION des changements avec contexte ---
