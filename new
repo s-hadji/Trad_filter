@@ -1,4 +1,43 @@
 
+
+
+    # --- 2. EXTRACTION des changements avec contexte ---
+    def mots_significatifs(tokens, cote, n):
+        """Recupere n 'mots' (tokens non-blancs) du cote demande d'un segment."""
+        mots = [t for t in tokens if t.strip()]  # on ignore les tokens d'espaces
+        return "".join(mots[-n:]) if cote == "fin" else "".join(mots[:n])
+
+    changements: List[Changement] = []
+    for pos, (tag, i1, i2, j1, j2) in enumerate(compacts):
+        if tag == "equal":
+            continue
+        avant, apres = "".join(a[i1:i2]), "".join(b[j1:j2])
+
+        # Contexte avant = fin du segment 'equal' precedent (dans v2 de preference)
+        ctx_avant = ""
+        if pos > 0 and compacts[pos - 1][0] == "equal":
+            _, pi1, pi2, pj1, pj2 = compacts[pos - 1]
+            src = b[pj1:pj2] if (pj2 > pj1) else a[pi1:pi2]
+            ctx_avant = mots_significatifs(src, "fin", contexte_mots)
+
+        # Contexte apres = debut du segment 'equal' suivant
+        ctx_apres = ""
+        if pos < len(compacts) - 1 and compacts[pos + 1][0] == "equal":
+            _, ni1, ni2, nj1, nj2 = compacts[pos + 1]
+            src = b[nj1:nj2] if (nj2 > nj1) else a[ni1:ni2]
+            ctx_apres = mots_significatifs(src, "debut", contexte_mots)
+
+        if tag == "replace":
+            changements.append(Changement("MODIFIE", avant, apres, ctx_avant, ctx_apres))
+        elif tag == "delete":
+            changements.append(Changement("SUPPRIME", avant, "", ctx_avant, ctx_apres))
+        elif tag == "insert":
+            changements.append(Changement("AJOUTE", "", apres, ctx_avant, ctx_apres))
+    return changements
+
+
+
+
 import re
 import difflib
 import numpy as np
