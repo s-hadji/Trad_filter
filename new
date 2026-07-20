@@ -1,4 +1,8 @@
+
+
+
 import json
+import re
 from typing import List, Dict
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -61,7 +65,6 @@ prompt_extraction = ChatPromptTemplate.from_messages([
 
 def _compter_balises(texte: str) -> int:
     """Compte deterministe des balises reellement presentes dans le document."""
-    import re
     return len(re.findall(r"\[\s*(?:MODIFIER|SUPPRIME|AJOUTE)\s*\|", texte, re.IGNORECASE))
 
 
@@ -80,60 +83,8 @@ def generer_comptes_rendus_packs(packs_nettoyes, max_retries: int = 2) -> Dict[o
         # Nombre de balises attendu par DM (verite deterministe issue du texte source)
         attendus_par_dm = {c: _compter_balises(str(donnees_feuilles[c])) for c in codes_attendus}
         total_attendu = sum(attendus_par_dm.values())
-        print(f"Analyse du pack : {nom_pivot} "
-              f"({len(codes_attendus)} documents, {total_attendu} balises attendues)...")
+        print(f"Analyse du pack :
 
-        payload_textuel = json.dumps(donnees_feuilles, indent=2, ensure_ascii=False)
-
-        fiches: List[FicheDM] = []
-        for tentative in range(max_retries + 1):
-            resultat = chaine.invoke({
-                "nom_pivot": nom_pivot,
-                "codes_attendus": ", ".join(codes_attendus),
-                "input_data": payload_textuel,
-            })
-
-            # 1. On ne garde que les DM reellement attendus (purge des hallucinations)
-            index = {f.code_dm: f for f in resultat.fiches_dm if f.code_dm in donnees_feuilles}
-
-            # 2. DM totalement manquants dans la sortie
-            manquants = [c for c in codes_attendus if c not in index]
-
-            # 3. DM presents mais vides alors que le texte contient des balises
-            vides = [c for c in codes_attendus
-                     if c in index and not index[c].modifications and attendus_par_dm[c] > 0]
-
-            # 4. DM incomplets : moins de modifications que de balises attendues
-            incomplets = [
-                c for c in codes_attendus
-                if c in index and len(index[c].modifications) < attendus_par_dm[c]
-            ]
-
-            if not manquants and not vides and not incomplets:
-                fiches = [index[c] for c in codes_attendus]
-                break
-
-            print(f"   ! Tentative {tentative + 1} incomplete "
-                  f"(manquants={manquants}, vides={vides}, "
-                  f"incomplets={[(c, len(index[c].modifications), attendus_par_dm[c]) for c in incomplets]})")
-            fiches = [index.get(c, FicheDM(code_dm=c)) for c in codes_attendus]
-
-        # --- Rapport de completude final ---
-        ok = True
-        for f in fiches:
-            attendu = attendus_par_dm[f.code_dm]
-            obtenu = len(f.modifications)
-            statut = "OK" if obtenu >= attendu else "INCOMPLET"
-            if obtenu < attendu:
-                ok = False
-            print(f"   - DM {f.code_dm} : {obtenu}/{attendu} modification(s) [{statut}]")
-
-        if not ok:
-            print(f"   ATTENTION : le pack {nom_pivot} reste incomplet apres {max_retries + 1} tentative(s).")
-
-        dictionnaire_final[noeud_pivot] = ExtractionPack(fiches_dm=fiches)
-
-    return dictionnaire_final
 
 
 
