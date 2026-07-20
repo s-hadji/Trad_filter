@@ -1,5 +1,127 @@
 
 import re
+from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+
+
+# =================================================================== #
+#  Nettoyage du code DMC                                              #
+# =================================================================== #
+def nettoyer_dmc(code_dm: str) -> str:
+    """
+    Retire le suffixe repère ' _X' (espace + underscore + numero) que tu as
+    ajoute manuellement, pour retrouver le vrai code DMC.
+    Exemple : 'EG-G-05-00A-000A-A _3' -> 'EG-G-05-00A-000A-A'
+    """
+    return re.sub(r"\s*_\d+\s*$", "", code_dm).strip()
+
+
+def dmc_uniques(resumes: Dict[str, "ResumeDM"]) -> set:
+    """Ensemble des DMC nettoyes presents dans les resumes."""
+    return {nettoyer_dmc(code) for code in resumes.keys()}
+
+
+# =================================================================== #
+#  Résultat par feuille                                               #
+# =================================================================== #
+@dataclass
+class FeuilleTrouvee:
+    dm_code: str                 # DMC nettoye
+    chemin: List[str]            # noms des nodes, de la racine jusqu'a la feuille
+    modifications: str           # le resume associe a ce DMC
+
+    def chemin_texte(self) -> str:
+        return " > ".join(self.chemin)
+
+
+# =================================================================== #
+#  Descente depuis la racine                                          #
+# =================================================================== #
+def parcourir_arbre(racine, resumes: Dict[str, "ResumeDM"]) -> Dict[str, FeuilleTrouvee]:
+    """
+    Descend depuis la racine via l'attribut 'children'. Pour chaque node dont le
+    DMC nettoye figure dans 'resumes', enregistre son chemin et ses modifications.
+    Renvoie {dm_code_nettoye: FeuilleTrouvee}.
+    """
+    # On indexe les resumes par DMC nettoye pour un acces direct
+    resumes_par_dmc = {nettoyer_dmc(code): r for code, r in resumes.items()}
+
+    trouvees: Dict[str, FeuilleTrouvee] = {}
+
+    def descendre(node, chemin_courant: List[str]):
+        nom = getattr(node, "name", "?")
+        chemin = chemin_courant + [nom]
+
+        # Ce node correspond-il a un DMC qu'on cherche ?
+        dm_code = nettoyer_dmc(str(getattr(node, "dm_code", "") or ""))
+        if dm_code and dm_code in resumes_par_dmc:
+            trouvees[dm_code] = FeuilleTrouvee(
+                dm_code=dm_code,
+                chemin=chemin,
+                modifications=resumes_par_dmc[dm_code].resume,
+            )
+
+        # On continue la descente sur les enfants
+        for enfant in getattr(node, "children", []) or []:
+            descendre(enfant, chemin)
+
+    descendre(racine, [])
+    return trouvees
+
+
+# =================================================================== #
+#  Affichage en arborescence                                          #
+# =================================================================== #
+def afficher_arbre(racine, resumes: Dict[str, "ResumeDM"]) -> None:
+    """
+    Affiche l'arbre depuis la racine. Chaque node est indente selon sa profondeur ;
+    les feuilles presentes dans 'resumes' affichent leur DMC et leurs modifications.
+    """
+    resumes_par_dmc = {nettoyer_dmc(code): r for code, r in resumes.items()}
+
+    def afficher(node, profondeur: int):
+        indentation = "    " * profondeur
+        nom = getattr(node, "name", "?")
+        dm_code = nettoyer_dmc(str(getattr(node, "dm_code", "") or ""))
+
+        if dm_code and dm_code in resumes_par_dmc:
+            # Node concerne par une modification
+            print(f"{indentation}• {nom}  [{dm_code}]")
+            resume = resumes_par_dmc[dm_code].resume
+            for ligne in resume.splitlines() or [resume]:
+                print(f"{indentation}      {ligne}")
+        else:
+            # Node de structure (branche intermediaire)
+            print(f"{indentation}• {nom}")
+
+        for enfant in getattr(node, "children", []) or []:
+            afficher(enfant, profondeur + 1)
+
+    afficher(racine, 0)
+
+
+# =================================================================== #
+#  Exemple d'utilisation                                              #
+# =================================================================== #
+# 1) DMC uniques présents dans les résumés
+# uniques = dmc_uniques(resumes)
+# print("DMC uniques :", uniques)
+#
+# 2) Dictionnaire {dm_code: chemin + modifications}
+# feuilles_trouvees = parcourir_arbre(racine, resumes)
+# for dm_code, feuille in feuilles_trouvees.items():
+#     print(f"\n{dm_code}")
+#     print(f"  chemin : {feuille.chemin_texte()}")
+#     print(f"  modifs : {feuille.modifications}")
+#
+# 3) Affichage en arborescence
+# afficher_arbre(racine, resumes)
+
+
+
+
+
+import re
 import difflib
 import json
 import numpy as np
