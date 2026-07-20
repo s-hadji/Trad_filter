@@ -1,3 +1,222 @@
+
+import re
+import difflib
+import numpy as np
+from typing import List, Tuple, Dict
+from dataclasses import dataclass
+from scipy.spatial.distance import cdist
+
+
+# ------------------------------------------------------------------ #
+#  Modèle d'un changement                                            #
+# ------------------------------------------------------------------ #
+@dataclass(frozen=True)
+class Changement:
+    type: str            # "MODIFIE", "SUPPRIME", "AJOUTE"
+    avant: str
+    apres: str
+
+    def cle(self) -> Tuple[str, str, str]:
+        """Cle d'identite pour regrouper des changements identiques entre DM."""
+        return (self.type, self.avant.strip(), self.apres.strip())
+
+    def phrase(self) -> str:
+        if self.type == "MODIFIE":
+            return f"un element '{self.avant.strip()}' a ete remplace par '{self.apres.strip()}'"
+        if self.type == "SUPPRIME":
+            return f"un element '{self.avant.strip()}' a ete supprime"
+        return f"un element '{self.apres.strip()}' a ete insere"
+
+
+# ------------------------------------------------------------------ #
+#  Détection des changements entre deux versions d'un même document  #
+# ------------------------------------------------------------------ #
+def detecter_changements(
+    v1: str,
+    v2: str,
+    seuil_fusion: int = 30,
+    skip_characters: str = " \t\n\r.,;:!?()[]{}'\"/-",
+) -> List[Changement]:
+    """
+    Compare v1 et v2 et renvoie la liste des changements reels.
+    Les changements sans valeur metier (avant ET apres composes uniquement de
+    skip_characters, ou vides) sont ignores.
+    seuil_fusion : deux changements separes par une partie commune de moins de
+    seuil_fusion caracteres sont fusionnes en un seul bloc modifie.
+    """
+    skip = set(skip_characters)
+    est_negligeable = lambda t: all(c in skip for c in t)  # vrai aussi si t == ""
+
+    decoupe = lambda t: re.findall(r"\S+|\s+", t)
+    a, b = decoupe(v1), decoupe(v2)
+    opcodes = difflib.SequenceMatcher(None, a, b).get_opcodes()
+
+    # --- 0. NEUTRALISATION des changements sans valeur metier ---
+    # Fait AVANT la fusion : sinon un changement negligeable servirait de pont
+    # et ferait fusionner a tort deux vrais changements eloignes.
+    nettoyes = []
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag != "equal":
+            avant, apres = "".join(a[i1:i2]), "".join(b[j1:j2])
+            if est_negligeable(avant) and est_negligeable(apres):
+                tag = "equal"  # assimile a du commun
+        nettoyes.append((tag, i1, i2, j1, j2))
+
+    # Recoller les 'equal' devenus consecutifs
+    opcodes = []
+    for op in nettoyes:
+        if opcodes and op[0] == "equal" and opcodes[-1][0] == "equal":
+            _, pi1, _, pj1, _ = opcodes[-1]
+            opcodes[-1] = ("equal", pi1, op[2], pj1, op[4])
+        else:
+            opcodes.append(op)
+
+    # --- 1. FUSION : absorber les 'equal' trop courts entre deux changements ---
+    fusionnes = []
+    for op in opcodes:
+        tag, i1, i2, j1, j2 = op
+        taille = len("".join(a[i1:i2]))
+        est_court = tag == "equal" and taille < seuil_fusion
+        entre_deux = bool(fusionnes) and fusionnes[-1][0] != "equal"
+        fusionnes.append(("replace", i1, i2, j1, j2) if (est_court and entre_deux) else op)
+
+    compacts = []
+    for tag, i1, i2, j1, j2 in fusionnes:
+        if compacts and tag != "equal" and compacts[-1][0] != "equal":
+            _, pi1, _, pj1, _ = compacts[-1]
+            compacts[-1] = ("replace", pi1, i2, pj1, j2)
+        else:
+            compacts.append((tag, i1, i2, j1, j2))
+
+    # --- 2. EXTRACTION des changements ---
+    changements: List[Changement] = []
+    for tag, i1, i2, j1, j2 in compacts:
+        if tag == "equal":
+            continue
+        avant, apres = "".join(a[i1:i2]), "".join(b[j1:j2])
+        if tag == "replace":
+            changements.append(Changement("MODIFIE", avant, apres))
+        elif tag == "delete":
+            changements.append(Changement("SUPPRIME", avant, ""))
+        elif tag == "insert":
+            changements.append(Changement("AJOUTE", "", apres))
+    return changements
+
+
+# ------------------------------------------------------------------ #
+#  Extraction depuis la structure de node                            #
+# ------------------------------------------------------------------ #
+def _extraire_code_dm(node) -> str:
+    """Recupere le code DM du node. ADAPTE les noms d'attributs a ta structure."""
+    for attr in ("code_dm", "dmc", "name"):
+        val = getattr(node, attr, None)
+        if val:
+            return str(val)
+    return "DM_INCONNU"
+
+
+def _extraire_contenu(doc) -> str:
+    """Recupere le texte depuis un doc (dict avec cle 'content', ou chaine)."""
+    if isinstance(doc, dict):
+        return str(doc.get("content", "") or "")
+    return str(doc or "")
+
+
+# ------------------------------------------------------------------ #
+#  Génération des lignes condensées (regroupées par DM)              #
+# ------------------------------------------------------------------ #
+def generer_lignes_condensees(feuille, **kwargs) -> List[str]:
+    """
+    Parcourt les nodes de 'feuille', detecte les changements de chaque document,
+    regroupe les changements IDENTIQUES en listant tous les codes DM concernes,
+    et renvoie la LISTE des lignes (une par changement distinct).
+    kwargs : transmis a detecter_changements (seuil_fusion, skip_characters).
+    """
+    regroupes: Dict[Tuple[str, str, str], Tuple[Changement, List[str]]] = {}
+
+    for node in feuille:
+        code_dm = _extraire_code_dm(node)
+        v1 = _extraire_contenu(getattr(node, "doc_v1", None))
+        v2 = _extraire_contenu(getattr(node, "doc_v2", None))
+        if not v1 and not v2:
+            continue
+        for ch in detecter_changements(v1, v2, **kwargs):
+            cle = ch.cle()
+            if cle not in regroupes:
+                regroupes[cle] = (ch, [])
+            _, dms = regroupes[cle]
+            if code_dm not in dms:  # deduplication des DM
+                dms.append(code_dm)
+
+    return [
+        f"- {ch.phrase()} dans le(s) DM : {', '.join(sorted(dms))}"
+        for ch, dms in regroupes.values()
+    ]
+
+
+# ------------------------------------------------------------------ #
+#  Tri par plus proche voisin (chemin glouton en distance cosinus)   #
+# ------------------------------------------------------------------ #
+def get_nearest_neighbor_order(embeddings, docs):
+    n = len(embeddings)
+    current_idx = 0
+    sorted_indices = [current_idx]
+    remaining_indices = list(range(1, n))
+
+    while remaining_indices:
+        current_vec = embeddings[current_idx].reshape(1, -1)
+        remaining_vecs = embeddings[remaining_indices]
+        distances = cdist(current_vec, remaining_vecs, metric="cosine")[0]
+        min_dist_idx = np.argmin(distances)
+        next_idx = remaining_indices[min_dist_idx]
+        sorted_indices.append(next_idx)
+        remaining_indices.pop(min_dist_idx)
+        current_idx = next_idx
+
+    return sorted_indices
+
+
+# ------------------------------------------------------------------ #
+#  Pipeline complet : lignes -> embedding -> tri -> rapport          #
+# ------------------------------------------------------------------ #
+def generer_rapport_trie(feuille, embedding, **kwargs) -> str:
+    """
+    feuille   : liste de nodes (doc_v1, doc_v2, code DM).
+    embedding : objet d'embedding LangChain deja initialise (a embed_documents).
+    kwargs    : transmis a detecter_changements.
+    """
+    # 1. Génération des lignes de changement
+    doc_to_embedd = generer_lignes_condensees(feuille, **kwargs)
+    print(f"{len(doc_to_embedd)} lignes de changement generees")
+
+    # 2. Cas triviaux : rien a trier
+    if len(doc_to_embedd) < 2:
+        X_trie_nearest = list(doc_to_embedd)
+    else:
+        # 3. Embedding (embed_documents attend une liste de str)
+        embeded_doc = np.array(embedding.embed_documents(doc_to_embedd))
+
+        # 4. Tri par plus proche voisin
+        indices_nearest = get_nearest_neighbor_order(embeded_doc, doc_to_embedd)
+
+        # 5. Reconstruction des lignes triees
+        X_trie_nearest = [doc_to_embedd[i] for i in indices_nearest]
+
+    # 6. Rapport final
+    return "RAPPORT DES MODIFICATIONS AUTOMATIQUEMENT CONDENSE\n\n" + "\n".join(X_trie_nearest)
+
+
+# ------------------------------------------------------------------ #
+#  Exemple d'utilisation                                             #
+# ------------------------------------------------------------------ #
+# rapport = generer_rapport_trie(feuille, embedding)
+# print(rapport)
+
+
+
+
+
+
 if len(doc_to_embedd) < 2:
     X_trie_nearest = list(doc_to_embedd)
 else:
