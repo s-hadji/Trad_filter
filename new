@@ -1,45 +1,49 @@
 
 
 import re
-from typing import List, Dict, Tuple
-from collections import defaultdict
+import difflib
+from typing import List, Dict, Tuple, Optional
 
 
 # =================================================================== #
-#  Normalisation : neutraliser les parties volatiles                  #
+#  Caractères "volatils" : ce qui, quand ça seul diffère entre deux    #
+#  lignes, ne suffit pas a les distinguer.                            #
 # =================================================================== #
-# Les motifs qui varient d'une ligne a l'autre sans changer le sens.
-# On les remplace par un marqueur, pour que deux lignes "identiques a un
-# numero de repere pres" produisent la MEME cle.
-MOTIFS_VOLATILES = [
-    (re.compile(r"\(rep\.\s*[\d,\s\[\]]+\)", re.IGNORECASE), "(rep. #)"),  # (rep. 2), (rep. [1,2,3])
-    (re.compile(r"\brep\.\s*\d+", re.IGNORECASE), "rep. #"),               # rep. 5
-]
-
-# Caracteres sans valeur : si deux textes ne different QUE par ceux-ci,
-# on les considere identiques.
-SKIP = set(" \t\n\r.,;:!?()[]{}'\"/-")
+# On y met la ponctuation, les blancs ET les chiffres, pour que
+# '(rep. 2)' et '(rep. 5)' soient consideres equivalents.
+VOLATILES = set(" \t\n\r.,;:!?()[]{}'\"/-0123456789")
 
 
-def normaliser(texte: str) -> str:
+def diff_est_volatile(texte_a: str, texte_b: str) -> bool:
     """
-    Reduit un texte a une forme canonique :
-      - remplace les numeros de repere volatils par un marqueur,
-      - retire les skip-caracteres,
-      - met en minuscules.
-    Deux textes identiques 'a un skip-caractere ou un numero de repere pres'
-    donnent la meme forme normalisee.
+    Compare deux textes caractere par caractere avec difflib.
+    Renvoie True si TOUT ce qui differe entre eux est compose uniquement de
+    caracteres volatils. Autrement dit : ils sont identiques a un
+    numero / espace / ponctuation pres.
     """
-    for motif, remplacement in MOTIFS_VOLATILES:
-        texte = motif.sub(remplacement, texte)
-    sans_skip = "".join(c for c in texte.lower() if c not in SKIP)
-    return sans_skip
+    comparateur = difflib.SequenceMatcher(None, texte_a, texte_b)
+    for tag, i1, i2, j1, j2 in comparateur.get_opcodes():
+        if tag == "equal":
+            continue
+        # Portion qui differe, des deux cotes
+        part_a = texte_a[i1:i2]
+        part_b = texte_b[j1:j2]
+        # Si l'une des deux contient un caractere NON volatil -> vraie difference
+        if any(c not in VOLATILES for c in part_a + part_b):
+            return False
+    return True
+
+
+def couples_equivalents(couple_a, couple_b) -> bool:
+    """Deux changements sont equivalents si leur AVANT et leur APRES le sont."""
+    avant_a, apres_a = couple_a
+    avant_b, apres_b = couple_b
+    return diff_est_volatile(avant_a, avant_b) and diff_est_volatile(apres_a, apres_b)
 
 
 # =================================================================== #
 #  Extraction de l'avant / après d'une ligne                          #
 # =================================================================== #
-# Une ligne type : "- un element 'AVANT' a ete remplace par 'APRES' dans le(s) DM : ..."
 LIGNE = re.compile(
     r"un element '(?P<avant>.*?)' a ete remplace par '(?P<apres>.*?)'"
     r"(?:\s+dans le\(s\) DM\s*:\s*(?P<dm>.*))?$",
@@ -47,7 +51,7 @@ LIGNE = re.compile(
 )
 
 
-def analyser_ligne(ligne: str):
+def analyser_ligne(ligne: str) -> Optional[Tuple[str, str, List[str]]]:
     """Extrait (avant, apres, [dm...]) d'une ligne. None si le format ne colle pas."""
     m = LIGNE.search(ligne)
     if not m:
@@ -60,45 +64,57 @@ def analyser_ligne(ligne: str):
 
 
 # =================================================================== #
-#  Regroupement des lignes équivalentes                               #
+#  Regroupement par équivalence difflib (transitif)                   #
 # =================================================================== #
 def regrouper_lignes(lignes: List[str]) -> List[dict]:
     """
-    Regroupe les lignes dont l'AVANT et l'APRES sont identiques apres
-    normalisation (donc egaux a un skip-caractere ou un numero de repere pres).
-    Renvoie une liste de groupes : {avant, apres, variantes, dms}.
+    Regroupe les lignes dont (avant, apres) sont equivalents au sens difflib :
+    tout ce qui differe entre deux lignes d'un meme groupe est volatil.
+
+    Strategie : on parcourt les lignes une fois. Chaque nouvelle ligne est
+    comparee au REPRESENTANT de chaque groupe deja forme ; si elle est
+    equivalente, elle rejoint ce groupe, sinon elle en ouvre un nouveau.
+    Le premier element rencontre sert de representant (les lignes sont deja
+    triees, donc les equivalents sont voisins : la comparaison reste rapide).
     """
-    groupes: Dict[Tuple[str, str], dict] = {}
+    groupes: List[dict] = []
 
     for ligne in lignes:
         analyse = analyser_ligne(ligne)
         if analyse is None:
             continue
         avant, apres, dms = analyse
+        couple = (avant, apres)
 
-        # Cle = (avant normalise, apres normalise)
-        cle = (normaliser(avant), normaliser(apres))
+        # Cherche un groupe existant dont le representant est equivalent
+        groupe_trouve = None
+        for groupe in groupes:
+            if couples_equivalents(groupe["representant"], couple):
+                groupe_trouve = groupe
+                break
 
-        if cle not in groupes:
-            groupes[cle] = {
-                "avant": avant,          # on garde la 1re forme lisible rencontree
+        if groupe_trouve is None:
+            groupes.append({
+                "representant": couple,      # sert de reference pour comparer
+                "avant": avant,              # forme lisible affichee
                 "apres": apres,
-                "variantes": set(),      # les formes exactes vues (avec les rep. N)
-                "dms": set(),
-            }
-        groupes[cle]["variantes"].add((avant, apres))
-        groupes[cle]["dms"].update(dms)
+                "variantes": {couple},
+                "dms": set(dms),
+            })
+        else:
+            groupe_trouve["variantes"].add(couple)
+            groupe_trouve["dms"].update(dms)
 
     # Mise en forme finale
-    resultat = []
-    for g in groupes.values():
-        resultat.append({
+    return [
+        {
             "avant": g["avant"],
             "apres": g["apres"],
             "nb_variantes": len(g["variantes"]),
             "dms": sorted(g["dms"]),
-        })
-    return resultat
+        }
+        for g in groupes
+    ]
 
 
 # =================================================================== #
@@ -117,8 +133,7 @@ def afficher_groupes(groupes: List[dict]) -> None:
 # =================================================================== #
 #  Exemple d'utilisation                                              #
 # =================================================================== #
-# lignes = liste_triee            # tes lignes déjà triées
-# groupes = regrouper_lignes(lignes)
+# groupes = regrouper_lignes(liste_triee)
 # afficher_groupes(groupes)
 
 
