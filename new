@@ -1,3 +1,61 @@
+
+
+import numpy as np
+import plotly.graph_objects as go
+from scipy.spatial.distance import cosine
+
+
+def distances_voisins_consecutifs(vecteurs):
+    """
+    Sur une liste de vecteurs DEJA triee, calcule la distance cosinus entre
+    chaque vecteur i et son voisin i+1. Renvoie une liste de n-1 distances.
+    """
+    vecteurs = np.array(vecteurs)
+    return [cosine(vecteurs[i], vecteurs[i + 1]) for i in range(len(vecteurs) - 1)]
+
+
+def plot_distances(distances, codes=None):
+    """
+    Affiche la distance cosinus entre chaque paire consecutive (i, i+1).
+    'codes' (optionnel) : liste des DMC, pour annoter chaque transition.
+    """
+    x = list(range(len(distances)))
+
+    # Etiquette de chaque transition : "DMC_i -> DMC_i+1" si codes fournis
+    if codes:
+        etiquettes = [f"{codes[i]} → {codes[i + 1]}" for i in range(len(distances))]
+    else:
+        etiquettes = [f"{i} → {i + 1}" for i in x]
+
+    fig = go.Figure(go.Scatter(
+        x=x,
+        y=distances,
+        mode="lines+markers",
+        text=etiquettes,
+        hovertemplate="%{text}<br>distance = %{y:.4f}<extra></extra>",
+    ))
+    fig.update_layout(
+        title="Distance cosinus entre vecteurs consécutifs (après tri)",
+        xaxis_title="Transition i → i+1",
+        yaxis_title="Distance cosinus",
+        template="plotly_white",
+    )
+    fig.show()
+    return fig
+
+
+# --- Utilisation ---
+# On reprend l'ordre trié : documents_tries garde l'ordre du tri.
+codes = list(documents_tries.keys())
+vecteurs = [documents_tries[dmc]["vecteur"] for dmc in codes]
+
+distances = distances_voisins_consecutifs(vecteurs)
+plot_distances(distances, codes)
+
+
+
+
+
 from typing import List, Dict, Optional
 from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
