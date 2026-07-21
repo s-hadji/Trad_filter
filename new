@@ -1,3 +1,122 @@
+
+# =================================================================== #
+#  Sortie structurée du LLM                                           #
+# =================================================================== #
+class PatternDetecte(BaseModel):
+    """Un pattern de modification identifie par le LLM (reutilisable entre lots)."""
+    id: int = Field(description="Numero du pattern. REUTILISER un id existant si le pattern est deja connu.")
+    description: str = Field(
+        description="Description courte mais complete, dans le langage EXACT du texte, sans interpretation. "
+                    "Ex: 'Ajout de repere (rep. N) sur des elements du controle de vol'."
+    )
+    modifications_couvertes: List[int] = Field(
+        description="Ids des modifications (du lot) couvertes par ce pattern."
+    )
+
+
+class SortieLLM(BaseModel):
+    patterns: List[PatternDetecte] = Field(description="Patterns identifies dans ce lot.")
+
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Vous etes un expert en gestion de configuration documentaire. On vous donne un lot de "
+     "modifications deja detectees (chacune : un id, une forme condensee avant->apres, et un "
+     "ensemble de DM).\n\n"
+     "Votre tache : regrouper ces modifications en PATTERNS. Un pattern rassemble des modifications "
+     "qui suivent une meme regularite : changement de reference, traduction, ajout de repere, etc.\n\n"
+     "REGLES ABSOLUES :\n"
+     "1. Description COURTE mais COMPLETE. Citez TOUJOURS le texte exact. Parlez UNIQUEMENT avec le "
+     "langage du texte, sans interpreter ni reformuler le sens metier.\n"
+     "2. Chaque modification du lot doit etre couverte par exactement un pattern (via son id dans "
+     "'modifications_couvertes').\n"
+     "3. PATTERNS DEJA CONNUS : la liste ci-dessous recense les patterns identifies dans les lots "
+     "precedents. Si une modification de ce lot correspond a un pattern deja connu, REUTILISEZ son id "
+     "et sa description a l'identique. Ne creez un nouvel id que pour un pattern reellement nouveau.\n\n"
+     "PATTERNS DEJA CONNUS :\n{patterns_connus}\n\n"
+     "Aucun emoji. Style factuel."),
+    ("user",
+     "Lot de modifications a analyser :\n{lot}\n\n"
+     "Identifiez les patterns.")
+])
+
+
+def _formater_lot(mods: List[Modification]) -> str:
+    return "\n".join(
+        f"  [modif {m.id}] {m.condense}  (Ensemble {m.ensemble_id})"
+        for m in mods
+    )
+
+
+def _formater_patterns_connus(patterns: Dict[int, dict]) -> str:
+    if not patterns:
+        return "  (aucun pour l'instant)"
+    return "\n".join(f"  [pattern {pid}] {p['description']}" for pid, p in patterns.items())
+
+
+def analyser_par_lots(rapport: RapportFinal, taille_lot: int = 10) -> Dict[int, dict]:
+    """
+    Envoie les modifications au LLM par lots. Accumule les patterns : un pattern
+    vu au lot 1 est reinjecte pour etre reutilise au lot 10.
+    Renvoie {pattern_id: {description, modifications, ensembles}} avec tracabilite.
+    """
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.1, max_tokens=4000)
+    chaine = PROMPT | llm.with_structured_output(SortieLLM)
+
+    # Table pour retrouver l'ensemble_id de chaque modification
+    ensemble_de_modif = {m.id: m.ensemble_id for m in rapport.modifications}
+
+    patterns: Dict[int, dict] = {}   # memoire cumulative
+    mods = rapport.modifications
+    nb_lots = (len(mods) + taille_lot - 1) // taille_lot
+
+    for numero, debut in enumerate(range(0, len(mods), taille_lot), 1):
+        lot = mods[debut: debut + taille_lot]
+        print(f"[LLM] Lot {numero}/{nb_lots} ({len(lot)} modifs)")
+
+        sortie = chaine.invoke({
+            "lot": _formater_lot(lot),
+            "patterns_connus": _formater_patterns_connus(patterns),
+        })
+
+        # Fusion dans la memoire cumulative + tracabilite des ensembles
+        for p in sortie.patterns:
+            entree = patterns.setdefault(
+                p.id, {"description": p.description, "modifications": set(), "ensembles": set()}
+            )
+            # On garde la description (celle du 1er lot fait foi pour la coherence)
+            for modif_id in p.modifications_couvertes:
+                entree["modifications"].add(modif_id)
+                if modif_id in ensemble_de_modif:
+                    entree["ensembles"].add(ensemble_de_modif[modif_id])
+
+    return patterns
+
+
+# =================================================================== #
+#  Affichage final                                                    #
+# =================================================================== #
+def afficher_patterns(patterns: Dict[int, dict], rapport: RapportFinal) -> None:
+    table = rapport.table_ensembles()
+    print(f"\n{len(patterns)} pattern(s) identifie(s)\n")
+    for pid, p in sorted(patterns.items()):
+        dms = sorted({dm for eid in p["ensembles"] for dm in table.get(eid, [])})
+        print(f"Pattern {pid} : {p['description']}")
+        print(f"   modifications : {sorted(p['modifications'])}")
+        print(f"   ensembles DM  : {sorted(p['ensembles'])}")
+        print(f"   DM ({len(dms)}) : {', '.join(dms)}\n")
+
+
+# =================================================================== #
+#  Exemple d'utilisation                                              #
+# =================================================================== #
+# rapport = preparer_modifications(feuille, embedding)
+# patterns = analyser_par_lots(rapport, taille_lot=10)
+# afficher_patterns(patterns, rapport)
+
+
+
+
 import re
 import difflib
 import numpy as np
