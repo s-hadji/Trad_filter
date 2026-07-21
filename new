@@ -1,5 +1,185 @@
 
 
+import re
+import difflib
+from typing import List, Dict, Tuple, Optional
+from os.path import commonprefix
+from pydantic import BaseModel, Field
+
+
+# =================================================================== #
+#  Caractères "volatils"                                              #
+# =================================================================== #
+VOLATILES = set(" \t\n\r.,;:!?()[]{}'\"/-0123456789")
+
+# Motif (rep. N) / (rep. [1,2,3]) traité comme entièrement volatil.
+MOTIF_REP = re.compile(r"\(rep\.\s*[\d,\s\[\]]+\)", re.IGNORECASE)
+
+
+def diff_est_volatile(texte_a: str, texte_b: str) -> bool:
+    """
+    True si tout ce qui differe entre a et b est volatil OU un motif (rep. ...).
+    On efface d'abord les (rep. ...), puis on compare caractere par caractere.
+    """
+    a = MOTIF_REP.sub("", texte_a)
+    b = MOTIF_REP.sub("", texte_b)
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b).get_opcodes():
+        if tag == "equal":
+            continue
+        if any(c not in VOLATILES for c in a[i1:i2] + b[j1:j2]):
+            return False
+    return True
+
+
+def couples_equivalents(couple_a, couple_b) -> bool:
+    """Deux changements sont equivalents si leur AVANT et leur APRES le sont."""
+    return (diff_est_volatile(couple_a[0], couple_b[0])
+            and diff_est_volatile(couple_a[1], couple_b[1]))
+
+
+# =================================================================== #
+#  Extraction de l'avant / après d'une ligne                          #
+# =================================================================== #
+LIGNE = re.compile(
+    r"un element '(?P<avant>.*?)' a ete remplace par '(?P<apres>.*?)'"
+    r"(?:\s+dans le\(s\) DM\s*:\s*(?P<dm>.*))?$",
+    re.IGNORECASE,
+)
+
+
+def analyser_ligne(ligne: str) -> Optional[Tuple[str, str, List[str]]]:
+    m = LIGNE.search(ligne)
+    if not m:
+        return None
+    avant = m.group("avant") or ""
+    apres = m.group("apres") or ""
+    dms = [d.strip() for d in (m.group("dm") or "").split(",") if d.strip()]
+    return avant, apres, dms
+
+
+# =================================================================== #
+#  Factorisation : prefixe{variations}suffixe                         #
+# =================================================================== #
+def suffixe_commun(chaines: List[str]) -> str:
+    return commonprefix([c[::-1] for c in chaines])[::-1]
+
+
+def factoriser(valeurs: List[str]) -> str:
+    """['... rep. 2))', '... rep. 3))'] -> '... rep. {2, 3}))'."""
+    uniques = sorted(set(valeurs))
+    if len(uniques) == 1:
+        return uniques[0]
+    prefixe = commonprefix(uniques)
+    restes = [c[len(prefixe):] for c in uniques]
+    suffixe = suffixe_commun(restes)
+    milieux = [r[: len(r) - len(suffixe)] if suffixe else r for r in restes]
+    milieux = [m for m in milieux if m]
+    variable = "{" + ", ".join(dict.fromkeys(milieux)) + "}"
+    return f"{prefixe}{variable}{suffixe}"
+
+
+# =================================================================== #
+#  Structures Pydantic prêtes pour le LLM                             #
+# =================================================================== #
+class GroupeModification(BaseModel):
+    """Un changement, avec ses variantes factorisees, lisible d'un coup par un LLM."""
+    avant: str = Field(description="Forme factorisee de l'ancienne valeur, ex: 'support (rep. {2, 3}))'.")
+    apres: str = Field(description="Forme factorisee de la nouvelle valeur.")
+    variantes: List[str] = Field(
+        description="Toutes les formes exactes regroupees, sous forme 'avant => apres'."
+    )
+    nb_variantes: int = Field(description="Nombre de variantes exactes dans ce groupe.")
+    dms: List[str] = Field(description="Codes DM concernes par ce changement.")
+
+    def ligne_compacte(self) -> str:
+        base = f"'{self.avant}' -> '{self.apres}'"
+        if self.dms:
+            base += f"  [DM : {', '.join(self.dms)}]"
+        return base
+
+
+class RapportModifications(BaseModel):
+    """Ensemble des changements regroupes, pret a etre envoye au LLM."""
+    groupes: List[GroupeModification]
+
+    @property
+    def nb_groupes(self) -> int:
+        return len(self.groupes)
+
+    def texte_pour_llm(self) -> str:
+        """Rendu compact : une ligne factorisee par groupe."""
+        return "\n".join(f"- {g.ligne_compacte()}" for g in self.groupes)
+
+
+# =================================================================== #
+#  Regroupement -> RapportModifications                               #
+# =================================================================== #
+def regrouper_lignes(lignes: List[str]) -> RapportModifications:
+    """Regroupe les lignes equivalentes et construit la structure pour le LLM."""
+    bruts: List[dict] = []
+
+    for ligne in lignes:
+        analyse = analyser_ligne(ligne)
+        if analyse is None:
+            continue
+        avant, apres, dms = analyse
+        couple = (avant, apres)
+
+        cible = None
+        for g in bruts:
+            if couples_equivalents(g["representant"], couple):
+                cible = g
+                break
+
+        if cible is None:
+            bruts.append({"representant": couple, "variantes": {couple}, "dms": set(dms)})
+        else:
+            cible["variantes"].add(couple)
+            cible["dms"].update(dms)
+
+    groupes = []
+    for g in bruts:
+        variantes = sorted(g["variantes"])
+        avants = [av for av, _ in variantes]
+        apres = [ap for _, ap in variantes]
+        groupes.append(GroupeModification(
+            avant=factoriser(avants),
+            apres=factoriser(apres),
+            variantes=[f"{av} => {ap}" for av, ap in variantes],
+            nb_variantes=len(variantes),
+            dms=sorted(g["dms"]),
+        ))
+
+    return RapportModifications(groupes=groupes)
+
+
+# =================================================================== #
+#  Affichage                                                          #
+# =================================================================== #
+def afficher_rapport(rapport: RapportModifications) -> None:
+    print(f"{rapport.nb_groupes} groupe(s) apres regroupement\n")
+    for i, g in enumerate(rapport.groupes, 1):
+        print(f"{i}. '{g.avant}' -> '{g.apres}'")
+        print(f"   {g.nb_variantes} variante(s), {len(g.dms)} DM")
+        if g.nb_variantes > 1:
+            print("   variantes :")
+            for v in g.variantes:
+                print(f"     - {v}")
+        if g.dms:
+            print(f"   DM : {', '.join(g.dms)}")
+        print()
+
+
+# =================================================================== #
+#  Exemple d'utilisation                                              #
+# =================================================================== #
+# rapport = regrouper_lignes(liste_triee)
+# afficher_rapport(rapport)                 # inspection humaine
+# print(rapport.texte_pour_llm())           # texte compact à envoyer au LLM
+
+
+
+
 import numpy as np
 from scipy.spatial.distance import cosine
 
