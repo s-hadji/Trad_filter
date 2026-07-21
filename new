@@ -2,6 +2,263 @@
 
 import re
 import difflib
+import numpy as np
+from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass
+from os.path import commonprefix
+from scipy.spatial.distance import cdist
+from pydantic import BaseModel, Field
+
+
+# =================================================================== #
+#  Réglages                                                           #
+# =================================================================== #
+SKIP_CHARS = " \t\n\r.,;:!?()[]{}'\"/-"
+SEUIL_FUSION = 30
+VOLATILES = set(SKIP_CHARS + "0123456789")
+MOTIF_REP = re.compile(r"\(rep\.\s*[\d,\s\[\]]+\)", re.IGNORECASE)
+
+
+# =================================================================== #
+#  ÉTAPE 1 — Détection des changements (difflib au mot)               #
+# =================================================================== #
+def _est_sans_valeur(t: str) -> bool:
+    return all(c in SKIP_CHARS for c in t)
+
+
+def detecter_changements(v1: str, v2: str) -> List[Tuple[str, str]]:
+    """Renvoie la liste des (avant, apres) reels entre v1 et v2 (MODIFIE uniquement ici)."""
+    decoupe = lambda t: re.findall(r"\S+|\s+", t)
+    a, b = decoupe(v1), decoupe(v2)
+    opcodes = difflib.SequenceMatcher(None, a, b).get_opcodes()
+
+    # Neutraliser les changements sans valeur, recoller les equal
+    nettoyes = []
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag != "equal" and _est_sans_valeur("".join(a[i1:i2])) and _est_sans_valeur("".join(b[j1:j2])):
+            tag = "equal"
+        nettoyes.append((tag, i1, i2, j1, j2))
+
+    recolles = []
+    for op in nettoyes:
+        if recolles and op[0] == "equal" and recolles[-1][0] == "equal":
+            _, pi1, _, pj1, _ = recolles[-1]
+            recolles[-1] = ("equal", pi1, op[2], pj1, op[4])
+        else:
+            recolles.append(op)
+
+    # Fusionner les petits equal entre deux changements
+    fusionnes = []
+    for tag, i1, i2, j1, j2 in recolles:
+        court = tag == "equal" and len("".join(a[i1:i2])) < SEUIL_FUSION
+        entre_deux = bool(fusionnes) and fusionnes[-1][0] != "equal"
+        fusionnes.append(("replace", i1, i2, j1, j2) if (court and entre_deux) else (tag, i1, i2, j1, j2))
+
+    compacts = []
+    for tag, i1, i2, j1, j2 in fusionnes:
+        if compacts and tag != "equal" and compacts[-1][0] != "equal":
+            _, pi1, _, pj1, _ = compacts[-1]
+            compacts[-1] = ("replace", pi1, i2, pj1, j2)
+        else:
+            compacts.append((tag, i1, i2, j1, j2))
+
+    changements = []
+    for tag, i1, i2, j1, j2 in compacts:
+        if tag == "equal":
+            continue
+        avant, apres = "".join(a[i1:i2]).strip(), "".join(b[j1:j2]).strip()
+        changements.append((avant, apres))
+    return changements
+
+
+# =================================================================== #
+#  Lecture de la structure de node                                    #
+# =================================================================== #
+def _code_dm(node) -> str:
+    for attr in ("code_dm", "dmc", "name"):
+        v = getattr(node, attr, None)
+        if v:
+            return str(v)
+    return "DM_INCONNU"
+
+
+def _contenu(doc) -> str:
+    if isinstance(doc, dict):
+        return str(doc.get("content", "") or "")
+    return str(doc or "")
+
+
+# =================================================================== #
+#  Équivalence + factorisation (pour le regroupement)                 #
+# =================================================================== #
+def _diff_volatile(a: str, b: str) -> bool:
+    a, b = MOTIF_REP.sub("", a.lower()), MOTIF_REP.sub("", b.lower())
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b).get_opcodes():
+        if tag == "equal":
+            continue
+        if any(c not in VOLATILES for c in a[i1:i2] + b[j1:j2]):
+            return False
+    return True
+
+
+def _equivalents(c1, c2) -> bool:
+    return _diff_volatile(c1[0], c2[0]) and _diff_volatile(c1[1], c2[1])
+
+
+def _suffixe_commun(chaines: List[str]) -> str:
+    return commonprefix([c[::-1] for c in chaines])[::-1]
+
+
+def _parties_variables(valeurs: List[str]) -> List[str]:
+    uniques = sorted(set(valeurs))
+    if len(uniques) == 1:
+        return []
+    prefixe = commonprefix(uniques)
+    restes = [c[len(prefixe):] for c in uniques]
+    suffixe = _suffixe_commun(restes)
+    milieux = [r[: len(r) - len(suffixe)] if suffixe else r for r in restes]
+    return [m for m in dict.fromkeys(milieux) if m]
+
+
+def _factoriser(valeurs: List[str]) -> str:
+    uniques = sorted(set(valeurs))
+    if len(uniques) == 1:
+        return uniques[0]
+    prefixe = commonprefix(uniques)
+    restes = [c[len(prefixe):] for c in uniques]
+    suffixe = _suffixe_commun(restes)
+    return f"{prefixe}{{{', '.join(_parties_variables(valeurs))}}}{suffixe}"
+
+
+# =================================================================== #
+#  Structure finale : prête pour le LLM                               #
+# =================================================================== #
+class Modification(BaseModel):
+    """Un changement regroupe, avec sa forme condensee, ses variantes et ses DM."""
+    avant: str = Field(description="Ancienne valeur factorisee.")
+    apres: str = Field(description="Nouvelle valeur factorisee.")
+    condense: str = Field(description="Ligne condensee 'avant -> apres', lisible d'un coup.")
+    variations_avant: List[str] = Field(description="Parties variables de l'avant.")
+    variations_apres: List[str] = Field(description="Parties variables de l'apres.")
+    nb_variantes: int = Field(description="Nombre de variantes exactes regroupees.")
+    dms: List[str] = Field(description="Codes DM concernes par cette modification.")
+
+
+class RapportFinal(BaseModel):
+    modifications: List[Modification]
+
+    @property
+    def nb(self) -> int:
+        return len(self.modifications)
+
+    def texte_pour_llm(self) -> str:
+        return "\n".join(f"- {m.condense}  [DM : {', '.join(m.dms)}]" for m in self.modifications)
+
+
+# =================================================================== #
+#  PIPELINE COMPLET : feuille -> RapportFinal                         #
+# =================================================================== #
+def preparer_modifications(feuille, embedding) -> RapportFinal:
+    """
+    De 'feuille' aux modifications pretes pour le LLM, en une passe :
+      1. detecter les changements de chaque node ;
+      2. condenser (un couple avant/apres unique -> les DM concernes) ;
+      3. trier par proximite semantique (embedding + plus proche voisin) ;
+      4. regrouper les variantes equivalentes et factoriser.
+    """
+    # --- 1 + 2 : détection et condensation par couple (avant, apres) ---
+    print("1/4 Détection des changements...")
+    dms_par_couple: Dict[Tuple[str, str], set] = {}
+    for node in feuille:
+        code = _code_dm(node)
+        v1, v2 = _contenu(getattr(node, "doc_v1", None)), _contenu(getattr(node, "doc_v2", None))
+        if not v1 and not v2:
+            continue
+        for couple in detecter_changements(v1, v2):
+            dms_par_couple.setdefault(couple, set()).add(code)
+
+    couples = list(dms_par_couple.keys())
+    print(f"    {len(couples)} changement(s) distinct(s)")
+    if not couples:
+        return RapportFinal(modifications=[])
+
+    # --- 3 : tri par plus proche voisin sur l'embedding du couple ---
+    print("2/4 Tri par embedding...")
+    textes = [f"{av} => {ap}" for av, ap in couples]
+    if len(couples) > 1:
+        vecteurs = np.array(embedding.embed_documents(textes))
+        ordre = _ordre_plus_proche_voisin(vecteurs)
+        couples = [couples[i] for i in ordre]
+
+    # --- 4 : regroupement des variantes équivalentes ---
+    print("3/4 Regroupement des variantes...")
+    groupes: List[dict] = []
+    for couple in couples:
+        cible = next((g for g in groupes if _equivalents(g["representant"], couple)), None)
+        if cible is None:
+            groupes.append({"representant": couple, "variantes": {couple},
+                            "dms": set(dms_par_couple[couple])})
+        else:
+            cible["variantes"].add(couple)
+            cible["dms"].update(dms_par_couple[couple])
+
+    # --- Mise en forme finale ---
+    print("4/4 Mise en forme...")
+    modifications = []
+    for g in groupes:
+        variantes = sorted(g["variantes"])
+        avants = [av for av, _ in variantes]
+        apres = [ap for _, ap in variantes]
+        av_f, ap_f = _factoriser(avants), _factoriser(apres)
+        modifications.append(Modification(
+            avant=av_f,
+            apres=ap_f,
+            condense=f"'{av_f}' -> '{ap_f}'",
+            variations_avant=_parties_variables(avants),
+            variations_apres=_parties_variables(apres),
+            nb_variantes=len(variantes),
+            dms=sorted(g["dms"]),
+        ))
+
+    print(f"    {len(modifications)} modification(s) prête(s)")
+    return RapportFinal(modifications=modifications)
+
+
+def _ordre_plus_proche_voisin(vecteurs: np.ndarray) -> List[int]:
+    n = len(vecteurs)
+    courant, ordre, restants = 0, [0], list(range(1, n))
+    while restants:
+        d = cdist(vecteurs[courant].reshape(1, -1), vecteurs[restants], metric="cosine")[0]
+        courant = restants.pop(int(np.argmin(d)))
+        ordre.append(courant)
+    return ordre
+
+
+# =================================================================== #
+#  Affichage                                                          #
+# =================================================================== #
+def afficher(rapport: RapportFinal) -> None:
+    print(f"\n{rapport.nb} modification(s)\n")
+    for i, m in enumerate(rapport.modifications, 1):
+        print(f"{i}. {m.condense}")
+        print(f"   {m.nb_variantes} variante(s), {len(m.dms)} DM")
+        if m.variations_apres:
+            print(f"   variations apres : {{{', '.join(m.variations_apres)}}}")
+        if m.dms:
+            print(f"   DM : {', '.join(m.dms)}")
+        print()
+
+
+# =================================================================== #
+#  Exemple d'utilisation                                              #
+# =================================================================== #
+# rapport = preparer_modifications(feuille, embedding)
+# afficher(rapport)
+# print(rapport.texte_pour_llm())
+
+
+import re
+import difflib
 from typing import List, Dict, Tuple, Optional
 from os.path import commonprefix
 from pydantic import BaseModel, Field
