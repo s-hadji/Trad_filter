@@ -1,5 +1,127 @@
 
 
+import re
+from typing import List, Dict, Tuple
+from collections import defaultdict
+
+
+# =================================================================== #
+#  Normalisation : neutraliser les parties volatiles                  #
+# =================================================================== #
+# Les motifs qui varient d'une ligne a l'autre sans changer le sens.
+# On les remplace par un marqueur, pour que deux lignes "identiques a un
+# numero de repere pres" produisent la MEME cle.
+MOTIFS_VOLATILES = [
+    (re.compile(r"\(rep\.\s*[\d,\s\[\]]+\)", re.IGNORECASE), "(rep. #)"),  # (rep. 2), (rep. [1,2,3])
+    (re.compile(r"\brep\.\s*\d+", re.IGNORECASE), "rep. #"),               # rep. 5
+]
+
+# Caracteres sans valeur : si deux textes ne different QUE par ceux-ci,
+# on les considere identiques.
+SKIP = set(" \t\n\r.,;:!?()[]{}'\"/-")
+
+
+def normaliser(texte: str) -> str:
+    """
+    Reduit un texte a une forme canonique :
+      - remplace les numeros de repere volatils par un marqueur,
+      - retire les skip-caracteres,
+      - met en minuscules.
+    Deux textes identiques 'a un skip-caractere ou un numero de repere pres'
+    donnent la meme forme normalisee.
+    """
+    for motif, remplacement in MOTIFS_VOLATILES:
+        texte = motif.sub(remplacement, texte)
+    sans_skip = "".join(c for c in texte.lower() if c not in SKIP)
+    return sans_skip
+
+
+# =================================================================== #
+#  Extraction de l'avant / après d'une ligne                          #
+# =================================================================== #
+# Une ligne type : "- un element 'AVANT' a ete remplace par 'APRES' dans le(s) DM : ..."
+LIGNE = re.compile(
+    r"un element '(?P<avant>.*?)' a ete remplace par '(?P<apres>.*?)'"
+    r"(?:\s+dans le\(s\) DM\s*:\s*(?P<dm>.*))?$",
+    re.IGNORECASE,
+)
+
+
+def analyser_ligne(ligne: str):
+    """Extrait (avant, apres, [dm...]) d'une ligne. None si le format ne colle pas."""
+    m = LIGNE.search(ligne)
+    if not m:
+        return None
+    avant = m.group("avant") or ""
+    apres = m.group("apres") or ""
+    dm_txt = m.group("dm") or ""
+    dms = [d.strip() for d in dm_txt.split(",") if d.strip()]
+    return avant, apres, dms
+
+
+# =================================================================== #
+#  Regroupement des lignes équivalentes                               #
+# =================================================================== #
+def regrouper_lignes(lignes: List[str]) -> List[dict]:
+    """
+    Regroupe les lignes dont l'AVANT et l'APRES sont identiques apres
+    normalisation (donc egaux a un skip-caractere ou un numero de repere pres).
+    Renvoie une liste de groupes : {avant, apres, variantes, dms}.
+    """
+    groupes: Dict[Tuple[str, str], dict] = {}
+
+    for ligne in lignes:
+        analyse = analyser_ligne(ligne)
+        if analyse is None:
+            continue
+        avant, apres, dms = analyse
+
+        # Cle = (avant normalise, apres normalise)
+        cle = (normaliser(avant), normaliser(apres))
+
+        if cle not in groupes:
+            groupes[cle] = {
+                "avant": avant,          # on garde la 1re forme lisible rencontree
+                "apres": apres,
+                "variantes": set(),      # les formes exactes vues (avec les rep. N)
+                "dms": set(),
+            }
+        groupes[cle]["variantes"].add((avant, apres))
+        groupes[cle]["dms"].update(dms)
+
+    # Mise en forme finale
+    resultat = []
+    for g in groupes.values():
+        resultat.append({
+            "avant": g["avant"],
+            "apres": g["apres"],
+            "nb_variantes": len(g["variantes"]),
+            "dms": sorted(g["dms"]),
+        })
+    return resultat
+
+
+# =================================================================== #
+#  Affichage                                                          #
+# =================================================================== #
+def afficher_groupes(groupes: List[dict]) -> None:
+    print(f"{len(groupes)} groupe(s) apres regroupement\n")
+    for i, g in enumerate(groupes, 1):
+        print(f"{i}. '{g['avant']}' -> '{g['apres']}'")
+        print(f"   {g['nb_variantes']} variante(s), {len(g['dms'])} DM")
+        if g["dms"]:
+            print(f"   DM : {', '.join(g['dms'])}")
+        print()
+
+
+# =================================================================== #
+#  Exemple d'utilisation                                              #
+# =================================================================== #
+# lignes = liste_triee            # tes lignes déjà triées
+# groupes = regrouper_lignes(lignes)
+# afficher_groupes(groupes)
+
+
 import numpy as np
 import plotly.graph_objects as go
 from scipy.spatial.distance import cosine
