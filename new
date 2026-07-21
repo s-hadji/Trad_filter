@@ -1,5 +1,69 @@
 
 
+import numpy as np
+from scipy.spatial.distance import cosine
+
+
+def grouper_par_proximite(lignes, embedding):
+    """
+    Parcourt les lignes dans l'ordre et decide, pour chacune, si elle prolonge
+    le groupe courant ou en ouvre un nouveau.
+
+    Regle a chaque position i :
+      - distance au groupe precedent = distance cosinus entre la ligne i et la
+        MOYENNE des vecteurs du groupe courant ;
+      - distance au suivant = distance cosinus entre la ligne i et la ligne i+1 ;
+      - si la ligne est plus proche du suivant que du groupe courant, on FERME le
+        groupe courant et on en ouvre un nouveau a partir de la ligne i ;
+      - sinon la ligne i rejoint le groupe courant.
+
+    A l'initialisation il n'y a pas de groupe precedent : on compare seulement au
+    suivant, et la premiere ligne demarre le premier groupe.
+    """
+    vecteurs = np.array(embedding.embed_documents(lignes))
+    n = len(vecteurs)
+
+    if n == 0:
+        return []
+    if n == 1:
+        return [[0]]
+
+    groupes = []
+    groupe_courant = [0]                 # le 1er element demarre le 1er groupe
+    moyenne_courante = vecteurs[0].copy()  # moyenne du groupe courant
+
+    for i in range(1, n):
+        # Distance de la ligne i a la moyenne du groupe courant
+        dist_groupe = cosine(vecteurs[i], moyenne_courante)
+
+        # Distance de la ligne i a la ligne suivante (si elle existe)
+        if i + 1 < n:
+            dist_suivant = cosine(vecteurs[i], vecteurs[i + 1])
+        else:
+            dist_suivant = np.inf   # pas de suivant : on ne peut que rejoindre
+
+        if dist_suivant < dist_groupe:
+            # Plus proche du suivant -> on ferme le groupe et on en ouvre un nouveau
+            groupes.append(groupe_courant)
+            groupe_courant = [i]
+            moyenne_courante = vecteurs[i].copy()
+        else:
+            # Plus proche du groupe courant -> on l'y ajoute et on met a jour la moyenne
+            groupe_courant.append(i)
+            moyenne_courante = vecteurs[groupe_courant].mean(axis=0)
+
+    groupes.append(groupe_courant)  # ne pas oublier le dernier groupe
+    return groupes
+
+
+# --- Utilisation ---
+# groupes_indices = grouper_par_proximite(lignes, embedding)
+# for numero, indices in enumerate(groupes_indices, 1):
+#     print(f"\n=== Groupe {numero} ({len(indices)} ligne(s)) ===")
+#     for i in indices:
+#         print(f"  {lignes[i]}")
+
+
 
 """
 Pipeline complet :
