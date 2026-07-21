@@ -1,5 +1,332 @@
 
 
+
+"""
+Pipeline complet :
+  1. Detecter les changements entre v1 et v2 de chaque node (difflib au mot).
+  2. Condenser : une ligne par changement distinct, avec les DM concernes.
+  3. Embedder ces lignes et les trier par proximite (plus proche voisin).
+  4. Regrouper les lignes equivalentes (memes a un numero de repere pres).
+  5. Rendre chaque groupe en UNE ligne compacte 'prefixe{variations}suffixe',
+     lisible d'un coup par un LLM.
+"""
+
+import re
+import difflib
+import numpy as np
+from typing import List, Tuple, Dict, Optional
+from dataclasses import dataclass
+from os.path import commonprefix
+from scipy.spatial.distance import cdist
+
+
+# =================================================================== #
+#  Réglages                                                           #
+# =================================================================== #
+SKIP_CHARS = " \t\n\r.,;:!?()[]{}'\"/-"
+SEUIL_FUSION = 30          # fusionne deux changements séparés par < N caractères communs
+
+# Caractères "volatils" pour le regroupement : ponctuation + blancs + chiffres.
+VOLATILES = set(SKIP_CHARS + "0123456789")
+
+# Motif (rep. N) / (rep. [1,2,3]) traité comme entièrement volatil.
+MOTIF_REP = re.compile(r"\(rep\.\s*[\d,\s\[\]]+\)", re.IGNORECASE)
+
+
+# =================================================================== #
+#  1. Détection des changements (difflib au mot)                      #
+# =================================================================== #
+@dataclass(frozen=True)
+class Changement:
+    type: str            # "MODIFIE", "SUPPRIME", "AJOUTE"
+    avant: str
+    apres: str
+
+    def cle(self) -> Tuple[str, str, str]:
+        return (self.type, self.avant.strip(), self.apres.strip())
+
+    def phrase(self) -> str:
+        if self.type == "MODIFIE":
+            return f"un element '{self.avant.strip()}' a ete remplace par '{self.apres.strip()}'"
+        if self.type == "SUPPRIME":
+            return f"un element '{self.avant.strip()}' a ete supprime"
+        return f"un element '{self.apres.strip()}' a ete insere"
+
+
+def est_sans_valeur(texte: str) -> bool:
+    """Vrai si le texte est vide ou uniquement composé de skip-caractères."""
+    return all(c in SKIP_CHARS for c in texte)
+
+
+def detecter_changements(v1: str, v2: str) -> List[Changement]:
+    """Compare v1 et v2 au mot, ignore les changements sans valeur, fusionne les proches."""
+    decoupe = lambda t: re.findall(r"\S+|\s+", t)
+    a, b = decoupe(v1), decoupe(v2)
+    opcodes = difflib.SequenceMatcher(None, a, b).get_opcodes()
+
+    # Neutraliser les changements purement ponctuation/espaces
+    nettoyes = []
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag != "equal":
+            if est_sans_valeur("".join(a[i1:i2])) and est_sans_valeur("".join(b[j1:j2])):
+                tag = "equal"
+        nettoyes.append((tag, i1, i2, j1, j2))
+
+    # Recoller les 'equal' voisins
+    recolles = []
+    for op in nettoyes:
+        if recolles and op[0] == "equal" and recolles[-1][0] == "equal":
+            _, pi1, _, pj1, _ = recolles[-1]
+            recolles[-1] = ("equal", pi1, op[2], pj1, op[4])
+        else:
+            recolles.append(op)
+
+    # Absorber les petits 'equal' coincés entre deux changements
+    fusionnes = []
+    for tag, i1, i2, j1, j2 in recolles:
+        court = tag == "equal" and len("".join(a[i1:i2])) < SEUIL_FUSION
+        entre_deux = bool(fusionnes) and fusionnes[-1][0] != "equal"
+        fusionnes.append(("replace", i1, i2, j1, j2) if (court and entre_deux) else (tag, i1, i2, j1, j2))
+
+    compacts = []
+    for tag, i1, i2, j1, j2 in fusionnes:
+        if compacts and tag != "equal" and compacts[-1][0] != "equal":
+            _, pi1, _, pj1, _ = compacts[-1]
+            compacts[-1] = ("replace", pi1, i2, pj1, j2)
+        else:
+            compacts.append((tag, i1, i2, j1, j2))
+
+    # Extraire les changements
+    changements = []
+    for tag, i1, i2, j1, j2 in compacts:
+        if tag == "equal":
+            continue
+        avant, apres = "".join(a[i1:i2]), "".join(b[j1:j2])
+        if tag == "replace":
+            changements.append(Changement("MODIFIE", avant, apres))
+        elif tag == "delete":
+            changements.append(Changement("SUPPRIME", avant, ""))
+        elif tag == "insert":
+            changements.append(Changement("AJOUTE", "", apres))
+    return changements
+
+
+# =================================================================== #
+#  Lecture de la structure de node                                    #
+# =================================================================== #
+def lire_code_dm(node) -> str:
+    for attr in ("code_dm", "dmc", "name"):
+        val = getattr(node, attr, None)
+        if val:
+            return str(val)
+    return "DM_INCONNU"
+
+
+def lire_contenu(doc) -> str:
+    if isinstance(doc, dict):
+        return str(doc.get("content", "") or "")
+    return str(doc or "")
+
+
+# =================================================================== #
+#  2. Rapport condensé : une ligne par changement distinct            #
+# =================================================================== #
+def generer_lignes_condensees(feuille) -> List[str]:
+    """Regroupe les changements identiques et liste les DM concernés (une ligne chacun)."""
+    regroupes: Dict[Tuple[str, str, str], Tuple[Changement, List[str]]] = {}
+    for node in feuille:
+        code_dm = lire_code_dm(node)
+        v1 = lire_contenu(getattr(node, "doc_v1", None))
+        v2 = lire_contenu(getattr(node, "doc_v2", None))
+        if not v1 and not v2:
+            continue
+        for ch in detecter_changements(v1, v2):
+            cle = ch.cle()
+            if cle not in regroupes:
+                regroupes[cle] = (ch, [])
+            _, dms = regroupes[cle]
+            if code_dm not in dms:
+                dms.append(code_dm)
+
+    return [
+        f"- {ch.phrase()} dans le(s) DM : {', '.join(sorted(dms))}"
+        for ch, dms in regroupes.values()
+    ]
+
+
+# =================================================================== #
+#  3. Tri par plus proche voisin (embedding)                          #
+# =================================================================== #
+def ordre_plus_proche_voisin(vecteurs: np.ndarray) -> List[int]:
+    """Chemin glouton : part du 1er, enchaîne toujours vers le plus proche non visité."""
+    n = len(vecteurs)
+    courant = 0
+    ordre = [courant]
+    restants = list(range(1, n))
+    while restants:
+        distances = cdist(vecteurs[courant].reshape(1, -1), vecteurs[restants], metric="cosine")[0]
+        suivant_local = int(np.argmin(distances))
+        courant = restants.pop(suivant_local)
+        ordre.append(courant)
+    return ordre
+
+
+def trier_lignes(lignes: List[str], embedding) -> List[str]:
+    """Embedde les lignes puis les réordonne par proximité sémantique."""
+    if len(lignes) < 2:
+        return list(lignes)
+    vecteurs = np.array(embedding.embed_documents(lignes))
+    ordre = ordre_plus_proche_voisin(vecteurs)
+    return [lignes[i] for i in ordre]
+
+
+# =================================================================== #
+#  4. Regroupement des variantes (difflib au caractère)               #
+# =================================================================== #
+LIGNE = re.compile(
+    r"un element '(?P<avant>.*?)' a ete remplace par '(?P<apres>.*?)'"
+    r"(?:\s+dans le\(s\) DM\s*:\s*(?P<dm>.*))?$",
+    re.IGNORECASE,
+)
+
+
+def analyser_ligne(ligne: str) -> Optional[Tuple[str, str, List[str]]]:
+    m = LIGNE.search(ligne)
+    if not m:
+        return None
+    avant = m.group("avant") or ""
+    apres = m.group("apres") or ""
+    dms = [d.strip() for d in (m.group("dm") or "").split(",") if d.strip()]
+    return avant, apres, dms
+
+
+def diff_est_volatile(texte_a: str, texte_b: str) -> bool:
+    """
+    True si tout ce qui differe entre a et b est volatil OU un motif (rep. ...).
+    On efface d'abord les (rep. ...), puis on compare le reste au caractere.
+    """
+    a = MOTIF_REP.sub("", texte_a)
+    b = MOTIF_REP.sub("", texte_b)
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b).get_opcodes():
+        if tag == "equal":
+            continue
+        if any(c not in VOLATILES for c in a[i1:i2] + b[j1:j2]):
+            return False
+    return True
+
+
+def couples_equivalents(couple_a, couple_b) -> bool:
+    """Deux changements sont equivalents si leur avant ET leur apres le sont."""
+    return (diff_est_volatile(couple_a[0], couple_b[0])
+            and diff_est_volatile(couple_a[1], couple_b[1]))
+
+
+def regrouper_variantes(lignes: List[str]) -> List[dict]:
+    """
+    Regroupe les lignes dont (avant, apres) sont equivalents. Chaque nouvelle
+    ligne rejoint le premier groupe dont le representant lui est equivalent.
+    """
+    groupes: List[dict] = []
+    for ligne in lignes:
+        analyse = analyser_ligne(ligne)
+        if analyse is None:
+            continue
+        avant, apres, dms = analyse
+        couple = (avant, apres)
+
+        cible = None
+        for g in groupes:
+            if couples_equivalents(g["representant"], couple):
+                cible = g
+                break
+
+        if cible is None:
+            groupes.append({
+                "representant": couple,
+                "variantes": {couple},
+                "dms": set(dms),
+            })
+        else:
+            cible["variantes"].add(couple)
+            cible["dms"].update(dms)
+
+    return [
+        {
+            "variantes": sorted(g["variantes"]),
+            "nb_variantes": len(g["variantes"]),
+            "dms": sorted(g["dms"]),
+        }
+        for g in groupes
+    ]
+
+
+# =================================================================== #
+#  5. Rendu compact : prefixe{variations}suffixe                      #
+# =================================================================== #
+def suffixe_commun(chaines: List[str]) -> str:
+    inverses = [c[::-1] for c in chaines]
+    return commonprefix(inverses)[::-1]
+
+
+def factoriser(variantes: List[str]) -> str:
+    """Compacte ['... rep. 2))', '... rep. 3))'] en '... rep. {2, 3}))'."""
+    uniques = sorted(set(variantes))
+    if len(uniques) == 1:
+        return uniques[0]
+
+    prefixe = commonprefix(uniques)
+    restes = [c[len(prefixe):] for c in uniques]
+    suffixe = suffixe_commun(restes)
+    milieux = [r[: len(r) - len(suffixe)] if suffixe else r for r in restes]
+    milieux = [m for m in milieux if m]
+
+    variable = "{" + ", ".join(dict.fromkeys(milieux)) + "}"
+    return f"{prefixe}{variable}{suffixe}"
+
+
+def rendre_groupe(groupe: dict) -> str:
+    """Une ligne : avant factorisé -> apres factorisé, + DM."""
+    avants = [av for av, _ in groupe["variantes"]]
+    apres = [ap for _, ap in groupe["variantes"]]
+    ligne = f"- '{factoriser(avants)}' -> '{factoriser(apres)}'"
+    if groupe["dms"]:
+        ligne += f"  [DM : {', '.join(groupe['dms'])}]"
+    return ligne
+
+
+def rendre_pour_llm(groupes: List[dict]) -> str:
+    return "\n".join(rendre_groupe(g) for g in groupes)
+
+
+# =================================================================== #
+#  Pipeline complet                                                   #
+# =================================================================== #
+def traiter(feuille, embedding) -> Tuple[List[dict], str]:
+    """Chaîne complète. Renvoie (groupes, texte compact prêt pour le LLM)."""
+    print("1. Détection + condensation...")
+    lignes = generer_lignes_condensees(feuille)
+    print(f"   {len(lignes)} ligne(s) de changement")
+
+    print("2. Tri par embedding...")
+    lignes_triees = trier_lignes(lignes, embedding)
+
+    print("3. Regroupement des variantes...")
+    groupes = regrouper_variantes(lignes_triees)
+    print(f"   {len(groupes)} groupe(s) après regroupement")
+
+    print("4. Rendu compact...")
+    texte = rendre_pour_llm(groupes)
+
+    return groupes, texte
+
+
+# =================================================================== #
+#  Exemple d'utilisation                                              #
+# =================================================================== #
+# groupes, texte = traiter(feuille, embedding)
+# print(texte)
+
+
 import re
 import difflib
 from typing import List, Dict, Tuple, Optional
