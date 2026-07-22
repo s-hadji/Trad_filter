@@ -1,5 +1,137 @@
 
 
+from typing import List, Dict, Set
+from pydantic import BaseModel, Field
+from langchain_core.prompts import ChatPromptTemplate
+
+
+# =================================================================== #
+#  Ce que le LLM doit renvoyer                                        #
+# =================================================================== #
+class ModificationVue(BaseModel):
+    """Une modification reperee dans le diff d'un document."""
+    id_connu: int = Field(
+        description="Id d'une modification DEJA CONNUE si c'est la meme, sinon -1 pour une nouvelle."
+    )
+    description: str = Field(
+        description="Description englobante de la modification, dans le langage EXACT du texte, "
+                    "sans interpretation. Si id_connu != -1, recopier la description connue."
+    )
+
+
+class SortieLLM(BaseModel):
+    modifications: List[ModificationVue] = Field(
+        description="Liste exhaustive des modifications vues dans ce document."
+    )
+
+
+# =================================================================== #
+#  Le catalogue : modification -> DM concernes                        #
+# =================================================================== #
+class Modification(BaseModel):
+    id: int
+    description: str
+    dms: Set[str] = Field(default_factory=set)
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Vous etes un expert en analyse de modifications documentaires.\n\n"
+     "On vous donne un document ou seules les modifications sont balisees :\n"
+     "  [MODIFIE | avant: X | apres: Y]   X est devenu Y\n"
+     "  [SUPPRIME | avant: X]             X a ete retire\n"
+     "  [AJOUTE | apres: Y]               Y a ete ajoute\n"
+     "Le texte non balise est le contexte inchange, et [...] signale un passage omis.\n\n"
+     "Listez TOUTES les modifications, de maniere exhaustive. Chaque description doit etre "
+     "ENGLOBANTE : si plusieurs balises relevent de la meme nature (traduction, ajout de repere, "
+     "changement de reference), regroupez-les en une seule description qui les couvre toutes.\n\n"
+     "MODIFICATIONS DEJA CONNUES :\n{connues}\n\n"
+     "Si une modification que vous voyez correspond a une modification deja connue, mettez son id "
+     "dans 'id_connu' et RECOPIEZ sa description a l'identique. Sinon, 'id_connu' = -1.\n\n"
+     "Citez toujours le texte exact. Aucun emoji. Style factuel."),
+    ("user", "Document balise :\n{diff}\n\nListez les modifications.")
+])
+
+
+def _formater_connues(catalogue: Dict[int, Modification]) -> str:
+    if not catalogue:
+        return "  (aucune pour l'instant)"
+    return "\n".join(f"  [{m.id}] {m.description}" for m in catalogue.values())
+
+
+# =================================================================== #
+#  Traitement : une passe sur toutes les feuilles                     #
+# =================================================================== #
+def analyser_feuilles(feuille, llm, has_changes, diff_unifie):
+    """
+    Pour chaque feuille modifiee : calcule le diff, demande au LLM la liste des
+    modifications, et met a jour les deux tables.
+    Renvoie (catalogue, par_dm) :
+      - catalogue : {id: Modification}          -> modification -> liste de DM
+      - par_dm    : {dm_code: [ids de modifs]}  -> DM -> ses modifications
+    """
+    chaine = PROMPT | llm.with_structured_output(SortieLLM)
+
+    catalogue: Dict[int, Modification] = {}
+    par_dm: Dict[str, List[int]] = {}
+    prochain_id = 1
+
+    # On ne garde que les feuilles reellement modifiees
+    a_traiter = [f for f in feuille
+                 if has_changes(f.doc_v1["content"], f.doc_v2["content"])]
+    total = len(a_traiter)
+
+    for numero, f in enumerate(a_traiter, 1):
+        dm = f.dm_code
+        print(f"[{numero}/{total}] DM {dm} — catalogue : {len(catalogue)} modif(s)")
+
+        diff = diff_unifie(f.doc_v1["content"], f.doc_v2["content"])
+        sortie = chaine.invoke({"diff": diff, "connues": _formater_connues(catalogue)})
+
+        ids_du_dm = []
+        for vue in sortie.modifications:
+            # Modification deja connue ? (on verifie que l'id existe vraiment)
+            modif = catalogue.get(vue.id_connu) if vue.id_connu != -1 else None
+
+            if modif is None:
+                modif = Modification(id=prochain_id, description=vue.description)
+                catalogue[prochain_id] = modif
+                prochain_id += 1
+
+            # C'est NOUS qui rattachons le DM : aucune hallucination possible
+            modif.dms.add(dm)
+            ids_du_dm.append(modif.id)
+
+        par_dm[dm] = ids_du_dm
+
+    print(f"\nTermine : {len(catalogue)} modification(s) distincte(s) sur {total} DM")
+    return catalogue, par_dm
+
+
+# =================================================================== #
+#  Affichage des deux tables                                          #
+# =================================================================== #
+def afficher(catalogue: Dict[int, Modification], par_dm: Dict[str, List[int]]) -> None:
+    print("\n=== MODIFICATIONS -> DM ===\n")
+    for m in catalogue.values():
+        print(f"[{m.id}] {m.description}")
+        print(f"     {len(m.dms)} DM : {', '.join(sorted(m.dms))}\n")
+
+    print("\n=== DM -> MODIFICATIONS ===\n")
+    for dm, ids in par_dm.items():
+        print(f"{dm} : modifications {ids}")
+
+
+# =================================================================== #
+#  Utilisation                                                        #
+# =================================================================== #
+# catalogue, par_dm = analyser_feuilles(feuille, llm, has_changes, diff_unifie)
+# afficher(catalogue, par_dm)
+
+
 def construire_trie(entrees, parent):
     # --- 1. Appariement global par dm_code, indépendant du chemin ---
     paires = defaultdict(lambda: {"v1": [], "v2": [], "tokens": None})
