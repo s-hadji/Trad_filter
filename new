@@ -9,6 +9,170 @@ from langchain_core.prompts import ChatPromptTemplate
 #  Ce que le LLM doit renvoyer                                        #
 # =================================================================== #
 class ModificationVue(BaseModel):
+    """Un pattern de modification repere dans le diff d'un document."""
+    id_connu: int = Field(
+        description="Id d'un pattern DEJA CONNU si c'est le meme, sinon -1 pour un nouveau."
+    )
+    description: str = Field(
+        description="Pattern de modification, GENERIQUE et court. Decrire la NATURE du changement, "
+                    "pas les elements precis sur lesquels il porte. "
+                    "Si id_connu != -1, recopier la description connue a l'identique."
+    )
+
+
+class SortieLLM(BaseModel):
+    modifications: List[ModificationVue] = Field(
+        description="Les patterns de modification presents dans ce document. Peu nombreux."
+    )
+
+
+# =================================================================== #
+#  Le catalogue : pattern -> DM concernes                             #
+# =================================================================== #
+class Modification(BaseModel):
+    id: int
+    description: str
+    dms: Set[str] = Field(default_factory=set)
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Vous etes un expert en analyse de modifications documentaires.\n\n"
+     "On vous donne un document ou seules les modifications sont balisees :\n"
+     "  [MODIFIE | avant: X | apres: Y]   X est devenu Y\n"
+     "  [SUPPRIME | avant: X]             X a ete retire\n"
+     "  [AJOUTE | apres: Y]               Y a ete ajoute\n"
+     "Le texte non balise est le contexte inchange, [...] signale un passage omis.\n\n"
+     "Votre role : identifier les PATTERNS de modification, pas les modifications individuelles.\n\n"
+     "REGLE FONDAMENTALE : decrivez la NATURE du changement, JAMAIS les elements precis sur "
+     "lesquels il porte.\n"
+     "  BON  : 'Traduction des libelles du francais vers l'anglais'\n"
+     "  BON  : 'Ajout de reperes (rep. N) apres les designations'\n"
+     "  BON  : 'Remplacement de references alphanumeriques'\n"
+     "  MAUVAIS : 'Gouvernes horizontales (pose) devient Horizontal Control Surfaces (rep. 2)'\n"
+     "  MAUVAIS : 'Le calculateur detail connecteur a ete traduit'\n\n"
+     "Un document contient en general 1 a 4 patterns seulement. Regroupez agressivement : toutes "
+     "les balises de meme nature relevent d'UN SEUL pattern, quel que soit leur nombre.\n\n"
+     "PATTERNS DEJA CONNUS :\n{connues}\n\n"
+     "Si un pattern que vous voyez existe deja, mettez son id dans 'id_connu' et RECOPIEZ sa "
+     "description a l'identique. Ne creez un nouveau pattern (-1) que si aucun ne correspond.\n\n"
+     "Aucun emoji. Style factuel et concis."),
+    ("user", "Document balise :\n{diff}\n\nIdentifiez les patterns de modification.")
+])
+
+
+def _formater_connues(catalogue: Dict[int, Modification]) -> str:
+    if not catalogue:
+        return "  (aucun pour l'instant)"
+    return "\n".join(f"  [{m.id}] {m.description}" for m in catalogue.values())
+
+
+def _afficher_catalogue(catalogue: Dict[int, Modification]) -> None:
+    """Etat courant du catalogue, affiche apres chaque DM."""
+    print(f"    --- Catalogue ({len(catalogue)}) ---")
+    for m in catalogue.values():
+        print(f"    [{m.id}] {m.description}  ({len(m.dms)} DM)")
+    print()
+
+
+# =================================================================== #
+#  Traitement : une passe sur toutes les feuilles                     #
+# =================================================================== #
+def analyser_feuilles(feuille, llm, has_changes, diff_unifie, nombre_essais: int = 3):
+    """
+    Pour chaque feuille modifiee : calcule le diff, demande au LLM les patterns,
+    et met a jour les deux tables.
+    Renvoie (catalogue, par_dm) :
+      - catalogue : {id: Modification}          -> pattern -> liste de DM
+      - par_dm    : {dm_code: [ids de patterns]} -> DM -> ses patterns
+    """
+    chaine = PROMPT | llm.with_structured_output(SortieLLM)
+
+    catalogue: Dict[int, Modification] = {}
+    par_dm: Dict[str, List[int]] = {}
+    prochain_id = 1
+
+    a_traiter = [f for f in feuille
+                 if has_changes(f.doc_v1["content"], f.doc_v2["content"])]
+    total = len(a_traiter)
+
+    for numero, f in enumerate(a_traiter, 1):
+        dm = f.dm_code
+        print(f"[{numero}/{total}] DM {dm}")
+
+        diff = diff_unifie(f.doc_v1["content"], f.doc_v2["content"])
+        sortie = _appeler_llm(chaine, diff, catalogue, nombre_essais)
+
+        if sortie is None:                 # echec definitif : on passe au suivant
+            par_dm[dm] = []
+            continue
+
+        ids_du_dm = []
+        for vue in sortie.modifications:
+            # Pattern deja connu ? (on verifie que l'id existe vraiment)
+            modif = catalogue.get(vue.id_connu) if vue.id_connu != -1 else None
+
+            if modif is None:
+                modif = Modification(id=prochain_id, description=vue.description)
+                catalogue[prochain_id] = modif
+                prochain_id += 1
+
+            # C'est NOUS qui rattachons le DM : aucune hallucination possible
+            modif.dms.add(dm)
+            ids_du_dm.append(modif.id)
+
+        par_dm[dm] = ids_du_dm
+        _afficher_catalogue(catalogue)
+
+    print(f"Termine : {len(catalogue)} pattern(s) distinct(s) sur {total} DM")
+    return catalogue, par_dm
+
+
+def _appeler_llm(chaine, diff, catalogue, nombre_essais):
+    """Appelle le LLM avec quelques tentatives. Renvoie None si echec definitif."""
+    for essai in range(1, nombre_essais + 1):
+        try:
+            return chaine.invoke({"diff": diff, "connues": _formater_connues(catalogue)})
+        except Exception as erreur:
+            print(f"    ! Essai {essai}/{nombre_essais} echoue "
+                  f"({type(erreur).__name__}: {erreur})")
+    print("    ! Echec definitif, DM ignore")
+    return None
+
+
+# =================================================================== #
+#  Affichage final des deux tables                                    #
+# =================================================================== #
+def afficher(catalogue: Dict[int, Modification], par_dm: Dict[str, List[int]]) -> None:
+    print("\n=== PATTERNS -> DM ===\n")
+    for m in catalogue.values():
+        print(f"[{m.id}] {m.description}")
+        print(f"     {len(m.dms)} DM : {', '.join(sorted(m.dms))}\n")
+
+    print("\n=== DM -> PATTERNS ===\n")
+    for dm, ids in par_dm.items():
+        print(f"{dm} : {ids}")
+
+
+# =================================================================== #
+#  Utilisation                                                        #
+# =================================================================== #
+# catalogue, par_dm = analyser_feuilles(feuille, llm, has_changes, diff_unifie)
+# afficher(catalogue, par_dm)
+
+
+from typing import List, Dict, Set
+from pydantic import BaseModel, Field
+from langchain_core.prompts import ChatPromptTemplate
+
+
+# =================================================================== #
+#  Ce que le LLM doit renvoyer                                        #
+# =================================================================== #
+class ModificationVue(BaseModel):
     """Une modification reperee dans le diff d'un document."""
     id_connu: int = Field(
         description="Id d'une modification DEJA CONNUE si c'est la meme, sinon -1 pour une nouvelle."
