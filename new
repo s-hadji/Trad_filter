@@ -1,4 +1,192 @@
 
+
+from typing import List, Dict, Set
+import numpy as np
+from scipy.spatial.distance import cdist
+from pydantic import BaseModel, Field
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+
+
+# =================================================================== #
+#  Un pattern dans la liste (unité de travail de la passe 2)          #
+# =================================================================== #
+class Pattern(BaseModel):
+    id: int                                            # id stable
+    description: str                                   # texte courant
+    sources: Set[int] = Field(default_factory=set)     # ids passe-1 absorbes
+    ensembles: Set[int] = Field(default_factory=set)   # ensembles de DM (union)
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+# =================================================================== #
+#  Sortie structurée du LLM                                           #
+# =================================================================== #
+class DecisionMerge(BaseModel):
+    """Pour UN pattern du lot : fusionne-t-il avec un pattern deja present ?"""
+    pattern_id: int = Field(description="Id du pattern du lot que l'on evalue.")
+    merge_avec: int = Field(
+        description="Id du pattern DEJA PRESENT avec lequel fusionner. -1 si aucun merge."
+    )
+    description_fusionnee: str = Field(
+        description="Si merge : texte fusionne EXHAUSTIF (on doit retrouver l'info des deux), "
+                    "dans le langage EXACT du texte, sans interpretation. Sinon : repeter la "
+                    "description du pattern inchangee."
+    )
+
+
+class SortieLot(BaseModel):
+    decisions: List[DecisionMerge] = Field(
+        description="Une decision par pattern du lot, dans l'ordre."
+    )
+
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Vous etes un expert en gestion de configuration documentaire. On construit une liste condensee "
+     "de patterns de modifications. On vous donne les patterns DEJA PRESENTS dans la liste, puis un "
+     "nouveau lot de patterns a integrer.\n\n"
+     "Pour CHAQUE pattern du lot, decidez :\n"
+     "- s'il decrit la MEME chose qu'un pattern deja present : indiquez son id dans 'merge_avec' et "
+     "fournissez une 'description_fusionnee' EXHAUSTIVE, qui reunit sans perte l'information des deux ;\n"
+     "- sinon : 'merge_avec' = -1 et 'description_fusionnee' = la description du pattern, inchangee.\n\n"
+     "REGLES ABSOLUES :\n"
+     "1. Citez TOUJOURS le texte exact. Parlez UNIQUEMENT avec le langage du texte, sans interpreter.\n"
+     "2. Ne fusionnez que ce qui decrit reellement la meme nature de modification.\n"
+     "3. N'utilisez dans 'merge_avec' que des ids reellement presents dans la liste ci-dessous.\n\n"
+     "PATTERNS DEJA PRESENTS :\n{presents}\n\n"
+     "Aucun emoji. Style factuel."),
+    ("user",
+     "Nouveau lot a integrer :\n{lot}\n\n"
+     "Donnez une decision par pattern du lot.")
+])
+
+
+def _formater(patterns: List[Pattern]) -> str:
+    if not patterns:
+        return "  (aucun pour l'instant)"
+    return "\n".join(f"  [pattern {p.id}] {p.description}" for p in patterns)
+
+
+# =================================================================== #
+#  Tri par plus proche voisin (embedding)                             #
+# =================================================================== #
+def _ordre_plus_proche_voisin(vecteurs: np.ndarray) -> List[int]:
+    """Chemin glouton : part du 1er, enchaine toujours vers le plus proche non visite."""
+    n = len(vecteurs)
+    courant, ordre, restants = 0, [0], list(range(1, n))
+    while restants:
+        distances = cdist(vecteurs[courant].reshape(1, -1), vecteurs[restants], metric="cosine")[0]
+        courant = restants.pop(int(np.argmin(distances)))
+        ordre.append(courant)
+    return ordre
+
+
+def trier_patterns(patterns: List[Pattern], embedding) -> List[Pattern]:
+    """
+    Embedde les descriptions et reordonne les patterns par proximite semantique.
+    Les patterns similaires se retrouvent ainsi dans le MEME lot, ce qui augmente
+    fortement les chances de merge.
+    """
+    if len(patterns) < 2:
+        return list(patterns)
+    vecteurs = np.array(embedding.embed_documents([p.description for p in patterns]))
+    return [patterns[i] for i in _ordre_plus_proche_voisin(vecteurs)]
+
+
+# =================================================================== #
+#  Passe 2 : tri, puis intégration lot par lot dans UNE liste         #
+# =================================================================== #
+def consolider(patterns_passe1: Dict[int, dict], embedding, taille_lot: int = 10) -> List[Pattern]:
+    """
+    Part des patterns de la passe 1, les TRIE par proximite semantique, puis les
+    integre par lots dans une liste unique. Pour chaque pattern d'un lot, le LLM
+    dit s'il fusionne avec un pattern deja present ; si oui, le code fusionne
+    EN PLACE (meme position que l'existant) et unit les DM.
+    """
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.1, max_tokens=4000)
+    chaine = PROMPT | llm.with_structured_output(SortieLot)
+
+    # Patterns de depart (un par pattern passe-1)
+    entrants = [
+        Pattern(id=pid, description=p["description"],
+                sources={pid}, ensembles=set(p["ensembles"]))
+        for pid, p in patterns_passe1.items()
+    ]
+
+    # --- TRI par embedding avant l'envoi au LLM ---
+    print(f"[Consolidation] Tri de {len(entrants)} pattern(s) par embedding...")
+    entrants = trier_patterns(entrants, embedding)
+
+    liste: List[Pattern] = []          # la liste condensee qui se construit
+    nb_lots = (len(entrants) + taille_lot - 1) // taille_lot
+
+    for numero, debut in enumerate(range(0, len(entrants), taille_lot), 1):
+        lot = entrants[debut: debut + taille_lot]
+        print(f"[Consolidation] Lot {numero}/{nb_lots} ({len(lot)} patterns) "
+              f"— liste : {len(liste)}")
+
+        sortie = chaine.invoke({"presents": _formater(liste), "lot": _formater(lot)})
+        integrer_lot(sortie, lot, liste)
+
+    print(f"[Consolidation] Liste finale : {len(liste)} pattern(s)")
+    return liste
+
+
+def integrer_lot(sortie: SortieLot, lot: List[Pattern], liste: List[Pattern]) -> None:
+    """
+    Applique les decisions du LLM sur la liste, cote Python.
+    - merge : on reecrit le pattern present a SA position, on unit sources+DM.
+    - pas de merge : on ajoute le nouveau pattern a la fin de la liste.
+    La fusion des DM ne depend jamais du LLM.
+    """
+    decisions = {d.pattern_id: d for d in sortie.decisions}
+
+    for pattern in lot:
+        decision = decisions.get(pattern.id)
+
+        # Cible de merge valide et reellement presente dans la liste ?
+        cible = None
+        if decision and decision.merge_avec != -1:
+            cible = next((p for p in liste if p.id == decision.merge_avec), None)
+
+        if cible is not None:
+            # Fusion EN PLACE : la cible garde sa position dans la liste
+            cible.description = decision.description_fusionnee
+            cible.sources |= pattern.sources
+            cible.ensembles |= pattern.ensembles      # union des DM, cote code
+        else:
+            # Pas de merge : le pattern rejoint la liste tel quel
+            if decision:
+                pattern.description = decision.description_fusionnee
+            liste.append(pattern)
+
+
+# =================================================================== #
+#  Affichage final avec DM reconstruits                               #
+# =================================================================== #
+def afficher(liste: List[Pattern], rapport) -> None:
+    table = rapport.table_ensembles()
+    print(f"\n{len(liste)} pattern(s) final(aux)\n")
+    for p in liste:
+        dms = sorted({dm for eid in p.ensembles for dm in table.get(eid, [])})
+        print(f"Pattern {p.id} : {p.description}")
+        print(f"   sources passe-1 : {sorted(p.sources)}")
+        print(f"   ensembles DM    : {sorted(p.ensembles)}")
+        print(f"   DM ({len(dms)}) : {', '.join(dms)}\n")
+
+
+# =================================================================== #
+#  Exemple d'utilisation                                              #
+# =================================================================== #
+# rapport   = preparer_modifications(feuille, embedding)
+# patterns1 = analyser_par_lots(rapport, taille_lot=10)              # passe 1
+# liste     = consolider(patterns1, embedding, taille_lot=10)        # passe 2
+# afficher(liste, rapport)
+
+
 from typing import List, Dict, Set
 from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
