@@ -1,5 +1,78 @@
 
 
+def construire_trie(entrees, parent):
+    # --- 1. Appariement global par dm_code, indépendant du chemin ---
+    paires = defaultdict(lambda: {"v1": [], "v2": [], "tokens": None})
+    for tokens, code, doc, version in entrees:
+        p = paires[code]
+        p[version].append(doc)
+        if p["tokens"] is None:
+            p["tokens"] = tokens        # chemin de référence = premier vu
+
+    # --- 2. Fusion : UNE entrée par dm_code, contenus concaténés ---
+    appariees = []
+    for code, p in paires.items():
+        appariees.append((
+            p["tokens"], code,
+            _fusionner_docs(p["v1"]),
+            _fusionner_docs(p["v2"]),
+        ))
+
+    _construire(appariees, parent)
+
+
+def _fusionner_docs(docs):
+    """
+    Fusionne plusieurs documents d'un meme dm_code en un seul, contenus
+    joints par '\n'. Renvoie None si aucun document.
+    """
+    docs = [d for d in docs if d is not None]
+    if not docs:
+        return None
+    if len(docs) == 1:
+        return docs[0]
+
+    # Documents sous forme de dict {'content': ...} : on fusionne les contenus
+    if isinstance(docs[0], dict):
+        fusion = dict(docs[0])                     # on garde les autres champs du 1er
+        fusion["content"] = "\n".join(
+            str(d.get("content", "") or "") for d in docs
+        )
+        return fusion
+
+    # Sinon, ce sont des chaines
+    return "\n".join(str(d) for d in docs)
+
+
+def _construire(entrees, parent):
+    # Feuilles : une seule par dm_code
+    for tokens, code, d1, d2 in entrees:
+        if tokens:
+            continue
+        feuille = Node(code, parent=parent)
+        feuille.dm_code = code
+        feuille.feuille = True
+        feuille.statut = "FEUILLE"
+        feuille.doc_v1 = d1
+        feuille.doc_v2 = d2
+
+    # Branches
+    groupes = defaultdict(list)
+    for e in entrees:
+        if e[0]:
+            groupes[e[0][0].lower()].append(e)
+
+    for _, groupe in sorted(groupes.items()):
+        chemins = [e[0] for e in groupe]
+        n = 0
+        for i in range(min(len(c) for c in chemins)):
+            if len({c[i].lower() for c in chemins}) > 1:
+                break
+            n = i + 1
+        branche = Node(".".join(chemins[0][:n]), parent=parent)
+        _construire([(t[n:], c, d1, d2) for t, c, d1, d2 in groupe], branche)
+
+
 from typing import List, Dict, Set
 import numpy as np
 from scipy.spatial.distance import cdist
