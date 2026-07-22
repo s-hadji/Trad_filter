@@ -1,5 +1,196 @@
 
 
+
+
+from typing import List, Dict, Set, Iterator, Tuple
+from pydantic import BaseModel, Field
+from langchain_core.prompts import ChatPromptTemplate
+
+
+# =================================================================== #
+#  Ce que le LLM doit renvoyer                                        #
+# =================================================================== #
+class ModificationDecrite(BaseModel):
+    """Une modification (pattern ou cas isole) observee dans le document."""
+    id_connu: int = Field(
+        description="Id d'une modification DEJA CONNUE si c'est la meme, sinon -1 pour une nouvelle."
+    )
+    description: str = Field(
+        description="Description de la modification. Si c'est un PATTERN (plusieurs changements de "
+                    "meme nature), decrire le pattern de maniere generique. Si c'est un cas ISOLE, "
+                    "le decrire precisement en citant le texte. "
+                    "Si id_connu != -1, RECOPIER la description connue a l'identique."
+    )
+    est_pattern: bool = Field(
+        description="True si c'est un pattern regroupant plusieurs changements, False si c'est isole."
+    )
+
+
+class SortieDM(BaseModel):
+    modifications: List[ModificationDecrite] = Field(
+        description="TOUTES les modifications du document : patterns ET cas isoles. Exhaustif."
+    )
+
+
+# =================================================================== #
+#  Catalogue : modification unique -> DM concernes                    #
+# =================================================================== #
+class ModificationUnique(BaseModel):
+    id: int
+    description: str
+    est_pattern: bool
+    dms: Set[str] = Field(default_factory=set)
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    @property
+    def nb_dm(self) -> int:
+        return len(self.dms)
+
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Vous etes un expert en analyse de modifications documentaires.\n\n"
+     "On vous donne la liste des modifications relevees dans UN document. Votre role est de les "
+     "decrire de maniere structuree, en distinguant deux cas :\n"
+     "  - PATTERN : plusieurs modifications relevent de la meme nature (traduction, ajout de "
+     "reperes, changement de references...). Decrivez le pattern UNE fois, de maniere generique, "
+     "sans vous attarder sur les elements precis concernes.\n"
+     "  - ISOLE : une modification qui ne rentre dans aucun pattern. Decrivez-la precisement en "
+     "citant le texte exact.\n\n"
+     "REGLES ABSOLUES :\n"
+     "1. EXHAUSTIVITE : chaque modification de la liste doit etre couverte, soit par un pattern, "
+     "soit comme cas isole. N'en oubliez aucune.\n"
+     "2. Un document peut contenir A LA FOIS des patterns et des modifications isolees.\n"
+     "3. MODIFICATIONS DEJA CONNUES : si une modification (pattern ou isolee) correspond a une "
+     "entree deja connue ci-dessous, mettez son id dans 'id_connu' et RECOPIEZ sa description a "
+     "l'identique. Ne creez une nouvelle entree (-1) que si aucune ne correspond.\n"
+     "4. Citez toujours le texte exact. Ne mentionnez JAMAIS de code DM.\n\n"
+     "MODIFICATIONS DEJA CONNUES :\n{connues}\n\n"
+     "Aucun emoji. Style factuel et concis."),
+    ("user",
+     "Modifications relevees dans ce document :\n{modifications}\n\n"
+     "Decrivez-les toutes : patterns et cas isoles.")
+])
+
+
+def _formater_connues(catalogue: Dict[int, ModificationUnique]) -> str:
+    if not catalogue:
+        return "  (aucune pour l'instant)"
+    return "\n".join(
+        f"  [{m.id}] {'PATTERN' if m.est_pattern else 'ISOLE'} : {m.description}"
+        for m in catalogue.values()
+    )
+
+
+def _appeler_llm(chaine, modifications, catalogue, nombre_essais):
+    """Appelle le LLM avec quelques tentatives. Renvoie None si echec definitif."""
+    entree = {
+        "modifications": "\n".join(f"  - {m}" for m in modifications),
+        "connues": _formater_connues(catalogue),
+    }
+    for essai in range(1, nombre_essais + 1):
+        try:
+            return chaine.invoke(entree)
+        except Exception as erreur:
+            print(f"    ! Essai {essai}/{nombre_essais} echoue "
+                  f"({type(erreur).__name__}: {erreur})")
+    print("    ! Echec definitif, DM ignore")
+    return None
+
+
+# =================================================================== #
+#  GENERATEUR : passe 2, DM par DM, catalogue cumulatif               #
+# =================================================================== #
+def decrire_modifications(details: Dict[str, "DetailDM"], llm,
+                          catalogue: Dict[int, ModificationUnique] = None,
+                          nombre_essais: int = 3
+                          ) -> Iterator[Tuple[str, List[int]]]:
+    """
+    Passe 2 : pour chaque DM, decrit ses modifications (patterns + isolees) en
+    reutilisant le catalogue cumulatif.
+
+    'catalogue' est fourni par l'appelant et rempli au fur et a mesure : meme en
+    cas d'interruption, il conserve tout ce qui a ete traite.
+
+    yield (dm_code, [ids des modifications de ce DM]).
+    """
+    if catalogue is None:
+        catalogue = {}
+
+    chaine = PROMPT | llm.with_structured_output(SortieDM)
+    prochain_id = max(catalogue.keys(), default=0) + 1
+    total = len(details)
+
+    for numero, (code, detail) in enumerate(details.items(), 1):
+        print(f"[{numero}/{total}] DM {code} — catalogue : {len(catalogue)}")
+
+        if not detail.modifications:
+            yield code, []
+            continue
+
+        sortie = _appeler_llm(chaine, detail.modifications, catalogue, nombre_essais)
+        if sortie is None:
+            yield code, []
+            continue
+
+        ids_du_dm = []
+        for vue in sortie.modifications:
+            # Modification deja connue ? (on verifie que l'id existe vraiment)
+            modif = catalogue.get(vue.id_connu) if vue.id_connu != -1 else None
+
+            if modif is None:
+                modif = ModificationUnique(id=prochain_id, description=vue.description,
+                                           est_pattern=vue.est_pattern)
+                catalogue[prochain_id] = modif
+                prochain_id += 1
+
+            # C'est NOUS qui rattachons le DM : aucune hallucination possible
+            modif.dms.add(code)
+            ids_du_dm.append(modif.id)
+
+        print(f"    {len(ids_du_dm)} modification(s) rattachee(s)")
+        yield code, ids_du_dm
+
+
+# =================================================================== #
+#  Affichage final : modifications uniques et DM concernes            #
+# =================================================================== #
+def afficher_catalogue(catalogue: Dict[int, ModificationUnique]) -> None:
+    """Liste toutes les modifications uniques, triees par nombre de DM concernes."""
+    patterns = [m for m in catalogue.values() if m.est_pattern]
+    isolees = [m for m in catalogue.values() if not m.est_pattern]
+
+    print(f"\n{len(catalogue)} modification(s) unique(s) : "
+          f"{len(patterns)} pattern(s), {len(isolees)} isolee(s)\n")
+
+    for titre, groupe in (("PATTERNS", patterns), ("MODIFICATIONS ISOLEES", isolees)):
+        if not groupe:
+            continue
+        print(f"=== {titre} ===\n")
+        for m in sorted(groupe, key=lambda x: x.nb_dm, reverse=True):
+            print(f"[{m.id}] {m.description}")
+            print(f"     {m.nb_dm} DM : {', '.join(sorted(m.dms))}\n")
+
+
+# =================================================================== #
+#  Utilisation                                                        #
+# =================================================================== #
+# # Passe 1
+# details = {}
+# for code, detail in detailler_feuilles(feuille, llm, has_changes, diff_unifie):
+#     details[code] = detail
+#
+# # Passe 2 (le catalogue est a nous : conserve meme si on interrompt)
+# catalogue = {}
+# par_dm = {}
+# for code, ids in decrire_modifications(details, llm, catalogue=catalogue):
+#     par_dm[code] = ids
+#
+# afficher_catalogue(catalogue)
+
+
 from typing import List, Dict, Set, Iterator, Tuple
 from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
