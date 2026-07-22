@@ -8,6 +8,160 @@ from langchain_core.prompts import ChatPromptTemplate
 # =================================================================== #
 #  Ce que le LLM doit renvoyer                                        #
 # =================================================================== #
+class ModificationsDUnDM(BaseModel):
+    """Les modifications precises trouvees dans UN document du lot."""
+    position: int = Field(
+        description="Numero du document dans le lot (1, 2 ou 3), tel qu'affiche."
+    )
+    modifications: List[str] = Field(
+        description="TOUTES les modifications de ce document. Phrases COURTES et PRECISES. "
+                    "Une entree par modification distincte, sans doublon dans ce document."
+    )
+
+
+class SortieLot(BaseModel):
+    documents: List[ModificationsDUnDM] = Field(
+        description="Une entree par document du lot, dans l'ordre."
+    )
+
+
+# =================================================================== #
+#  Resultat : dm_code -> liste de modifications                       #
+# =================================================================== #
+class DetailDM(BaseModel):
+    dm_code: str
+    modifications: List[str] = Field(default_factory=list)
+
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Vous etes un expert en analyse de modifications documentaires.\n\n"
+     "On vous donne plusieurs documents ou seules les modifications sont balisees :\n"
+     "  [MODIFIE | avant: X | apres: Y]   X est devenu Y\n"
+     "  [SUPPRIME | avant: X]             X a ete retire\n"
+     "  [AJOUTE | apres: Y]               Y a ete ajoute\n"
+     "Le texte non balise est le contexte inchange, [...] signale un passage omis.\n\n"
+     "Pour CHAQUE document, listez TOUTES ses modifications en phrases COURTES et PRECISES.\n"
+     "Chaque phrase decrit un changement concret, en citant le texte exact.\n"
+     "  Exemple : \"'Gouvernes horizontales (pose)' devient 'Horizontal Control Surfaces "
+     "(installation)'\"\n\n"
+     "REGLES ABSOLUES :\n"
+     "1. Traitez chaque document SEPAREMENT et de maniere EXHAUSTIVE. Identifiez-le par sa "
+     "'position' (1, 2 ou 3). Chaque document recoit sa propre liste complete.\n"
+     "2. Pas de doublon A L'INTERIEUR d'un document : si une meme modification revient plusieurs "
+     "fois dans le meme document, ne la listez qu'UNE fois.\n"
+     "3. FORMULATIONS DEJA UTILISEES : la liste ci-dessous recense des formulations deja employees. "
+     "Si un document presente la meme modification, REUTILISEZ la formulation a l'identique. "
+     "Cela n'exclut PAS de la lister : chaque document doit avoir sa liste complete, meme si la "
+     "modification apparait deja ailleurs.\n"
+     "4. Ne mentionnez JAMAIS de code DM : vous ne les connaissez pas.\n\n"
+     "FORMULATIONS DEJA UTILISEES :\n{deja_vues}\n\n"
+     "Aucun emoji. Style factuel et concis."),
+    ("user", "{lot}\n\nListez toutes les modifications de chaque document.")
+])
+
+
+def _formater_lot(diffs: List[str]) -> str:
+    """Presente les documents numerotes, sans jamais exposer les codes DM."""
+    return "\n\n".join(
+        f"--- Document {position} ---\n{diff}"
+        for position, diff in enumerate(diffs, 1)
+    )
+
+
+def _formater_deja_vues(vues: Set[str]) -> str:
+    if not vues:
+        return "  (aucune pour l'instant)"
+    return "\n".join(f"  - {m}" for m in sorted(vues))
+
+
+# =================================================================== #
+#  Traitement par lots de 3 documents                                 #
+# =================================================================== #
+def detailler_feuilles(feuille, llm, has_changes, diff_unifie,
+                       taille_lot: int = 3, nombre_essais: int = 3) -> Dict[str, DetailDM]:
+    """
+    Traite les feuilles modifiees par lots de 3. Le LLM ne voit que les diffs
+    numerotes ; c'est NOUS qui rattachons les codes DM via la position.
+    Chaque DM conserve sa liste complete de modifications.
+    Renvoie {dm_code: DetailDM}.
+    """
+    chaine = PROMPT | llm.with_structured_output(SortieLot)
+
+    a_traiter = [f for f in feuille
+                 if has_changes(f.doc_v1["content"], f.doc_v2["content"])]
+    total = len(a_traiter)
+    nb_lots = (total + taille_lot - 1) // taille_lot
+
+    resultats: Dict[str, DetailDM] = {}
+    formulations: Set[str] = set()       # memoire des tournures, pour rester coherent
+
+    for numero, debut in enumerate(range(0, total, taille_lot), 1):
+        lot = a_traiter[debut: debut + taille_lot]
+        codes = [f.dm_code for f in lot]          # garde cote Python
+        diffs = [diff_unifie(f.doc_v1["content"], f.doc_v2["content"]) for f in lot]
+
+        print(f"[Lot {numero}/{nb_lots}] {', '.join(codes)}")
+
+        sortie = _appeler_llm(chaine, diffs, formulations, nombre_essais)
+        if sortie is None:
+            for code in codes:
+                resultats[code] = DetailDM(dm_code=code, modifications=[])
+            continue
+
+        # Rattachement par POSITION : le LLM n'a jamais vu les codes DM
+        par_position = {d.position: d.modifications for d in sortie.documents}
+        for position, code in enumerate(codes, 1):
+            modifs = par_position.get(position, [])
+            # Dedup interne au document uniquement, en preservant l'ordre
+            uniques = [m for m in dict.fromkeys(modifs) if m.strip()]
+            resultats[code] = DetailDM(dm_code=code, modifications=uniques)
+            formulations.update(uniques)          # memoire de style, pas d'exclusion
+            print(f"    {code} : {len(uniques)} modification(s)")
+
+    print(f"\nTermine : {len(resultats)} DM, "
+          f"{sum(len(d.modifications) for d in resultats.values())} modification(s) au total")
+    return resultats
+
+
+def _appeler_llm(chaine, diffs, formulations, nombre_essais):
+    """Appelle le LLM avec quelques tentatives. Renvoie None si echec definitif."""
+    entree = {"lot": _formater_lot(diffs), "deja_vues": _formater_deja_vues(formulations)}
+    for essai in range(1, nombre_essais + 1):
+        try:
+            return chaine.invoke(entree)
+        except Exception as erreur:
+            print(f"    ! Essai {essai}/{nombre_essais} echoue "
+                  f"({type(erreur).__name__}: {erreur})")
+    print("    ! Echec definitif, lot ignore")
+    return None
+
+
+# =================================================================== #
+#  Affichage                                                          #
+# =================================================================== #
+def afficher_details(resultats: Dict[str, DetailDM]) -> None:
+    for detail in resultats.values():
+        print(f"\n=== {detail.dm_code} ({len(detail.modifications)}) ===")
+        for i, modif in enumerate(detail.modifications, 1):
+            print(f"  {i}. {modif}")
+
+
+# =================================================================== #
+#  Utilisation                                                        #
+# =================================================================== #
+# details = detailler_feuilles(feuille, llm, has_changes, diff_unifie)
+# afficher_details(details)
+
+
+from typing import List, Dict, Set
+from pydantic import BaseModel, Field
+from langchain_core.prompts import ChatPromptTemplate
+
+
+# =================================================================== #
+#  Ce que le LLM doit renvoyer                                        #
+# =================================================================== #
 class ModificationVue(BaseModel):
     """Un pattern de modification repere dans le diff d'un document."""
     id_connu: int = Field(
