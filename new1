@@ -1,3 +1,85 @@
+
+
+from typing import List
+from collections import deque
+from pydantic import BaseModel, Field
+from langchain_core.prompts import ChatPromptTemplate
+
+
+class SortieDM(BaseModel):
+    modifications: List[str] = Field(
+        description="Liste EXHAUSTIVE des modifications du document, en phrases courtes. "
+                    "Les modifications de meme nature sont regroupees en un seul pattern. "
+                    "Aucune omission, aucune repetition."
+    )
+
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Vous analysez un document ou les modifications sont balisees :\n"
+     "  [MODIFIE | avant: X | apres: Y]   X est devenu Y\n"
+     "  [SUPPRIME | avant: X]             X a ete retire\n"
+     "  [AJOUTE | apres: Y]               Y a ete ajoute\n"
+     "Le texte non balise est le contexte inchange, [...] signale un passage omis.\n\n"
+     "Listez TOUTES les modifications, en phrases COURTES et efficaces.\n"
+     "EXHAUSTIVITE ABSOLUE : n'oubliez AUCUNE information, chaque changement doit etre couvert.\n"
+     "REGROUPEZ les modifications de meme nature en UNE entree formulee comme un pattern :\n"
+     "  - plusieurs traductions -> 'Traduction des libelles du francais vers l'anglais'\n"
+     "  - plusieurs (rep. N) ajoutes -> 'Ajout de reperes (rep. N) apres les designations'\n"
+     "Les modifications isolees sont listees individuellement, en citant le texte.\n"
+     "Aucune repetition. Aucun emoji. Style factuel.\n\n"
+     "PATTERNS RECEMMENT OBSERVES :\n{deja_vus}\n"
+     "Si vous retrouvez un de ces patterns, REUTILISEZ sa formulation a l'identique pour rester "
+     "coherent. Cela ne vous dispense pas de rester exhaustif sur ce document."),
+    ("user", "Document :\n{diff}")
+])
+
+
+def lister_modifications(feuille, llm, has_changes, diff_unifie, taille_fenetre=30):
+    """
+    Generateur. Pour chaque DM modifie, yield (dm_code, [modifications]).
+    Garde une FENETRE GLISSANTE des N dernieres modifications vues et la renvoie
+    au LLM, pour reutiliser les patterns recents sans saturer le contexte.
+    """
+    chaine = PROMPT | llm.with_structured_output(SortieDM)
+    fenetre = deque(maxlen=taille_fenetre)   # garde seulement les N plus recentes
+
+    for f in feuille:
+        v1, v2 = f.doc_v1["content"], f.doc_v2["content"]
+        if not has_changes(v1, v2):
+            continue
+
+        contexte = "\n".join(f"  - {m}" for m in fenetre) or "  (aucun pour l'instant)"
+        try:
+            sortie = chaine.invoke({"diff": diff_unifie(v1, v2), "deja_vus": contexte})
+            modifs = sortie.modifications
+        except Exception as e:
+            print(f"  ! {f.dm_code} echoue : {e}")
+            modifs = []
+
+        # On ajoute a la fenetre en evitant les doublons deja presents
+        for m in modifs:
+            if m not in fenetre:
+                fenetre.append(m)            # deque ejecte automatiquement les plus vieilles
+
+        print(f"{f.dm_code} : {len(modifs)} modification(s) — fenetre : {len(fenetre)}")
+        yield f.dm_code, modifs
+
+
+# =================================================================== #
+#  Utilisation                                                        #
+# =================================================================== #
+# resultats = {}
+# for dm_code, modifs in lister_modifications(feuille, llm, has_changes, diff_unifie, taille_fenetre=30):
+#     resultats[dm_code] = modifs
+#
+# for dm, modifs in resultats.items():
+#     print(f"\n=== {dm} ===")
+#     for m in modifs:
+#         print(f"  - {m}")
+
+
+
 from typing import List
 from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
