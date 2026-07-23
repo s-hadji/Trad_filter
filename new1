@@ -1,6 +1,5 @@
 
 
-
 from typing import List, Dict, Set, Optional
 import numpy as np
 from scipy.spatial.distance import cdist
@@ -286,7 +285,57 @@ def consolider_catalogue(catalogue: Dict[int, Modification], llm, embedding,
         lot = {m.id: m for m in lignes[debut: debut + taille_lot]}
         print(f"[Lot {numero}/{nb_lots}] {len(lot)} pattern(s)")
 
-        sortie = _appeler_passe2(chaine, lot, nombre
+        sortie = _appeler_passe2(chaine, lot, nombre_essais)
+        if sortie is None:
+            for m in lot.values():
+                finaux.append(PatternFinal(id=prochain_id, description=m.description,
+                                           sources={m.id}, dms=set(m.dms)))
+                prochain_id += 1
+            continue
+
+        couverts: Set[int] = set()
+        for entree in sortie.entrees:
+            sources_valides = [i for i in entree.sources if i in lot]
+            if not sources_valides:
+                continue
+            dms = set()
+            for i in sources_valides:
+                dms |= lot[i].dms             # UNION des DM, cote code
+                couverts.add(i)
+            finaux.append(PatternFinal(id=prochain_id, description=entree.description,
+                                       sources=set(sources_valides), dms=dms))
+            prochain_id += 1
+
+        oublies = set(lot) - couverts
+        if oublies:
+            print(f"    ! {len(oublies)} pattern(s) oublie(s), rattache(s) seuls")
+            for i in oublies:
+                m = lot[i]
+                finaux.append(PatternFinal(id=prochain_id, description=m.description,
+                                           sources={i}, dms=set(m.dms)))
+                prochain_id += 1
+
+    print(f"Passe 2 terminee : {len(finaux)} entree(s) finale(s)")
+    return finaux
+
+
+# =================================================================== #
+#  Affichage final                                                    #
+# =================================================================== #
+def afficher_final(finaux: List[PatternFinal]) -> None:
+    print(f"\n=== CATALOGUE FINAL ({len(finaux)}) ===\n")
+    for p in sorted(finaux, key=lambda x: x.nb_dm, reverse=True):
+        print(f"[{p.id}] {p.description}")
+        print(f"     sources : {sorted(p.sources)}")
+        print(f"     {p.nb_dm} DM : {', '.join(sorted(p.dms))}\n")
+
+
+# =================================================================== #
+#  Utilisation                                                        #
+# =================================================================== #
+# catalogue, par_dm = analyser_feuilles(feuille, llm, embedding, has_changes, diff_unifie)
+# finaux = consolider_catalogue(catalogue, llm, embedding)
+# afficher_final(finaux)
 
 
 
