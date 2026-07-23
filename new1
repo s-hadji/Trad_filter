@@ -1,3 +1,67 @@
+from typing import List
+from pydantic import BaseModel, Field
+from langchain_core.prompts import ChatPromptTemplate
+
+
+class SortieDM(BaseModel):
+    modifications: List[str] = Field(
+        description="Liste des modifications du document, en phrases courtes. "
+                    "Les modifications de meme nature sont regroupees en un seul pattern. "
+                    "Exhaustif, sans repetition."
+    )
+
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Vous analysez un document ou les modifications sont balisees :\n"
+     "  [MODIFIE | avant: X | apres: Y]   X est devenu Y\n"
+     "  [SUPPRIME | avant: X]             X a ete retire\n"
+     "  [AJOUTE | apres: Y]               Y a ete ajoute\n"
+     "Le texte non balise est le contexte inchange, [...] signale un passage omis.\n\n"
+     "Listez TOUTES les modifications en phrases COURTES et efficaces, sans en oublier.\n"
+     "REGROUPEZ les modifications de meme nature en UNE seule entree formulee comme un pattern :\n"
+     "  - plusieurs traductions -> 'Traduction des libelles du francais vers l'anglais'\n"
+     "  - plusieurs (rep. N) ajoutes -> 'Ajout de reperes (rep. N) apres les designations'\n"
+     "Les modifications isolees (sans pattern) sont listees individuellement, en citant le texte.\n"
+     "Aucune repetition. Aucun emoji. Style factuel."),
+    ("user", "Document :\n{diff}")
+])
+
+
+def lister_modifications(feuille, llm, has_changes, diff_unifie):
+    """
+    Generateur. Pour chaque DM modifie, yield (dm_code, [modifications]).
+    Chaque modification est une phrase courte ; les patterns sont regroupes.
+    """
+    chaine = PROMPT | llm.with_structured_output(SortieDM)
+
+    for f in feuille:
+        v1, v2 = f.doc_v1["content"], f.doc_v2["content"]
+        if not has_changes(v1, v2):
+            continue
+
+        try:
+            sortie = chaine.invoke({"diff": diff_unifie(v1, v2)})
+            modifs = sortie.modifications
+        except Exception as e:
+            print(f"  ! {f.dm_code} echoue : {e}")
+            modifs = []
+
+        print(f"{f.dm_code} : {len(modifs)} modification(s)")
+        yield f.dm_code, modifs
+
+
+# =================================================================== #
+#  Utilisation                                                        #
+# =================================================================== #
+# resultats = {}
+# for dm_code, modifs in lister_modifications(feuille, llm, has_changes, diff_unifie):
+#     resultats[dm_code] = modifs
+#
+# for dm, modifs in resultats.items():
+#     print(f"\n=== {dm} ===")
+#     for m in modifs:
+#         print(f"  - {m}")
 
 
 import pandas as pd
