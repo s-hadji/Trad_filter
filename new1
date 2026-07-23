@@ -1,5 +1,346 @@
 
 
+
+from typing import List, Dict, Set, Iterator, Tuple, Optional
+import numpy as np
+from scipy.spatial.distance import cdist
+from pydantic import BaseModel, Field
+from langchain_core.prompts import ChatPromptTemplate
+
+
+# =================================================================== #
+#  Tri par plus proche voisin (embedding)                             #
+# =================================================================== #
+def ordre_plus_proche_voisin(vecteurs: np.ndarray) -> List[int]:
+    n = len(vecteurs)
+    courant, ordre, restants = 0, [0], list(range(1, n))
+    while restants:
+        distances = cdist(vecteurs[courant].reshape(1, -1), vecteurs[restants], metric="cosine")[0]
+        courant = restants.pop(int(np.argmin(distances)))
+        ordre.append(courant)
+    return ordre
+
+
+def trier_par_embedding(textes: List[str], embedding) -> List[int]:
+    if len(textes) < 2:
+        return list(range(len(textes)))
+    vecteurs = np.array(embedding.embed_documents(textes))
+    return ordre_plus_proche_voisin(vecteurs)
+
+
+# =================================================================== #
+#  Structures                                                         #
+# =================================================================== #
+class ModificationVue(BaseModel):
+    id_connu: int = Field(description="Id d'un pattern DEJA CONNU si meme, sinon -1.")
+    description: str = Field(
+        description="Pattern GENERIQUE et court : la NATURE du changement, pas les elements precis. "
+                    "Si id_connu != -1, recopier la description connue a l'identique."
+    )
+
+
+class SortieLLM(BaseModel):
+    modifications: List[ModificationVue] = Field(description="Patterns du document. Peu nombreux.")
+
+
+class Modification(BaseModel):
+    id: int
+    description: str
+    dms: Set[str] = Field(default_factory=set)
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+class EtatPasse1(BaseModel):
+    """Etat partage de la passe 1, detenu par l'appelant (survit aux interruptions)."""
+    catalogue_courant: Dict[int, Modification] = Field(default_factory=dict)
+    tous_les_patterns: Dict[int, Modification] = Field(default_factory=dict)
+    par_dm: Dict[str, List[int]] = Field(default_factory=dict)
+    prochain_id: int = 1
+    numero_catalogue: int = 1
+    traites: Set[str] = Field(default_factory=set)   # dm_code deja faits (reprise)
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+PROMPT_PASSE1 = ChatPromptTemplate.from_messages([
+    ("system",
+     "Vous etes un expert en analyse de modifications documentaires.\n\n"
+     "On vous donne un document ou seules les modifications sont balisees :\n"
+     "  [MODIFIE | avant: X | apres: Y]   X est devenu Y\n"
+     "  [SUPPRIME | avant: X]             X a ete retire\n"
+     "  [AJOUTE | apres: Y]               Y a ete ajoute\n"
+     "Le texte non balise est le contexte inchange, [...] signale un passage omis.\n\n"
+     "Votre role : identifier les PATTERNS de modification, pas les modifications individuelles.\n\n"
+     "REGLE FONDAMENTALE : decrivez la NATURE du changement, JAMAIS les elements precis sur "
+     "lesquels il porte.\n"
+     "  BON  : 'Traduction des libelles du francais vers l'anglais'\n"
+     "  BON  : 'Ajout de reperes (rep. N) apres les designations'\n"
+     "  BON  : 'Remplacement de references alphanumeriques'\n"
+     "  MAUVAIS : 'Gouvernes horizontales (pose) devient Horizontal Control Surfaces (rep. 2)'\n\n"
+     "Un document contient en general 1 a 4 patterns. Regroupez agressivement.\n\n"
+     "PATTERNS DEJA CONNUS :\n{connues}\n\n"
+     "Si un pattern existe deja, mettez son id dans 'id_connu' et RECOPIEZ sa description. "
+     "Sinon 'id_connu' = -1.\n\nAucun emoji. Style factuel et concis."),
+    ("user", "Document balise :\n{diff}\n\nIdentifiez les patterns de modification.")
+])
+
+
+def _formater_connues(catalogue: Dict[int, Modification]) -> str:
+    if not catalogue:
+        return "  (aucun pour l'instant)"
+    return "\n".join(f"  [{m.id}] {m.description}" for m in catalogue.values())
+
+
+def _appeler(chaine, variables, nombre_essais):
+    for essai in range(1, nombre_essais + 1):
+        try:
+            return chaine.invoke(variables)
+        except Exception as erreur:
+            print(f"    ! Essai {essai}/{nombre_essais} echoue "
+                  f"({type(erreur).__name__}: {erreur})")
+    return None
+
+
+# =================================================================== #
+#  PASSE 1 — générateur                                               #
+# =================================================================== #
+def analyser_feuilles(feuille, llm, embedding, has_changes, diff_unifie, etat: EtatPasse1,
+                      taille_max_catalogue: int = 30, nombre_essais: int = 3
+                      ) -> Iterator[Tuple[str, List[int]]]:
+    """
+    Generateur. Trie les feuilles par embedding puis detecte les patterns, DM par DM.
+    'etat' est detenu par l'appelant : en cas d'interruption, tout ce qui a ete
+    traite est conserve, et un nouvel appel REPREND (les dm_code de etat.traites
+    sont sautes).
+    yield (dm_code, [ids de patterns du DM]).
+    """
+    chaine = PROMPT_PASSE1 | llm.with_structured_output(SortieLLM)
+
+    # Feuilles modifiees non encore traitees + leur diff
+    a_traiter = []
+    for f in feuille:
+        v1, v2 = f.doc_v1["content"], f.doc_v2["content"]
+        if has_changes(v1, v2) and f.dm_code not in etat.traites:
+            a_traiter.append((f, diff_unifie(v1, v2)))
+
+    if not a_traiter:
+        return
+
+    print(f"Tri de {len(a_traiter)} document(s) par embedding...")
+    ordre = trier_par_embedding([d for _, d in a_traiter], embedding)
+    a_traiter = [a_traiter[i] for i in ordre]
+    total = len(a_traiter)
+
+    for numero, (f, diff) in enumerate(a_traiter, 1):
+        dm = f.dm_code
+        print(f"[{numero}/{total}] DM {dm} — catalogue #{etat.numero_catalogue} "
+              f"({len(etat.catalogue_courant)})")
+
+        # Rotation du catalogue courant si trop grand
+        if len(etat.catalogue_courant) >= taille_max_catalogue:
+            etat.numero_catalogue += 1
+            print(f"    >>> Ouverture du catalogue #{etat.numero_catalogue}")
+            etat.catalogue_courant = {}
+
+        sortie = _appeler(chaine, {"diff": diff, "connues": _formater_connues(etat.catalogue_courant)},
+                          nombre_essais)
+        if sortie is None:
+            etat.par_dm[dm] = []
+            etat.traites.add(dm)
+            yield dm, []
+            continue
+
+        ids_du_dm = []
+        for vue in sortie.modifications:
+            modif = etat.catalogue_courant.get(vue.id_connu) if vue.id_connu != -1 else None
+            if modif is None:
+                modif = Modification(id=etat.prochain_id, description=vue.description)
+                etat.catalogue_courant[etat.prochain_id] = modif
+                etat.tous_les_patterns[etat.prochain_id] = modif
+                etat.prochain_id += 1
+            modif.dms.add(dm)                 # rattachement du DM, cote code
+            ids_du_dm.append(modif.id)
+
+        etat.par_dm[dm] = ids_du_dm
+        etat.traites.add(dm)
+        yield dm, ids_du_dm
+
+
+def finaliser_passe1(etat: EtatPasse1) -> Dict[int, Modification]:
+    """A appeler quand la passe 1 est finie : fusionne les doublons entre catalogues."""
+    par_desc: Dict[str, Modification] = {}
+    remap: Dict[int, int] = {}
+    for m in etat.tous_les_patterns.values():
+        cle = m.description.strip().lower()
+        if cle not in par_desc:
+            par_desc[cle] = m
+            remap[m.id] = m.id
+        else:
+            par_desc[cle].dms |= m.dms
+            remap[m.id] = par_desc[cle].id
+    etat.par_dm = {dm: [remap.get(i, i) for i in ids] for dm, ids in etat.par_dm.items()}
+    catalogue = {m.id: m for m in par_desc.values()}
+    print(f"Passe 1 : {len(catalogue)} pattern(s) distinct(s)")
+    return catalogue
+
+
+# =================================================================== #
+#  PASSE 2 — générateur                                               #
+# =================================================================== #
+class EntreeFinale(BaseModel):
+    description: str = Field(description="Description finale precise, langage EXACT du texte.")
+    sources: List[int] = Field(
+        description="Ids des lignes regroupees. Chaque id d'entree dans exactement une entree finale."
+    )
+
+
+class SuperCatalogue(BaseModel):
+    entrees: List[EntreeFinale] = Field(description="Catalogue final compact, sans perte.")
+
+
+class PatternFinal(BaseModel):
+    id: int
+    description: str
+    sources: Set[int] = Field(default_factory=set)
+    dms: Set[str] = Field(default_factory=set)
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    @property
+    def nb_dm(self) -> int:
+        return len(self.dms)
+
+
+class EtatPasse2(BaseModel):
+    """Etat partage de la passe 2, detenu par l'appelant."""
+    finaux: List[PatternFinal] = Field(default_factory=list)
+    prochain_id: int = 1
+    lots_traites: int = 0            # nombre de lots deja faits (reprise)
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+PROMPT_PASSE2 = ChatPromptTemplate.from_messages([
+    ("system",
+     "Vous etes un expert en analyse de modifications documentaires. On vous donne un catalogue de "
+     "patterns, chacun avec un id. Certains sont des doublons ou variantes du meme pattern.\n\n"
+     "Construisez le CATALOGUE FINAL en fusionnant les patterns de MEME nature, en restant SUPER "
+     "PRECIS.\n\n"
+     "REGLES ABSOLUES :\n"
+     "1. Fusionnez les patterns de meme nature en UNE entree, description couvrant tout sans perte.\n"
+     "2. Chaque entree finale liste dans 'sources' les ids qu'elle regroupe.\n"
+     "3. EXHAUSTIVITE : chaque id d'entree dans exactement une entree finale. N'oubliez ni "
+     "n'inventez aucun id.\n"
+     "4. Ne fusionnez que ce qui est reellement de meme nature. Un pattern unique reste seul.\n"
+     "5. Citez le texte exact. Ne mentionnez JAMAIS de code DM. Aucun emoji.\n\nStyle factuel."),
+    ("user", "Catalogue d'entree :\n{catalogue}\n\nConstruisez le catalogue final.")
+])
+
+
+def _formater_catalogue(lignes: Dict[int, Modification]) -> str:
+    return "\n".join(f"  [{m.id}] {m.description}" for m in lignes.values())
+
+
+def consolider_catalogue(catalogue: Dict[int, Modification], llm, embedding, etat: EtatPasse2,
+                         taille_lot: int = 40, nombre_essais: int = 3
+                         ) -> Iterator[Tuple[int, List[PatternFinal]]]:
+    """
+    Generateur. Trie les lignes par embedding puis consolide par lots.
+    'etat' est detenu par l'appelant : reprise possible (etat.lots_traites sautes).
+    Le LLM fusionne les descriptions ; NOUS reconstruisons les DM par union.
+    yield (numero_lot, [PatternFinal produits par ce lot]).
+    """
+    chaine = PROMPT_PASSE2 | llm.with_structured_output(SuperCatalogue)
+
+    lignes = list(catalogue.values())
+    print(f"Tri de {len(lignes)} pattern(s) par embedding...")
+    ordre = trier_par_embedding([m.description for m in lignes], embedding)
+    lignes = [lignes[i] for i in ordre]
+
+    total = len(lignes)
+    nb_lots = (total + taille_lot - 1) // taille_lot
+
+    for numero, debut in enumerate(range(0, total, taille_lot), 1):
+        if numero <= etat.lots_traites:          # reprise : lot deja fait
+            continue
+        lot = {m.id: m for m in lignes[debut: debut + taille_lot]}
+        print(f"[Lot {numero}/{nb_lots}] {len(lot)} pattern(s)")
+
+        produits: List[PatternFinal] = []
+        sortie = _appeler(chaine, {"catalogue": _formater_catalogue(lot)}, nombre_essais)
+
+        if sortie is None:
+            for m in lot.values():
+                produits.append(PatternFinal(id=etat.prochain_id, description=m.description,
+                                             sources={m.id}, dms=set(m.dms)))
+                etat.prochain_id += 1
+        else:
+            couverts: Set[int] = set()
+            for entree in sortie.entrees:
+                sources_valides = [i for i in entree.sources if i in lot]
+                if not sources_valides:
+                    continue
+                dms = set()
+                for i in sources_valides:
+                    dms |= lot[i].dms            # UNION des DM, cote code
+                    couverts.add(i)
+                produits.append(PatternFinal(id=etat.prochain_id, description=entree.description,
+                                             sources=set(sources_valides), dms=dms))
+                etat.prochain_id += 1
+            for i in set(lot) - couverts:        # filet : ids oublies rattaches seuls
+                m = lot[i]
+                produits.append(PatternFinal(id=etat.prochain_id, description=m.description,
+                                             sources={i}, dms=set(m.dms)))
+                etat.prochain_id += 1
+
+        etat.finaux.extend(produits)
+        etat.lots_traites = numero
+        yield numero, produits
+
+
+# =================================================================== #
+#  Affichage final                                                    #
+# =================================================================== #
+def afficher_final(finaux: List[PatternFinal]) -> None:
+    print(f"\n=== CATALOGUE FINAL ({len(finaux)}) ===\n")
+    for p in sorted(finaux, key=lambda x: x.nb_dm, reverse=True):
+        print(f"[{p.id}] {p.description}")
+        print(f"     sources : {sorted(p.sources)}")
+        print(f"     {p.nb_dm} DM : {', '.join(sorted(p.dms))}\n")
+
+
+# =================================================================== #
+#  Utilisation                                                        #
+# =================================================================== #
+# # --- Passe 1 ---
+# etat1 = EtatPasse1()
+# try:
+#     for dm, ids in analyser_feuilles(feuille, llm, embedding, has_changes, diff_unifie, etat1):
+#         pass                          # etat1 se remplit tout seul
+# except KeyboardInterrupt:
+#     print(f"Interrompu — {len(etat1.traites)} DM traites")
+# # Relancer la meme ligne reprend ou on s'etait arrete (traites sautes)
+#
+# catalogue = finaliser_passe1(etat1)   # fusion des doublons quand passe 1 finie
+#
+# # --- Passe 2 ---
+# etat2 = EtatPasse2()
+# try:
+#     for numero, produits in consolider_catalogue(catalogue, llm, embedding, etat2):
+#         pass                          # etat2.finaux se remplit
+# except KeyboardInterrupt:
+#     print(f"Interrompu — {etat2.lots_traites} lot(s) traites")
+#
+# afficher_final(etat2.finaux)
+
+
+
+
 from typing import List, Dict, Set, Optional
 import numpy as np
 from scipy.spatial.distance import cdist
