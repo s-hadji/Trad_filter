@@ -1,6 +1,295 @@
 
 
 
+from typing import List, Dict, Set, Optional
+import numpy as np
+from scipy.spatial.distance import cdist
+from pydantic import BaseModel, Field
+from langchain_core.prompts import ChatPromptTemplate
+
+
+# =================================================================== #
+#  Tri par plus proche voisin (embedding)                             #
+# =================================================================== #
+def ordre_plus_proche_voisin(vecteurs: np.ndarray) -> List[int]:
+    """Chemin glouton : part du 1er, enchaine toujours vers le plus proche non visite."""
+    n = len(vecteurs)
+    courant, ordre, restants = 0, [0], list(range(1, n))
+    while restants:
+        distances = cdist(vecteurs[courant].reshape(1, -1), vecteurs[restants], metric="cosine")[0]
+        courant = restants.pop(int(np.argmin(distances)))
+        ordre.append(courant)
+    return ordre
+
+
+def trier_par_embedding(textes: List[str], embedding) -> List[int]:
+    """Renvoie l'ordre des indices qui regroupe les textes semantiquement proches."""
+    if len(textes) < 2:
+        return list(range(len(textes)))
+    vecteurs = np.array(embedding.embed_documents(textes))
+    return ordre_plus_proche_voisin(vecteurs)
+
+
+# =================================================================== #
+#  PASSE 1 : détection des patterns par document                      #
+# =================================================================== #
+class ModificationVue(BaseModel):
+    """Un pattern de modification repere dans le diff d'un document."""
+    id_connu: int = Field(
+        description="Id d'un pattern DEJA CONNU si c'est le meme, sinon -1 pour un nouveau."
+    )
+    description: str = Field(
+        description="Pattern de modification, GENERIQUE et court. Decrire la NATURE du changement, "
+                    "pas les elements precis sur lesquels il porte. "
+                    "Si id_connu != -1, recopier la description connue a l'identique."
+    )
+
+
+class SortieLLM(BaseModel):
+    modifications: List[ModificationVue] = Field(
+        description="Les patterns de modification presents dans ce document. Peu nombreux."
+    )
+
+
+class Modification(BaseModel):
+    id: int
+    description: str
+    dms: Set[str] = Field(default_factory=set)
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+PROMPT_PASSE1 = ChatPromptTemplate.from_messages([
+    ("system",
+     "Vous etes un expert en analyse de modifications documentaires.\n\n"
+     "On vous donne un document ou seules les modifications sont balisees :\n"
+     "  [MODIFIE | avant: X | apres: Y]   X est devenu Y\n"
+     "  [SUPPRIME | avant: X]             X a ete retire\n"
+     "  [AJOUTE | apres: Y]               Y a ete ajoute\n"
+     "Le texte non balise est le contexte inchange, [...] signale un passage omis.\n\n"
+     "Votre role : identifier les PATTERNS de modification, pas les modifications individuelles.\n\n"
+     "REGLE FONDAMENTALE : decrivez la NATURE du changement, JAMAIS les elements precis sur "
+     "lesquels il porte.\n"
+     "  BON  : 'Traduction des libelles du francais vers l'anglais'\n"
+     "  BON  : 'Ajout de reperes (rep. N) apres les designations'\n"
+     "  BON  : 'Remplacement de references alphanumeriques'\n"
+     "  MAUVAIS : 'Gouvernes horizontales (pose) devient Horizontal Control Surfaces (rep. 2)'\n"
+     "  MAUVAIS : 'Le calculateur detail connecteur a ete traduit'\n\n"
+     "Un document contient en general 1 a 4 patterns seulement. Regroupez agressivement : toutes "
+     "les balises de meme nature relevent d'UN SEUL pattern, quel que soit leur nombre.\n\n"
+     "PATTERNS DEJA CONNUS :\n{connues}\n\n"
+     "Si un pattern que vous voyez existe deja, mettez son id dans 'id_connu' et RECOPIEZ sa "
+     "description a l'identique. Ne creez un nouveau pattern (-1) que si aucun ne correspond.\n\n"
+     "Aucun emoji. Style factuel et concis."),
+    ("user", "Document balise :\n{diff}\n\nIdentifiez les patterns de modification.")
+])
+
+
+def _formater_connues(catalogue: Dict[int, Modification]) -> str:
+    if not catalogue:
+        return "  (aucun pour l'instant)"
+    return "\n".join(f"  [{m.id}] {m.description}" for m in catalogue.values())
+
+
+def _afficher_catalogue(catalogue: Dict[int, Modification], numero_catalogue: int) -> None:
+    print(f"    --- Catalogue #{numero_catalogue} ({len(catalogue)}) ---")
+    for m in catalogue.values():
+        print(f"    [{m.id}] {m.description}  ({len(m.dms)} DM)")
+    print()
+
+
+def _appeler_passe1(chaine, diff, catalogue, nombre_essais):
+    for essai in range(1, nombre_essais + 1):
+        try:
+            return chaine.invoke({"diff": diff, "connues": _formater_connues(catalogue)})
+        except Exception as erreur:
+            print(f"    ! Essai {essai}/{nombre_essais} echoue "
+                  f"({type(erreur).__name__}: {erreur})")
+    print("    ! Echec definitif, DM ignore")
+    return None
+
+
+def analyser_feuilles(feuille, llm, embedding, has_changes, diff_unifie,
+                      taille_max_catalogue: int = 30, nombre_essais: int = 3):
+    """
+    Passe 1. Trie d'abord les feuilles modifiees par similarite de leur diff
+    (documents proches traites a la suite -> le LLM reutilise mieux les patterns),
+    puis detecte les patterns. Rotation du catalogue quand il devient trop grand.
+    Renvoie (catalogue_global, par_dm).
+    """
+    chaine = PROMPT_PASSE1 | llm.with_structured_output(SortieLLM)
+
+    # Feuilles modifiees + leur diff (calcule une seule fois)
+    a_traiter = []
+    for f in feuille:
+        v1, v2 = f.doc_v1["content"], f.doc_v2["content"]
+        if has_changes(v1, v2):
+            a_traiter.append((f, diff_unifie(v1, v2)))
+
+    # --- TRI par embedding des diffs ---
+    print(f"Tri de {len(a_traiter)} document(s) par embedding...")
+    ordre = trier_par_embedding([d for _, d in a_traiter], embedding)
+    a_traiter = [a_traiter[i] for i in ordre]
+
+    catalogue_courant: Dict[int, Modification] = {}
+    tous_les_patterns: Dict[int, Modification] = {}
+    par_dm: Dict[str, List[int]] = {}
+    prochain_id = 1
+    numero_catalogue = 1
+    total = len(a_traiter)
+
+    for numero, (f, diff) in enumerate(a_traiter, 1):
+        dm = f.dm_code
+        print(f"[{numero}/{total}] DM {dm}")
+
+        if len(catalogue_courant) >= taille_max_catalogue:
+            numero_catalogue += 1
+            print(f"    >>> Catalogue plein, ouverture du catalogue #{numero_catalogue}")
+            catalogue_courant = {}
+
+        sortie = _appeler_passe1(chaine, diff, catalogue_courant, nombre_essais)
+        if sortie is None:
+            par_dm[dm] = []
+            continue
+
+        ids_du_dm = []
+        for vue in sortie.modifications:
+            modif = catalogue_courant.get(vue.id_connu) if vue.id_connu != -1 else None
+            if modif is None:
+                modif = Modification(id=prochain_id, description=vue.description)
+                catalogue_courant[prochain_id] = modif
+                tous_les_patterns[prochain_id] = modif
+                prochain_id += 1
+            modif.dms.add(dm)                 # rattachement du DM, cote code
+            ids_du_dm.append(modif.id)
+
+        par_dm[dm] = ids_du_dm
+        _afficher_catalogue(catalogue_courant, numero_catalogue)
+
+    # Fusion des doublons strictement identiques entre catalogues
+    catalogue_global, remap = _fusionner_doublons(tous_les_patterns)
+    par_dm = {dm: [remap.get(i, i) for i in ids] for dm, ids in par_dm.items()}
+
+    print(f"Passe 1 terminee : {len(catalogue_global)} pattern(s) distinct(s)")
+    return catalogue_global, par_dm
+
+
+def _fusionner_doublons(patterns: Dict[int, Modification]):
+    """Fusionne les patterns de meme description. Renvoie (catalogue, remap)."""
+    par_desc: Dict[str, Modification] = {}
+    remap: Dict[int, int] = {}
+    for m in patterns.values():
+        cle = m.description.strip().lower()
+        if cle not in par_desc:
+            par_desc[cle] = m
+            remap[m.id] = m.id
+        else:
+            garde = par_desc[cle]
+            garde.dms |= m.dms
+            remap[m.id] = garde.id
+    return {m.id: m for m in par_desc.values()}, remap
+
+
+# =================================================================== #
+#  PASSE 2 : consolidation en super-catalogue (DM traces)             #
+# =================================================================== #
+class EntreeFinale(BaseModel):
+    description: str = Field(
+        description="Description finale du pattern, precise et generique, dans le langage EXACT "
+                    "du texte, sans interpretation."
+    )
+    sources: List[int] = Field(
+        description="Ids des lignes du catalogue d'entree regroupees. CHAQUE ligne d'entree doit "
+                    "apparaitre dans exactement une entree finale."
+    )
+
+
+class SuperCatalogue(BaseModel):
+    entrees: List[EntreeFinale] = Field(
+        description="Le catalogue final consolide. Aussi compact que possible, sans perte."
+    )
+
+
+class PatternFinal(BaseModel):
+    id: int
+    description: str
+    sources: Set[int] = Field(default_factory=set)
+    dms: Set[str] = Field(default_factory=set)
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    @property
+    def nb_dm(self) -> int:
+        return len(self.dms)
+
+
+PROMPT_PASSE2 = ChatPromptTemplate.from_messages([
+    ("system",
+     "Vous etes un expert en analyse de modifications documentaires. On vous donne un catalogue de "
+     "patterns de modifications, chacun avec un id. Certains sont des doublons ou des variantes du "
+     "meme pattern.\n\n"
+     "Votre role : construire le CATALOGUE FINAL en fusionnant les patterns de MEME nature, tout "
+     "en restant SUPER PRECIS.\n\n"
+     "REGLES ABSOLUES :\n"
+     "1. Fusionnez les patterns identiques ou de meme nature en UNE entree finale, avec une "
+     "description qui les couvre tous sans perte.\n"
+     "2. Chaque entree finale liste dans 'sources' les ids qu'elle regroupe.\n"
+     "3. EXHAUSTIVITE : CHAQUE id d'entree doit apparaitre dans exactement une entree finale. "
+     "N'oubliez aucun id, n'en inventez aucun.\n"
+     "4. Ne fusionnez que ce qui est reellement de meme nature. Un pattern unique reste seul.\n"
+     "5. Citez le texte exact. Ne mentionnez JAMAIS de code DM. Aucun emoji.\n\n"
+     "Style factuel et concis."),
+    ("user", "Catalogue d'entree :\n{catalogue}\n\nConstruisez le catalogue final consolide.")
+])
+
+
+def _formater_catalogue(lignes: Dict[int, Modification]) -> str:
+    return "\n".join(f"  [{m.id}] {m.description}" for m in lignes.values())
+
+
+def _appeler_passe2(chaine, lignes, nombre_essais):
+    for essai in range(1, nombre_essais + 1):
+        try:
+            return chaine.invoke({"catalogue": _formater_catalogue(lignes)})
+        except Exception as erreur:
+            print(f"  ! Essai {essai}/{nombre_essais} echoue "
+                  f"({type(erreur).__name__}: {erreur})")
+    return None
+
+
+def consolider_catalogue(catalogue: Dict[int, Modification], llm, embedding,
+                         taille_lot: int = 40, nombre_essais: int = 3) -> List[PatternFinal]:
+    """
+    Passe 2. Trie les lignes du catalogue par embedding (les doublons se
+    retrouvent dans le meme lot), puis consolide par lots. Le LLM fusionne les
+    descriptions ; NOUS reconstruisons les DM par union des sources.
+    """
+    chaine = PROMPT_PASSE2 | llm.with_structured_output(SuperCatalogue)
+
+    lignes = list(catalogue.values())
+
+    # --- TRI par embedding des descriptions ---
+    print(f"Tri de {len(lignes)} pattern(s) par embedding...")
+    ordre = trier_par_embedding([m.description for m in lignes], embedding)
+    lignes = [lignes[i] for i in ordre]
+
+    total = len(lignes)
+    nb_lots = (total + taille_lot - 1) // taille_lot
+    print(f"Consolidation en {nb_lots} lot(s)")
+
+    finaux: List[PatternFinal] = []
+    prochain_id = 1
+
+    for numero, debut in enumerate(range(0, total, taille_lot), 1):
+        lot = {m.id: m for m in lignes[debut: debut + taille_lot]}
+        print(f"[Lot {numero}/{nb_lots}] {len(lot)} pattern(s)")
+
+        sortie = _appeler_passe2(chaine, lot, nombre
+
+
+
 from typing import List, Dict, Set
 from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
