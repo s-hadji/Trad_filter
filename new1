@@ -1,5 +1,48 @@
 
 
+import pandas as pd
+import re
+
+# 1. Fonction pour couper le texte tous les X mots proprement
+def wrap_text_by_words(text, max_words=10):
+    if not isinstance(text, str):
+        return text
+    words = text.split()
+    if not words:
+        return text
+    
+    # Regrouper les mots par paquets de 'max_words'
+    chunks = [" ".join(words[i:i + max_words]) for i in range(0, len(words), max_words)]
+    return "\n".join(chunks)
+
+# 2. Fonction pour nettoyer la colonne 'dmc' (retirer accolades/guillemets et sauter des lignes)
+def clean_and_format_dmc(cell_value):
+    if not isinstance(cell_value, str):
+        # Si c'est déjà un set ou une liste Python
+        if isinstance(cell_value, (set, list)):
+            codes = [str(c).strip() for c in cell_value]
+            return "\n".join(codes)
+        return str(cell_value)
+    
+    # Supprimer les accolades {}, les guillemets ' ou "
+    cleaned = re.sub(r"[{}\'\"]", "", cell_value)
+    
+    # Séparer par la virgule et nettoyer les espaces
+    codes = [c.strip() for c in cleaned.split(",") if c.strip()]
+    
+    return "\n".join(codes)
+
+# ==========================================
+# Application sur votre DataFrame (df)
+# ==========================================
+
+# Exemple : 8 mots max par ligne pour la description
+df["description de l'écart"] = df["description de l'écart"].apply(lambda x: wrap_text_by_words(x, max_words=8))
+
+# Application sur la colonne dmc
+df["dmc"] = df["dmc"].apply(clean_and_format_dmc)
+
+
 
 from typing import List, Dict, Set, Iterator, Tuple, Optional
 import numpy as np
