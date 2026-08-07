@@ -1,4 +1,17 @@
 
+for _id, _name in dict_of_applic.items():
+    copie_of_original = BeautifulSoup(str(xml_file), "html")
+    
+    a_supprimer = [
+        el for el in copie_of_original.select('[applicrefid]')
+        if el.get('applicrefid') != _id
+    ]
+    for el in a_supprimer:
+        el.decompose()
+    
+    dict_of_id_vs_name_and_file[_id] = (_name, copie_of_original)
+
+
 
 ^(\d{4})[-\s]?(\d{2})[-\s]?(\d{3})[-\s]?(\d{4})$
 ^(\d{4})-(\d{2})-(\d{3})-(\d{4})$
