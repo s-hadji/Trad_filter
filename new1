@@ -1,3 +1,27 @@
+from bs4 import BeautifulSoup
+
+with open("DMC-....xml", encoding="utf-8") as f:
+    soup = BeautifulSoup(f, "xml")
+
+def to_dict(tag):
+    # enfants directs uniquement -> la récursion fait le reste
+    children = [to_dict(c) for c in tag.find_all(recursive=False)]
+    # texte propre au noeud (pas celui des descendants)
+    text = "".join(tag.find_all(string=True, recursive=False)).strip()
+
+    node = {"tag": tag.name}
+    if tag.attrs:
+        node["attrs"] = dict(tag.attrs)
+    if text:
+        node["text"] = text
+    if children:
+        node["children"] = children
+    return node
+
+tree = to_dict(soup.find("dmodule"))
+
+
+
 
 for _id, _name in dict_of_applic.items():
     copie_of_original = BeautifulSoup(str(xml_file), "html")
