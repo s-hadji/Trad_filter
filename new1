@@ -102,31 +102,57 @@ def regrouper_par_dm_code(docs_v1, docs_v2):
     return entrees
 
 
-def _enfant(parent, nom):
-    """Renvoie l'enfant de meme nom (insensible a la casse), le cree si absent."""
-    for child in parent.children:
-        if child.name.lower() == nom.lower():
-            return child
-    return Node(nom, parent=parent)
-
-
 def construire_arbre(docs_v1, docs_v2):
-    """Un noeud par DM_code, place sous le chemin issu de son DM_title."""
+    """Un noeud par DM_code, range sous un arbre construit sur les mots du DM_title."""
+    entrees = [
+        (normaliser(e["titre"]), code,
+         fusionner_docs(e["v1"]), fusionner_docs(e["v2"]))
+        for code, e in sorted(regrouper_par_dm_code(docs_v1, docs_v2).items())
+    ]
     racine = Node("ROOT")
-
-    for code, e in sorted(regrouper_par_dm_code(docs_v1, docs_v2).items()):
-        parent = racine
-        for token in normaliser(e["titre"]):        # descente token par token
-            parent = _enfant(parent, token)
-
-        feuille = Node(code, parent=parent)
-        feuille.dm_code = code
-        feuille.feuille = True
-        feuille.statut = "FEUILLE"
-        feuille.doc_v1 = fusionner_docs(e["v1"])
-        feuille.doc_v2 = fusionner_docs(e["v2"])
-
+    _construire(entrees, racine)
     return racine
+
+
+def _construire(entrees, parent):
+    """Regroupe les entrees par premier mot, une branche par groupe, puis recursion."""
+    groupes = defaultdict(list)
+    for entree in entrees:
+        tokens = entree[0]
+        if tokens:
+            groupes[tokens[0].lower()].append(entree)
+        else:
+            _creer_feuille(entree, parent)              # plus de mot : feuille ici
+
+    for _, groupe in sorted(groupes.items()):
+        if len(groupe) == 1:                            # seul dans son mot : pas de branche
+            _creer_feuille(groupe[0], parent)
+            continue
+
+        n = _prefixe_commun([e[0] for e in groupe])     # tout le prefixe commun d'un coup
+        branche = Node(" ".join(groupe[0][0][:n]), parent=parent)
+        _construire([(t[n:], c, d1, d2) for t, c, d1, d2 in groupe], branche)
+
+
+def _prefixe_commun(chemins):
+    """Nombre de mots de tete identiques (insensible a la casse) a tous les chemins."""
+    n = 0
+    for mots in zip(*chemins):                          # s'arrete au chemin le plus court
+        if len({m.lower() for m in mots}) > 1:
+            break
+        n += 1
+    return n
+
+
+def _creer_feuille(entree, parent):
+    _, code, d1, d2 = entree
+    feuille = Node(code, parent=parent)
+    feuille.dm_code = code
+    feuille.feuille = True
+    feuille.statut = "FEUILLE"
+    feuille.doc_v1 = d1
+    feuille.doc_v2 = d2
+    return feuille
 
 
 def feuilles(racine):
@@ -143,7 +169,6 @@ def afficher(node, niveau=0):
 # racine = construire_arbre(extraire(dico_v1), extraire(dico_v2))
 # common_set, added_set, delet_set = separer_en_set(feuilles(racine))
 # afficher(racine)
-
 
 
 
