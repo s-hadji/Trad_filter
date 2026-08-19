@@ -1,4 +1,59 @@
 
+import re
+import unicodedata
+
+TOKENS_PARASITES = {'/', '|', '.', '>', '→', '->'}      # on garde les tirets
+
+
+def normaliser(titre):
+    """Titre nettoye : une seule ligne, espaces simples, tokens parasites retires."""
+    titre = unicodedata.normalize('NFKC', titre.splitlines()[0])
+    titre = re.sub(r'\s+', ' ', titre).strip()
+    return " ".join(t for t in titre.split(' ') if t and t not in TOKENS_PARASITES)
+
+
+def set_titres(dico, dico_v2):
+    """Set des titres uniques des deux versions."""
+    return {normaliser(d["extra_information"]["DM_title"]) for d in dico + dico_v2}
+
+
+def arbre_titres(titres):
+    """Arbre prefixe des titres (separateur = espace, insensible a la casse).
+    Un noeud sans embranchement fusionne avec son fils unique."""
+    arbre = {}
+    for titre in titres:                                # 1. un niveau par mot
+        noeud = arbre
+        for mot in titre.split(" "):
+            noeud = noeud.setdefault(mot.lower(), (mot, {}))[1]
+
+    def merger(noeud):                                  # 2. un seul fils -> on colle les noms
+        fusionne = {}
+        for mot, fils in noeud.values():
+            while len(fils) == 1:
+                (suite, petits), = fils.values()
+                mot, fils = f"{mot} {suite}", petits
+            fusionne[mot] = merger(fils)
+        return fusionne
+
+    return merger(arbre)
+
+
+def compter_chemins(arbre):
+    """Nombre de chemins racine -> feuille (doit valoir len(titres))."""
+    return sum(compter_chemins(fils) if fils else 1 for fils in arbre.values())
+
+
+def afficher(arbre, niveau=0):
+    for nom, fils in sorted(arbre.items()):
+        print("  " * niveau + nom)
+        afficher(fils, niveau + 1)
+
+
+# --------------------------------------------------------------- utilisation
+# titres = set_titres(extraire(dico), extraire(dico_v2))
+# arbre = arbre_titres(titres)
+# afficher(arbre)
+# print(compter_chemins(arbre), "chemins pour", len(titres), "titres")
 
 
 
