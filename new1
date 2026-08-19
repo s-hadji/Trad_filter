@@ -1,3 +1,135 @@
+
+import re
+import unicodedata
+from collections import defaultdict
+import pygtrie
+
+TOKENS_PARASITES = {'-', '/', '|', '—', '.', '>', '→', '->'}
+
+
+class Node:
+    def __init__(self, name, parent=None):
+        self.name = name
+        self.parent = parent
+        self.children = []
+        if parent:
+            parent.children.append(self)
+        self.dm_code = None
+        self.feuille = False
+        self.patches = []
+        self.statut = "BRANCHE"
+        self.tokens_cumules = 0
+        self.doc_v1 = None
+        self.doc_v2 = None
+        self.md_out = None
+
+    @property
+    def descendants(self):
+        nodes = []
+        for child in self.children:
+            nodes.append(child)
+            nodes.extend(child.descendants)
+        return nodes
+
+    @property
+    def path(self):
+        path = []
+        current = self
+        while current:
+            path.insert(0, current)
+            current = current.parent
+        return path
+
+    @property
+    def depth(self):
+        return len(self.path) - 1
+
+
+def normaliser(ligne):
+    if not ligne:
+        return ""
+    ligne = unicodedata.normalize('NFKC', ligne.splitlines()[0])
+    ligne = re.sub(r'\s+', ' ', ligne).strip()
+    return " ".join(t for t in ligne.split(' ') if t and t not in TOKENS_PARASITES)
+
+
+def extraire(dico):
+    return [d for d in dico if d["type"] == "XML_procedure"]
+
+
+def separer_en_set(feuilles):
+    common_set = [f for f in feuilles if f.doc_v1 is not None and f.doc_v2 is not None]
+    added_set = [f for f in feuilles if f.doc_v1 is None and f.doc_v2 is not None]
+    delet_set = [f for f in feuilles if f.doc_v1 is not None and f.doc_v2 is None]
+    return common_set, added_set, delet_set
+
+
+# ------------------------------------------------------------- construction
+
+def construire_arbre(dico, dico_v2):
+    # 1. Trie des titres : au bout de chaque titre, ses docs ranges par code
+    trie = pygtrie.StringTrie(separator=" ")
+    for liste, champ in ((dico, "doc_v1"), (dico_v2, "doc_v2")):
+        for d in liste:
+            info = d["extra_information"]
+            titre = normaliser(info["DM_title"])
+            trie.setdefault(titre, defaultdict(dict))[info["DM_code"]][champ] = d
+
+    # 2. Arbre : on recopie le trie en ne creant un Node qu'aux splits
+    racine = Node("ROOT")
+    construire(trie._root, racine)
+    return racine
+
+
+def construire(tn, parent, nom=""):
+    """tn = noeud du trie. nom = mots accumules depuis le dernier Node cree."""
+    for mot, fils in sorted(tn.children.iteritems()):
+        nom_fils = f"{nom} {mot}".strip()
+        docs = fils.value if fils.value is not pygtrie._EMPTY else {}
+
+        if not docs and len(fils.children) == 1:            # chaine : on accumule
+            construire(fils, parent, nom_fils)
+            continue
+
+        if not fils.children and len(docs) == 1:            # titre unique : feuille directe
+            cible = parent
+        else:                                               # split : un vrai Node
+            cible = Node(nom_fils, parent=parent)
+            construire(fils, cible)
+
+        for code, d in docs.items():                        # les feuilles de ce titre
+            f = Node(code, parent=cible)
+            f.dm_code, f.feuille, f.statut = code, True, "FEUILLE"
+            f.doc_v1, f.doc_v2 = d.get("doc_v1"), d.get("doc_v2")
+
+
+def feuilles(racine):
+    return [n for n in racine.descendants if n.feuille]
+
+
+def afficher(node, niveau=0):
+    print("  " * niveau + f"{node.name} [{node.statut}]")
+    for child in node.children:
+        afficher(child, niveau + 1)
+
+
+# --------------------------------------------------------------- utilisation
+
+if __name__ == "__main__":
+    dico = parse_xml_css("/home/x0shadji/Workspace/Test/Data/Client 1.zip")
+    dico_v2 = parse_xml_css("/home/x0shadji/Workspace/Test/Data/Client 2.zip")
+
+    racine = construire_arbre(extraire(dico), extraire(dico_v2))
+    afficher(racine)
+
+    common_set, added_set, delet_set = separer_en_set(feuilles(racine))
+    print(len(common_set), "communs,", len(added_set), "ajoutes,", len(delet_set), "supprimes")
+
+    for f in common_set[:3]:
+        print(" > ".join(n.name for n in f.path), "|", f.doc_v1["length"], "->", f.doc_v2["length"])
+
+
+
 d1 = {d['extra_information']['DM_title']: d['extra_information']['DM_code'] for d in dico}
 d2 = {d['extra_information']['DM_title']: d['extra_information']['DM_code'] for d in dico_v2}
 
