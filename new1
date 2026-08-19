@@ -1,4 +1,3 @@
-
 import re
 import unicodedata
 
@@ -19,41 +18,41 @@ def set_titres(dico, dico_v2):
 
 def arbre_titres(titres):
     """Arbre prefixe des titres (separateur = espace, insensible a la casse).
-    Un noeud sans embranchement fusionne avec son fils unique."""
+    Chaque noeud : {'nom', 'titres' (les titres qui s'arretent ici), 'fils'}.
+    Un noeud sans titre et sans embranchement fusionne avec son fils unique."""
     arbre = {}
     for titre in titres:                                # 1. un niveau par mot
-        noeud = arbre
+        noeud, courant = arbre, None
         for mot in titre.split(" "):
-            noeud = noeud.setdefault(mot.lower(), (mot, {}))[1]
+            courant = noeud.setdefault(mot.lower(), {"nom": mot, "titres": set(), "fils": {}})
+            noeud = courant["fils"]
+        if courant:
+            courant["titres"].add(titre)                # le titre s'arrete ici
 
     def merger(noeud):                                  # 2. un seul fils -> on colle les noms
         fusionne = {}
-        for mot, fils in noeud.values():
-            while len(fils) == 1:
-                (suite, petits), = fils.values()
-                mot, fils = f"{mot} {suite}", petits
-            fusionne[mot] = merger(fils)
+        for n in noeud.values():
+            nom, titres_ici, fils = n["nom"], n["titres"], n["fils"]
+            while not titres_ici and len(fils) == 1:
+                (f,) = fils.values()
+                nom, titres_ici, fils = f"{nom} {f['nom']}", f["titres"], f["fils"]
+            fusionne[nom] = {"titres": titres_ici, "fils": merger(fils)}
         return fusionne
 
     return merger(arbre)
 
 
 def compter_chemins(arbre):
-    """Nombre de chemins racine -> feuille (doit valoir len(titres))."""
-    return sum(compter_chemins(fils) if fils else 1 for fils in arbre.values())
+    """Nombre de titres poses dans l'arbre : doit valoir len(titres)."""
+    return sum(len(n["titres"]) + compter_chemins(n["fils"]) for n in arbre.values())
 
 
 def afficher(arbre, niveau=0):
-    for nom, fils in sorted(arbre.items()):
-        print("  " * niveau + nom)
-        afficher(fils, niveau + 1)
+    for nom, n in sorted(arbre.items()):
+        marque = f"  <- {len(n['titres'])} titre(s)" if n["titres"] else ""
+        print("  " * niveau + nom + marque)
+        afficher(n["fils"], niveau + 1)
 
-
-# --------------------------------------------------------------- utilisation
-# titres = set_titres(extraire(dico), extraire(dico_v2))
-# arbre = arbre_titres(titres)
-# afficher(arbre)
-# print(compter_chemins(arbre), "chemins pour", len(titres), "titres")
 
 
 
