@@ -1,3 +1,13 @@
+def set_titres(dico, dico_v2):
+    return {normaliser(d["extra_information"]["DM_title"]) for d in dico + dico_v2}
+
+def arbre_titres(titres):
+    arbre = {}
+    for titre in titres:
+        noeud = arbre
+        for mot in titre.split(" "):
+            noeud = noeud.setdefault(mot, {})
+    return arbre
 
 
 from anytree import Node, RenderTree
