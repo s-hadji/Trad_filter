@@ -1,3 +1,197 @@
+
+import re
+import unicodedata
+from collections import defaultdict
+from typing import List
+
+# version fonct
+TOKENS_PARASITES = {'-', '/', '|', '—', '.', '>', '→', '->'}
+
+
+class Node:
+    def __init__(self, name, parent=None):
+        self.name = name
+        self.parent = parent
+        self.children = []
+        if parent:
+            parent.children.append(self)
+        self.dm_code = None
+        self.feuille = False
+        self.patches = []
+        self.statut = "BRANCHE"
+        self.tokens_cumules = 0
+        self.doc_v1 = None          # rempli seulement pour les docs SANS applic
+        self.doc_v2 = None
+        self.md_out = None
+        # {(code_applic, nom_applic) | None: {"v1": doc | None, "v2": doc | None}}
+        self.applics = {}
+
+    @property
+    def descendants(self):
+        nodes = []
+        for child in self.children:
+            nodes.append(child)
+            nodes.extend(child.descendants)
+        return nodes
+
+    @property
+    def path(self):
+        path = []
+        current = self
+        while current:
+            path.insert(0, current)
+            current = current.parent
+        return path
+
+    @property
+    def depth(self):
+        return len(self.path) - 1
+
+    # --- présence par version, tous applics confondus ---
+    @property
+    def a_v1(self):
+        return any(p["v1"] is not None for p in self.applics.values())
+
+    @property
+    def a_v2(self):
+        return any(p["v2"] is not None for p in self.applics.values())
+
+    def applics_par_statut(self):
+        """{'COMMUN': [...], 'AJOUTE': [...], 'SUPPRIME': [...]} — clés = applics."""
+        res = {"COMMUN": [], "AJOUTE": [], "SUPPRIME": []}
+        for applic, p in self.applics.items():
+            if p["v1"] is not None and p["v2"] is not None:
+                res["COMMUN"].append(applic)
+            elif p["v2"] is not None:
+                res["AJOUTE"].append(applic)
+            elif p["v1"] is not None:
+                res["SUPPRIME"].append(applic)
+        return res
+
+
+# ---------------------------------------------------------------- utilitaires
+
+def normaliser(ligne):
+    if not ligne:
+        return []
+    ligne = unicodedata.normalize('NFKC', ligne.splitlines()[0])
+    ligne = re.sub(r'\s+', ' ', ligne).strip()
+    return [t for t in ligne.split(' ') if t and t not in TOKENS_PARASITES]
+
+
+def extraire(dico):
+    return [d for d in dico if d["type"] == "XML_procedure"]
+
+
+def extraire_desc(dico):
+    return [d for d in dico if d["type"] == "XML_description"]
+
+
+def separer_en_set(feuilles: List[Node]) -> tuple:
+    """Sépare les feuilles en commun / ajouté / supprimé (niveau dm_code)."""
+    common_set = [f for f in feuilles if f.a_v1 and f.a_v2]
+    added_set = [f for f in feuilles if not f.a_v1 and f.a_v2]
+    delet_set = [f for f in feuilles if f.a_v1 and not f.a_v2]
+    return common_set, added_set, delet_set
+
+
+def applic_de(doc):
+    """(code_applic, nom_applic) depuis extra_information, ou None si absent/invalide."""
+    if not isinstance(doc, dict):
+        return None
+    applic = (doc.get("extra_information") or {}).get("Applic")
+    if isinstance(applic, (list, tuple)) and len(applic) == 2:
+        return tuple(applic)
+    return None
+
+
+def fusionner_docs(docs):
+    """Fusionne des documents d'un MEME dm_code ET d'une MEME applic. None si vide."""
+    docs = [d for d in docs if d is not None]
+    if not docs:
+        return None
+    if len(docs) == 1:
+        return docs[0]
+    if isinstance(docs[0], dict):
+        fusion = dict(docs[0])                       # on garde les champs du 1er
+        fusion["content"] = "\n".join(str(d.get("content") or "") for d in docs)
+        fusion["length"] = sum(int(d.get("length") or 0) for d in docs)
+        return fusion
+    return "\n".join(str(d) for d in docs)
+
+
+# ------------------------------------------------------------ construction
+
+def construire_trie(entrees, parent):
+    """entrees : (tokens, dm_code, doc, version) avec version dans {'v1', 'v2'}."""
+    # 1. Regroupement global par dm_code puis par applic, indépendant du chemin
+    groupes = defaultdict(lambda: {"tokens": None, "v1": defaultdict(list),
+                                   "v2": defaultdict(list)})
+    for tokens, code, doc, version in entrees:
+        g = groupes[code]
+        if g["tokens"] is None:
+            g["tokens"] = tokens                     # chemin de référence = premier vu
+        g[version][applic_de(doc)].append(doc)
+
+    # 2. Appariement v1/v2 applic par applic : une applic manquante d'un côté -> None
+    appariees = [
+        (g["tokens"], code, {
+            applic: {"v1": fusionner_docs(g["v1"].get(applic, [])),
+                     "v2": fusionner_docs(g["v2"].get(applic, []))}
+            for applic in {*g["v1"], *g["v2"]}
+        })
+        for code, g in groupes.items()
+    ]
+
+    _construire(appariees, parent)
+
+
+def _construire(entrees, parent):
+    """entrees : (tokens, dm_code, applics). Feuille si tokens vide, sinon branche."""
+    groupes = defaultdict(list)
+    for tokens, code, applics in entrees:
+        if tokens:
+            groupes[tokens[0].lower()].append((tokens, code, applics))
+        else:
+            _creer_feuille(code, applics, parent)
+
+    for _, groupe in sorted(groupes.items()):
+        n = _prefixe_commun([tokens for tokens, _, _ in groupe])
+        branche = Node(".".join(groupe[0][0][:n]), parent=parent)
+        _construire([(t[n:], c, a) for t, c, a in groupe], branche)
+
+
+def _prefixe_commun(chemins):
+    """Nombre de tokens de tête identiques (insensible à la casse) à tous les chemins."""
+    n = 0
+    for tokens in zip(*chemins):                     # s'arrête au chemin le plus court
+        if len({t.lower() for t in tokens}) > 1:
+            break
+        n += 1
+    return n
+
+
+def _creer_feuille(code, applics, parent):
+    feuille = Node(code, parent=parent)
+    feuille.dm_code = code
+    feuille.feuille = True
+    feuille.statut = "FEUILLE"
+    feuille.applics = applics
+    sans_applic = applics.get(None)                  # rétro-compat doc_v1 / doc_v2
+    if sans_applic:
+        feuille.doc_v1 = sans_applic["v1"]
+        feuille.doc_v2 = sans_applic["v2"]
+    return feuille
+
+
+
+
+
+
+
+
+
+
 from bs4 import BeautifulSoup
 
 with open("DMC-....xml", encoding="utf-8") as f:
