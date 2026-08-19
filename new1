@@ -1,5 +1,140 @@
 
 
+
+import re
+import unicodedata
+from collections import defaultdict
+from typing import List
+
+TOKENS_PARASITES = {'-', '/', '|', '—', '.', '>', '→', '->'}
+
+
+class Node:
+    def __init__(self, name, parent=None):
+        self.name = name
+        self.parent = parent
+        self.children = []
+        if parent:
+            parent.children.append(self)
+        self.dm_code = None
+        self.feuille = False
+        self.patches = []
+        self.statut = "BRANCHE"
+        self.tokens_cumules = 0
+        self.doc_v1 = None
+        self.doc_v2 = None
+        self.md_out = None
+
+    @property
+    def descendants(self):
+        nodes = []
+        for child in self.children:
+            nodes.append(child)
+            nodes.extend(child.descendants)
+        return nodes
+
+    @property
+    def path(self):
+        path = []
+        current = self
+        while current:
+            path.insert(0, current)
+            current = current.parent
+        return path
+
+    @property
+    def depth(self):
+        return len(self.path) - 1
+
+
+# ---------------------------------------------------------------- utilitaires
+
+def normaliser(ligne):
+    if not ligne:
+        return []
+    ligne = unicodedata.normalize('NFKC', ligne.splitlines()[0])
+    ligne = re.sub(r'\s+', ' ', ligne).strip()
+    return [t for t in ligne.split(' ') if t and t not in TOKENS_PARASITES]
+
+
+def extraire(dico):
+    return [d for d in dico if d["type"] == "XML_procedure"]
+
+
+def extraire_desc(dico):
+    return [d for d in dico if d["type"] == "XML_description"]
+
+
+def separer_en_set(feuilles: List[Node]) -> tuple:
+    common_set = [f for f in feuilles if f.doc_v1 is not None and f.doc_v2 is not None]
+    added_set = [f for f in feuilles if f.doc_v1 is None and f.doc_v2 is not None]
+    delet_set = [f for f in feuilles if f.doc_v1 is not None and f.doc_v2 is None]
+    return common_set, added_set, delet_set
+
+
+# ------------------------------------------------------------- construction
+
+def construire_arbre(dico, dico_v2):
+    """1. Set des (DM_code, titre) et une feuille par DM_code avec ses docs.
+       2. Arbre construit sur les titres splittes."""
+    feuilles = {}
+    for docs, champ in ((dico, "doc_v1"), (dico_v2, "doc_v2")):
+        for d in docs:
+            code = d["extra_information"]["DM_code"]
+            if code not in feuilles:
+                f = feuilles[code] = Node(code)
+                f.dm_code, f.feuille, f.statut = code, True, "FEUILLE"
+                f.mots = normaliser(d["extra_information"]["DM_title"])
+            setattr(feuilles[code], champ, d)
+
+    racine = Node("ROOT")
+    construire(sorted(feuilles.values(), key=lambda f: f.mots), racine)
+    return racine
+
+
+def construire(feuilles, parent, i=0):
+    """Prend la 1re feuille, regarde qui a le meme i-eme mot :
+       - personne -> feuille directe sous parent
+       - d'autres -> un noeud avec tout le prefixe commun, et on recommence dessous
+       Puis on passe a la suivante non encore traitee, et ainsi de suite."""
+    restantes = list(feuilles)
+    while restantes:
+        premiere = restantes[0]
+        if i >= len(premiere.mots):                                # plus de mot -> feuille
+            groupe = [premiere]
+        else:
+            groupe = [f for f in restantes
+                      if i < len(f.mots) and f.mots[i].lower() == premiere.mots[i].lower()]
+        restantes = [f for f in restantes if f not in groupe]
+
+        if len(groupe) == 1:                                       # seul -> feuille
+            premiere.parent = parent
+            parent.children.append(premiere)
+            continue
+
+        n = i + 1                                                  # prefixe le plus long
+        while all(len(f.mots) > n and f.mots[n].lower() == premiere.mots[n].lower()
+                  for f in groupe):
+            n += 1
+        construire(groupe, Node(" ".join(premiere.mots[i:n]), parent=parent), n)
+
+
+def feuilles(racine):
+    return [n for n in racine.descendants if n.feuille]
+
+
+def afficher(node, niveau=0):
+    print("  " * niveau + f"{node.name} [{node.statut}]")
+    for child in node.children:
+        afficher(child, niveau + 1)
+
+
+# --------------------------------------------------------------- utilisation
+# racine = construire_arbre(extraire(dico), extraire(dico_v2))
+# common_set, added_set, delet_set = separer_en_set(feuilles(racine))
+# afficher(racine)
+
+
 import re
 import unicodedata
 from collections import defaultdict
