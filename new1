@@ -1,3 +1,10 @@
+d1 = {d['extra_information']['DM_title']: d['extra_information']['DM_code'] for d in dico}
+d2 = {d['extra_information']['DM_title']: d['extra_information']['DM_code'] for d in dico_v2}
+
+problemes = {t: (d1[t], d2[t]) for t in titre.intersection(titre_v2) if d1.get(t) != d2.get(t)}
+print(problemes)
+
+
 
 import pandas as pd
 
