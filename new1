@@ -1,3 +1,23 @@
+
+
+titres = set_titres(extraire(dico), extraire(dico_v2))
+arbre = arbre_titres(titres)
+
+print(len(titres), "titres ->", compter_chemins(arbre), "chemins")
+
+def titres_dans(arbre):
+    poses = set()
+    for n in arbre.values():
+        poses |= n["titres"] | titres_dans(n["fils"])
+    return poses
+
+manquants = titres - titres_dans(arbre)
+print(len(manquants), "titres perdus :")
+for t in list(manquants)[:10]:
+    print("   ", repr(t))
+
+
+
 import re
 import unicodedata
 
