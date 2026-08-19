@@ -1,4 +1,23 @@
 
+
+from anytree import Node, RenderTree
+
+# Vos chemins avec un espace comme séparateur
+paths = ["Dossier1 SousDossier1 Fichier1", "Dossier1 SousDossier1 Fichier2", "Dossier2 Fichier3"]
+
+nodes = {}
+for path in paths:
+    parts = path.split(' ')
+    for i in range(len(parts)):
+        parent_path = ' '.join(parts[:i])
+        current_path = ' '.join(parts[:i+1])
+        if current_path not in nodes:
+            nodes[current_path] = Node(parts[i], parent=nodes.get(parent_path))
+
+# Affichage de l'arbre
+print(RenderTree(nodes[paths[0].split(' ')[0]]))
+
+
 def normaliser(titre):
     titre = unicodedata.normalize('NFKC', titre.splitlines()[0])
     titre = re.sub(r'\s+', ' ', titre).strip()
