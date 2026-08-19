@@ -1,4 +1,20 @@
 
+def normaliser(titre):
+    titre = unicodedata.normalize('NFKC', titre.splitlines()[0])
+    titre = re.sub(r'\s+', ' ', titre).strip()
+    return " ".join(t for t in titre.split(' ') if t and t not in TOKENS_PARASITES)
+
+def set_titres(dico, dico_v2):
+    return {normaliser(d["extra_information"]["DM_title"]) for d in dico + dico_v2}
+
+def arbre_titres(titres):
+    trie = pygtrie.StringTrie(separator=" ")
+    for titre in titres:
+        trie[titre] = True
+    return trie
+
+
+
 import re
 import unicodedata
 from collections import defaultdict
