@@ -1,5 +1,137 @@
 
 
+from lxml import etree
+
+# Ordre officiel des attributs du dmcode S1000D
+DMCODE_ATTRS = ["modelic", "sdc", "chapnum", "systemdiffcode", "systemcode",
+                "subsystemcode", "subsubsystemcode", "assycode", "disassycode",
+                "disassycodevariant", "infocode", "infocodevariant", "itemlocationcode"]
+
+
+class Node:
+    def __init__(self, name, parent=None):
+        self.name = name
+        self.parent = parent
+        self.children = []
+        if parent:
+            parent.children.append(self)
+        self.dm_code = None
+        self.feuille = False
+        self.patches = []
+        self.statut = "BRANCHE"
+        self.tokens_cumules = 0
+        self.doc_v1 = None
+        self.doc_v2 = None
+        self.md_out = None
+
+    @property
+    def descendants(self):
+        nodes = []
+        for child in self.children:
+            nodes.append(child)
+            nodes.extend(child.descendants)
+        return nodes
+
+    @property
+    def path(self):
+        path = []
+        current = self
+        while current:
+            path.insert(0, current)
+            current = current.parent
+        return path
+
+    @property
+    def depth(self):
+        return len(self.path) - 1
+
+
+def _texte(element, balise):
+    """Texte de la premiere balise fille portant ce nom, sinon ''."""
+    trouve = element.find(f".//{balise}")
+    return (trouve.text or "").strip() if trouve is not None else ""
+
+
+def dm_code(dmcode):
+    """Reconstitue le DM_code depuis les attributs de <dmcode>."""
+    return "-".join(dmcode.get(a) for a in DMCODE_ATTRS if dmcode.get(a))
+
+
+def parser_pm(chemin_pm):
+    """Parse un Publication Module S1000D et renvoie l'arbre en Node.
+    <pmentry> -> branche (nom = pmentrytitle), <dmref> -> feuille (nom = dmtitle)."""
+    arbre = etree.parse(chemin_pm)
+    racine = Node(_texte(arbre.getroot(), "pmtitle") or "ROOT")
+
+    def descendre(element, parent):
+        for enfant in element:
+            if enfant.tag == "pmentry":
+                titre = _texte(enfant, "pmentrytitle")
+                descendre(enfant, Node(titre, parent=parent))
+            elif enfant.tag == "dmref":
+                dmcode = enfant.find(".//dmcode")
+                if dmcode is None:
+                    continue
+                code = dm_code(dmcode)
+                titre = " - ".join(t for t in (_texte(enfant, "techname"),
+                                               _texte(enfant, "infoname")) if t)
+                feuille = Node(titre or code, parent=parent)
+                feuille.dm_code = code
+                feuille.feuille = True
+                feuille.statut = "FEUILLE"
+
+    contenu = arbre.getroot().find(".//content")
+    descendre(contenu, racine)
+    return racine
+
+
+def remplir(racine, dico, dico_v2):
+    """Raccroche les documents des deux versions aux feuilles, par DM_code."""
+    for docs, champ in ((dico, "doc_v1"), (dico_v2, "doc_v2")):
+        par_code = {}
+        for d in docs:
+            par_code.setdefault(d["extra_information"]["DM_code"], []).append(d)
+        for f in feuilles(racine):
+            trouves = par_code.get(f.dm_code)
+            if trouves:
+                setattr(f, champ, trouves[0] if len(trouves) == 1 else fusionner(trouves))
+    return racine
+
+
+def fusionner(docs):
+    fusion = dict(docs[0])
+    fusion["content"] = "\n".join(str(d.get("content") or "") for d in docs)
+    fusion["length"] = sum(int(d.get("length") or 0) for d in docs)
+    return fusion
+
+
+def feuilles(racine):
+    return [n for n in racine.descendants if n.feuille]
+
+
+def separer_en_set(feuilles):
+    common_set = [f for f in feuilles if f.doc_v1 is not None and f.doc_v2 is not None]
+    added_set = [f for f in feuilles if f.doc_v1 is None and f.doc_v2 is not None]
+    delet_set = [f for f in feuilles if f.doc_v1 is not None and f.doc_v2 is None]
+    return common_set, added_set, delet_set
+
+
+def afficher(node, niveau=0):
+    print("  " * niveau + f"{node.name} [{node.statut}]" +
+          (f" {node.dm_code}" if node.dm_code else ""))
+    for child in node.children:
+        afficher(child, niveau + 1)
+
+
+# --------------------------------------------------------------- utilisation
+# racine = parser_pm("DMC-MANPADSFUNG-A-01-00-00-02A-920A-A_001-00_EN-US.xml")
+# remplir(racine, extraire(dico), extraire(dico_v2))
+# afficher(racine)
+# common_set, added_set, delet_set = separer_en_set(feuilles(racine))
+
+
+
+
 titres = set_titres(extraire(dico), extraire(dico_v2))
 arbre = arbre_titres(titres)
 
