@@ -1,4 +1,646 @@
 
+
+"""
+Structure de données décrivant complètement une procédure S1000D.
+
+Reprend la logique de XmlCssParser (parse_procedure_*) mais renvoie des objets
+au lieu de chaînes concaténées. Les méthodes de bas niveau du parser existant
+(parse_para, parse_table, parse_dmref, parse_warning...) sont réutilisées telles
+quelles via l'instance passée au constructeur : rien n'est dupliqué.
+
+Usage:
+    parser = XmlCssParser(xml_file, **dicts)
+    proc = ProcedureBuilder(parser).build(node_procedure, dm_title)
+    proc.duration_total          # -> 2.75
+    proc.equipments[0].name      # -> "Clé dynamométrique 30Nm"
+    proc.walk_steps()            # -> itérateur à plat sur toutes les étapes
+    proc.to_chunks()             # -> les 5 chunks texte d'origine
+"""
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+from bs4 import Tag
+
+
+# =============================================================================
+# 1. Les briques élémentaires
+# =============================================================================
+
+
+@dataclass
+class Duration:
+    """productionmaintdata/taskduration — durées en heures décimales."""
+
+    startup: float = 0.0
+    procedure: float = 0.0
+    closeup: float = 0.0
+
+    @property
+    def total(self) -> float:
+        return self.startup + self.procedure + self.closeup
+
+
+@dataclass
+class Threshold:
+    """productionmaintdata/thresholdinterval — intervalle de maintenance."""
+
+    value: str = ""
+    unit_code: str = ""          # "th01"
+    unit_label: str = ""         # "Heures de vol"
+
+
+@dataclass
+class Person:
+    """reqpersons/personnel."""
+
+    num: int = 1
+    category: str = ""           # personcategorycode
+    skill_code: str = ""         # "sk02"
+    skill_label: str = ""        # "Intermédiaire"
+    time: str = ""               # brut ou formaté "1h 30min"
+    time_hours: Optional[float] = None
+
+
+@dataclass
+class Item:
+    """
+    Élément matériel requis. Couvre les trois cas du code d'origine, qui ne
+    diffèrent que par la balise et le dictionnaire de résolution :
+        - supportequipdescr -> tools_dict     (kind="equipment")
+        - supplydescr       -> supplies_dict  (kind="supply")
+        - sparedescr        -> parts_dict     (kind="spare")
+    """
+
+    kind: str = ""
+    name: str = ""
+    ref: str = ""                # "F0120 - 45B"
+    manufacturer_code: str = ""
+    number: str = ""
+    quantity: str = ""
+    remark: str = ""
+    source: str = ""             # "cir" | "catalog" | "inline" | "unknown"
+    ref_id: str = ""             # id CIR ou code catalogue ayant servi à résoudre
+    resolved: bool = True        # False si la clé était absente du dictionnaire
+
+
+@dataclass
+class Condition:
+    """reqcond, éventuellement porté par un reqconddm (donc avec un dmref)."""
+
+    text: str = ""
+    dm_ref: str = ""             # "Voir XXX-... titre"
+
+
+@dataclass
+class Safety:
+    """reqsafety : warnings/cautions inline + refs vers le CIR."""
+
+    warnings: List[str] = field(default_factory=list)
+    cautions: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+    referenced: List[str] = field(default_factory=list)
+
+    @property
+    def is_empty(self) -> bool:
+        return not (self.warnings or self.cautions or self.notes or self.referenced)
+
+
+@dataclass
+class Step:
+    """
+    proceduralstep, récursif. `number` est le prefix numéroté calculé comme dans
+    parse_procedural_step ("2.1.3."), `blocks` garde le contenu typé plutôt
+    qu'une chaîne unique, ce qui permet de filtrer (ex: toutes les tables).
+    """
+
+    number: str = ""
+    title: str = ""
+    blocks: List[Tuple[str, str]] = field(default_factory=list)  # (type, texte)
+    substeps: List["Step"] = field(default_factory=list)
+
+    @property
+    def depth(self) -> int:
+        return self.number.rstrip(".").count(".")
+
+    def text(self) -> str:
+        head = f"{self.number} {self.title}:\n" if self.title else f"{self.number} "
+        return head + "".join(t for _, t in self.blocks)
+
+
+# =============================================================================
+# 2. La procédure complète
+# =============================================================================
+
+
+@dataclass
+class Procedure:
+    dm_code: str = ""
+    dm_title: str = ""
+    subpart: str = ""                          # chemin du fichier dans le zip
+    applic: Optional[Tuple[str, str]] = None   # (applic_id, nom) ou None
+
+    # --- preliminaryrqmts ---
+    threshold: Optional[Threshold] = None
+    duration: Duration = field(default_factory=Duration)
+    persons: List[Person] = field(default_factory=list)
+    conditions: List[Condition] = field(default_factory=list)
+    equipments: List[Item] = field(default_factory=list)
+    supplies: List[Item] = field(default_factory=list)
+    spares: List[Item] = field(default_factory=list)
+    safety: Safety = field(default_factory=Safety)
+
+    # --- mainprocedure ---
+    steps: List[Step] = field(default_factory=list)
+    intro_tables: List[str] = field(default_factory=list)
+
+    # --- closerqmts ---
+    close_conditions: List[Condition] = field(default_factory=list)
+
+    # ------------------------------------------------------------------
+    # Accesseurs utiles
+    # ------------------------------------------------------------------
+
+    def walk_steps(self) -> Iterator[Step]:
+        """Parcours en profondeur de toutes les étapes, sous-étapes incluses."""
+
+        def _walk(steps):
+            for s in steps:
+                yield s
+                yield from _walk(s.substeps)
+
+        yield from _walk(self.steps)
+
+    @property
+    def step_count(self) -> int:
+        return sum(1 for _ in self.walk_steps())
+
+    @property
+    def max_depth(self) -> int:
+        return max((s.depth for s in self.walk_steps()), default=0)
+
+    @property
+    def all_items(self) -> List[Item]:
+        return self.equipments + self.supplies + self.spares
+
+    @property
+    def unresolved_items(self) -> List[Item]:
+        """Références introuvables dans les dictionnaires : à logguer/corriger."""
+        return [i for i in self.all_items if not i.resolved]
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "dm_code": self.dm_code,
+            "subpart": self.subpart,
+            "applic": self.applic,
+            "duration_total": self.duration.total,
+            "n_persons": sum(p.num for p in self.persons),
+            "n_equipments": len(self.equipments),
+            "n_supplies": len(self.supplies),
+            "n_spares": len(self.spares),
+            "n_steps": self.step_count,
+            "max_depth": self.max_depth,
+            "has_safety": not self.safety.is_empty,
+            "n_unresolved": len(self.unresolved_items),
+        }
+
+
+# =============================================================================
+# 3. Le constructeur — réutilise le parser existant
+# =============================================================================
+
+
+class ProcedureBuilder:
+    """
+    Construit un objet Procedure à partir d'un node <procedure>.
+    S'appuie sur une instance XmlCssParser déjà initialisée (dictionnaires CIR,
+    internal_refs, threshold_dict, skills_dict).
+    """
+
+    def __init__(self, parser):
+        self.p = parser
+
+    # ---------------------------------------------------------------- public
+
+    def build(
+        self,
+        node_procedure: Tag,
+        dm_title: str,
+        dm_code: str = "",
+        applic: Optional[Tuple[str, str]] = None,
+    ) -> Procedure:
+        proc = Procedure(dm_code=dm_code, dm_title=dm_title, applic=applic)
+
+        node_prereq = node_procedure.find("preliminaryrqmts")
+        node_main = node_procedure.find("mainprocedure")
+        node_close = node_procedure.find("closerqmts")
+
+        if node_prereq is not None:
+            self._build_prereq(node_prereq, proc)
+        if node_main is not None:
+            self._build_main(node_main, proc)
+        if node_close is not None:
+            proc.close_conditions = self._conditions(node_close)
+
+        return proc
+
+    # -------------------------------------------------------------- prereq
+
+    def _build_prereq(self, node_prereq: Tag, proc: Procedure) -> None:
+        node_info = node_prereq.find("productionmaintdata")
+        if node_info is not None:
+            proc.threshold = self._threshold(node_info)
+            proc.duration = self._duration(node_info)
+
+        node_conditions = node_prereq.find("reqcondgroup")
+        if node_conditions is not None:
+            proc.conditions = self._conditions(node_conditions)
+
+        node_persons = node_prereq.find("reqpersons")
+        if node_persons is not None:
+            proc.persons = self._persons(node_persons)
+
+        proc.equipments = self._items(
+            node_prereq.find("reqsupportequips"),
+            tag="supportequipdescr",
+            kind="equipment",
+        )
+        proc.supplies = self._items(
+            node_prereq.find("reqsupplies"), tag="supplydescr", kind="supply"
+        )
+        proc.spares = self._items(
+            node_prereq.find("reqspares"), tag="sparedescr", kind="spare"
+        )
+
+        node_safety = node_prereq.find("reqsafety")
+        if node_safety is not None:
+            proc.safety = self._safety(node_safety)
+
+    def _threshold(self, node_info: Tag) -> Optional[Threshold]:
+        node = node_info.find("thresholdinterval")
+        if node is None:
+            return None
+        code = node.get("thresholdunitofmeasure", "")
+        return Threshold(
+            value=node.text.strip(),
+            unit_code=code,
+            unit_label=self.p.threshold_dict.get(code, ""),
+        )
+
+    @staticmethod
+    def _to_float(raw: Optional[str]) -> float:
+        if not raw:
+            return 0.0
+        try:
+            return float(raw.strip().replace(",", "."))
+        except ValueError:
+            return 0.0
+
+    def _duration(self, node_info: Tag) -> Duration:
+        node = node_info.find("taskduration")
+        if node is None:
+            return Duration()
+        return Duration(
+            startup=self._to_float(node.get("startupduration")),
+            procedure=self._to_float(node.get("procedureduration")),
+            closeup=self._to_float(node.get("closeupduration")),
+        )
+
+    def _persons(self, node_persons: Tag) -> List[Person]:
+        out = []
+        for node in node_persons.find_all("personnel"):
+            skill_code = ""
+            node_skill = node.find("personskill")
+            if node_skill is not None:
+                skill_code = node_skill.get("skilllevelcode", "")
+
+            raw_time = ""
+            node_time = node.find("estimatedtime")
+            if node_time is not None:
+                raw_time = node_time.text
+
+            hours = None
+            if raw_time.replace(".", "").isnumeric():
+                hours = float(raw_time)
+
+            cat_node = node.find("personcategory")
+            out.append(
+                Person(
+                    num=int(node.get("numrequired", 1)),
+                    category=cat_node["personcategorycode"] if cat_node else "",
+                    skill_code=skill_code,
+                    skill_label=self.p.skills_dict.get(skill_code, ""),
+                    time=raw_time,
+                    time_hours=hours,
+                )
+            )
+        return out
+
+    def _conditions(self, node_group: Tag) -> List[Condition]:
+        out = []
+        for node_req in node_group.find_all("reqcond"):
+            cond = Condition(
+                text=self.p.parse_para(node_req, list_level=0).rstrip("\n")
+            )
+            if node_req.parent.name == "reqconddm":
+                node_ref = node_req.parent.find("dmref")
+                if node_ref is not None:
+                    cond.dm_ref = self.p.parse_dmref(node_ref)
+            out.append(cond)
+        return out
+
+    # --------------------------------------------------------------- items
+
+    def _items(self, node_group: Optional[Tag], tag: str, kind: str) -> List[Item]:
+        if node_group is None:
+            return []
+        return [self._item(node, kind) for node in node_group.find_all(tag)]
+
+    def _item(self, node: Tag, kind: str) -> Item:
+        """
+        Reprend exactement la cascade de résolution du code d'origine :
+        CIR -> catalogue -> attributs fabricant inline.
+        """
+        cfg = {
+            "equipment": ("toolref", "toolnumber", "tools_dict", "tool_number"),
+            "supply": ("supplyref", "supplynumber", "supplies_dict", "supply_number"),
+            "spare": ("partref", "partnumbervalue", "parts_dict", "part_number"),
+        }[kind]
+        ref_tag, ref_attr, dict_name, number_key = cfg
+        registry = getattr(self.p, dict_name)
+
+        item = Item(kind=kind)
+
+        node_ref = node.find(ref_tag)
+        if node_ref is not None:
+            # --- cas CIR ---
+            item.source = "cir"
+            item.ref_id = node_ref.get(ref_attr, "")
+            data = registry.get(item.ref_id)
+            if data:
+                item.name = data["name"]
+                item.manufacturer_code = data["manufacturer_code"]
+                item.number = data[number_key]
+                item.ref = f"{item.manufacturer_code} - {item.number}"
+            else:
+                item.resolved = False
+                item.name = item.ref_id
+                item.ref = "NO REF"
+        else:
+            # --- cas catalogue / inline ---
+            name_node = node.find("name")
+            item.name = name_node.text if name_node is not None else ""
+            item.ref = "NO REF"
+
+            node_code = node.find("catalogseqnumberref")
+            code = read_catalog_code(node_code, None) if node_code else "NO CODE"
+            item.ref_id = code
+
+            if code in self.p.catalog_dict:
+                item.source = "catalog"
+                data = self.p.catalog_dict[code]
+                item.manufacturer_code = data["part_ref"]
+                item.number = data["part_number"]
+                item.ref = f"{item.manufacturer_code} - {item.number}"
+            else:
+                node_manuf = node.find("manufacturercode")
+                node_part = node.find("partnumber")
+                if node_manuf is not None and node_part is not None:
+                    item.source = "inline"
+                    item.manufacturer_code = node_manuf.text
+                    item.number = node_part.text
+                    item.ref = f"{item.manufacturer_code} - {item.number}"
+                else:
+                    item.source = "unknown"
+                    item.resolved = False
+
+        node_qty = node.find("reqquantity")
+        item.quantity = node_qty.text if node_qty is not None else ""
+
+        node_remarks = node.find("remarks")
+        if node_remarks is not None:
+            remark = node_remarks.find("simplepara")
+            if remark is not None:
+                item.remark = remark.text.strip()
+
+        return item
+
+    # -------------------------------------------------------------- safety
+
+    def _safety(self, node_safety: Tag) -> Safety:
+        s = Safety(
+            warnings=[self.p.parse_warning(n) for n in node_safety.find_all("warning")],
+            cautions=[self.p.parse_caution(n) for n in node_safety.find_all("caution")],
+            notes=[self.p.parse_note(n) for n in node_safety.find_all("note")],
+        )
+        node_rqmts = node_safety.find("safetyrqmts")
+        if node_rqmts is not None:
+            for attr in ("warningrefs", "cautionrefs"):
+                if attr in node_rqmts.attrs:
+                    for ref in node_rqmts[attr].split(" "):
+                        if ref in self.p.internal_refs:
+                            s.referenced.append(self.p.internal_refs[ref])
+        return s
+
+    # ---------------------------------------------------------------- steps
+
+    def _build_main(self, node_main: Tag, proc: Procedure) -> None:
+        index = 1
+        for node in node_main.children:
+            if node.name is None:
+                continue
+            if node.name == "table":
+                proc.intro_tables.append(self.p.parse_table(node))
+            elif node.name == "proceduralstep":
+                proc.steps.append(self._step(node, index, ""))
+                index += 1
+
+    def _step(self, node_step: Tag, index: int, prefix: str) -> Step:
+        title_node = node_step.find("title")
+        step = Step(
+            number=f"{prefix}{index}.",
+            title=title_node.text.strip() if title_node is not None else "",
+        )
+
+        sub_prefix = f"{prefix}{index}."
+        sub_index = 0
+        handlers = {
+            "para": lambda n: self.p.parse_para(n, list_level=0),
+            "table": self.p.parse_table,
+            "note": self.p.parse_note,
+            "figure": self.p.parse_figure,
+            "warning": self.p.parse_warning,
+            "caution": self.p.parse_caution,
+        }
+
+        for node in node_step.children:
+            if node.name is None:
+                continue
+            if node.name == "proceduralstep":
+                sub_index += 1
+                step.substeps.append(self._step(node, sub_index, sub_prefix))
+            elif node.name in handlers:
+                step.blocks.append((node.name, handlers[node.name](node)))
+
+        return step
+
+
+# =============================================================================
+# 4. Détection : le DM est-il une procédure ?
+# =============================================================================
+
+
+def is_procedure(xml_file: BeautifulSoup) -> bool:
+    """
+    Même forme que is_catalog / is_tool_repo / is_supply_repo du fichier
+    d'origine, mais le test porte sur le noeud <procedure> à l'intérieur de
+    <content> — c'est exactement le test utilisé par XmlCssParser.parse_content
+    pour router vers parse_procedure.
+    """
+    node_content = xml_file.find("content")
+    if node_content is None:
+        return False
+
+    return node_content.find("procedure") is not None
+
+
+# =============================================================================
+# 5. Le point d'entrée : même boucle que parse_xml_css
+# =============================================================================
+
+
+def parse_procedures(zip_folder: NamedTemporaryFile) -> List[Procedure]:
+    """
+    Reprend la boucle de parse_xml_css (y compris la gestion des applicabilités
+    via fill_dict_of_applic / filter_by_applic_id), mais ne retient que les
+    Data Modules de type procédure et renvoie des objets Procedure au lieu de
+    chunks texte.
+
+    Args:
+        zip_folder: zip contenant les fichiers XML CSS
+
+    Returns: la liste des procédures du manuel
+
+    """
+    # Passe 1 : identique à parse_xml_css, les CIR doivent être lus avant.
+    xml_dicts = build_dictionaries(zip_folder)
+    list_procedures = []
+
+    # Passe 2 : boucle sur les DM
+    with zipfile.ZipFile(zip_folder, "r") as zip_ref:
+        for file_name in zip_ref.namelist():
+            name = file_name.split("/")[-1]
+            if not (name.endswith(".xml") and name.startswith("DMC")):
+                continue
+
+            with zip_ref.open(file_name) as f:
+                filehandle = io.TextIOWrapper(f, encoding="utf-8")
+                c = unicodedata.normalize("NFKC", filehandle.read())
+
+                xml_file = BeautifulSoup(c, "lxml")
+                dm_title, code = read_code_and_title(xml_file)
+                dict_of_applic = {}
+
+                # Même filtre que build_dictionaries : IPC non chapitrés écartés
+                if "Z" in code:
+                    continue
+
+                # On ne garde que les procédures : CIR, catalogues et
+                # descriptions sont ignorés ici.
+                if not is_procedure(xml_file):
+                    continue
+
+                if fill_dict_of_applic(xml_file, dict_of_applic):
+                    applic_files = filter_by_applic_id(xml_file, dict_of_applic)
+
+                    for applic, (name_applic, file) in applic_files.items():
+                        list_procedures.append(
+                            _build_procedure(
+                                file,
+                                xml_dicts,
+                                code=code,
+                                applic=(applic, name_applic),
+                                subpart=file_name,
+                            )
+                        )
+                else:
+                    list_procedures.append(
+                        _build_procedure(
+                            xml_file,
+                            xml_dicts,
+                            code=code,
+                            applic=None,
+                            subpart=file_name,
+                        )
+                    )
+
+    return list_procedures
+
+
+def _build_procedure(
+    xml_file: BeautifulSoup,
+    xml_dicts: Dict,
+    code: str,
+    applic: Optional[Tuple[str, str]],
+    subpart: str,
+) -> Procedure:
+    """
+    Bloc commun aux deux branches de parse_procedures : instancie le parser
+    d'origine (inchangé) puis construit l'objet Procedure.
+    Le dm_title est repris de parser.dm_title, comme dans parse_content.
+    """
+    parser = XmlCssParser(
+        xml_file,
+        dm_refs=xml_dicts["dm_dict"],
+        tools_dict=xml_dicts["tools_dict"],
+        supplies_dict=xml_dicts["supplies_dict"],
+        catalog_dict=xml_dicts["catalog_dict"],
+        parts_dict=xml_dicts["parts_dict"],
+        warnings_dict=xml_dicts["warnings_dict"],
+        cautions_dict=xml_dicts["cautions_dict"],
+    )
+
+    node_procedure = xml_file.find("content").find("procedure")
+
+    proc = ProcedureBuilder(parser).build(
+        node_procedure,
+        dm_title=parser.dm_title,
+        dm_code=code,
+        applic=applic,
+    )
+    proc.subpart = subpart
+
+    return proc
+
+
+# =============================================================================
+# 6. Vue d'ensemble sur tout le dossier
+# =============================================================================
+
+
+def procedures_report(list_procedures: List[Procedure]) -> Dict[str, Any]:
+    """Contrôle rapide après un passage sur un zip complet."""
+    unresolved = [
+        (p.dm_code, p.applic, i.kind, i.ref_id)
+        for p in list_procedures
+        for i in p.unresolved_items
+    ]
+    return {
+        "n_procedures": len(list_procedures),
+        "n_avec_applic": sum(1 for p in list_procedures if p.applic),
+        "duree_totale_h": round(sum(p.duration.total for p in list_procedures), 2),
+        "n_etapes": sum(p.step_count for p in list_procedures),
+        "profondeur_max": max((p.max_depth for p in list_procedures), default=0),
+        "sans_etapes": [p.dm_code for p in list_procedures if p.step_count == 0],
+        "references_non_resolues": unresolved,
+    }
+
+
+
+
+
+
+
 """
 Structure de données décrivant complètement une procédure S1000D.
 
