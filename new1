@@ -2,6 +2,42 @@
 
 from lxml import etree
 
+DMCODE_ATTRS = ["modelic", "sdc", "chapnum", "systemdiffcode", "systemcode",
+                "subsystemcode", "subsubsystemcode", "assycode", "disassycode",
+                "disassycodevariant", "infocode", "infocodevariant", "itemlocationcode"]
+
+
+def _texte(element, balise):
+    trouve = element.find(f".//{balise}")
+    return (trouve.text or "").strip() if trouve is not None else ""
+
+
+def parser_pm(chemin_pm):
+    """Parse le Publication Module : <pmentry> -> branche, <dmref> -> feuille."""
+    arbre = etree.parse(chemin_pm)
+    racine = Node(_texte(arbre.getroot(), "pmtitle") or "ROOT")
+
+    def descendre(element, parent):
+        for enfant in element:
+            if enfant.tag == "pmentry":
+                descendre(enfant, Node(_texte(enfant, "pmentrytitle"), parent=parent))
+            elif enfant.tag == "dmref":
+                dmcode = enfant.find(".//dmcode")
+                if dmcode is None:
+                    continue
+                code = "-".join(dmcode.get(a) for a in DMCODE_ATTRS if dmcode.get(a))
+                titre = " - ".join(t for t in (_texte(enfant, "techname"),
+                                               _texte(enfant, "infoname")) if t)
+                feuille = Node(titre or code, parent=parent)
+                feuille.dm_code, feuille.feuille, feuille.statut = code, True, "FEUILLE"
+
+    descendre(arbre.getroot().find(".//content"), racine)
+    return racine
+
+
+
+from lxml import etree
+
 # Ordre officiel des attributs du dmcode S1000D
 DMCODE_ATTRS = ["modelic", "sdc", "chapnum", "systemdiffcode", "systemcode",
                 "subsystemcode", "subsubsystemcode", "assycode", "disassycode",
