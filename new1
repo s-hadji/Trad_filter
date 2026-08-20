@@ -1,4 +1,13 @@
 
+def dm_code(c):
+    """MANPADSFUNG-A-00-00-00-11A-000A-A"""
+    g = c.get
+    return (f"{g('modelIdentCode')}-{g('systemDiffCode')}-{g('systemCode')}"
+            f"-{g('subSystemCode')}{g('subSubSystemCode')}-{g('assyCode')}"
+            f"-{g('disassyCode')}{g('disassyCodeVariant')}"
+            f"-{g('infoCode')}{g('infoCodeVariant')}-{g('itemLocationCode')}")
+
+
 from bs4 import BeautifulSoup
 
 DMCODE_ATTRS = ["modelic", "sdc", "chapnum", "systemdiffcode", "systemcode",
