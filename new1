@@ -1,4 +1,38 @@
 
+from bs4 import BeautifulSoup
+
+DMCODE_ATTRS = ["modelic", "sdc", "chapnum", "systemdiffcode", "systemcode",
+                "subsystemcode", "subsubsystemcode", "assycode", "disassycode",
+                "disassycodevariant", "infocode", "infocodevariant", "itemlocationcode"]
+
+
+def parser_pm(chemin_pm):
+    """Parse le Publication Module : <pmentry> -> branche, <dmref> -> feuille."""
+    with open(chemin_pm, encoding="utf-8") as f:
+        soup = BeautifulSoup(f.read(), "xml")
+
+    pmtitle = soup.find("pmtitle")
+    racine = Node(pmtitle.get_text(strip=True) if pmtitle else "ROOT")
+
+    def descendre(element, parent):
+        for enfant in element.find_all(["pmentry", "dmref"], recursive=False):
+            if enfant.name == "pmentry":
+                titre = enfant.find("pmentrytitle", recursive=False)
+                descendre(enfant, Node(titre.get_text(strip=True) if titre else "", parent=parent))
+            else:
+                dmcode = enfant.find("dmcode")
+                if dmcode is None:
+                    continue
+                code = "-".join(dmcode.get(a) for a in DMCODE_ATTRS if dmcode.get(a))
+                mots = [b.get_text(strip=True) for b in
+                        (enfant.find("techname"), enfant.find("infoname")) if b]
+                feuille = Node(" - ".join(m for m in mots if m) or code, parent=parent)
+                feuille.dm_code, feuille.feuille, feuille.statut = code, True, "FEUILLE"
+
+    descendre(soup.find("content"), racine)
+    return racine
+
+
 
 from lxml import etree
 
