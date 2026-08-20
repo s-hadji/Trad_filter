@@ -1,4 +1,15 @@
 
+def applic(doc):
+    a = (doc.get("extra_information") or {}).get("Applic")
+    return tuple(a) if isinstance(a, (list, tuple)) and len(a) == 2 else None
+
+def applics(feuille):
+    """{applic: {'v1': doc | None, 'v2': doc | None}}"""
+    v1 = {applic(d): d for d in feuille.doc_v1}
+    v2 = {applic(d): d for d in feuille.doc_v2}
+    return {a: {"v1": v1.get(a), "v2": v2.get(a)} for a in {*v1, *v2}}
+
+
 def rapport(racine):
     """DM et applics ajoutes / supprimes entre les deux versions."""
     dm_ajoutes, dm_supprimes = [], []
