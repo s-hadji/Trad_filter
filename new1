@@ -1,4 +1,12 @@
 
+def separer_en_set(racine):
+    f = [n for n in racine.descendants if n.feuille]
+    return ([x for x in f if x.doc_v1 and x.doc_v2],          # commun
+            [x for x in f if not x.doc_v1 and x.doc_v2],      # ajoute
+            [x for x in f if x.doc_v1 and not x.doc_v2])      # supprime
+
+
+
 def remplir(racine, dico, dico_v2):
     """doc_v1 / doc_v2 = LISTE des documents de ce dm_code (un par applic), sans fusion.
     Liste vide si le code est absent de la version."""
