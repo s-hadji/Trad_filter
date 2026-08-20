@@ -1,4 +1,53 @@
 
+
+def separer_en_set(racine):
+    """Range chaque feuille dans un set, du plus sain au plus problematique :
+      conformes  : DM present des deux cotes, memes applics
+      fusionnes  : les applics ont ete regroupees en une seule (None apparait) ou eclatees
+      applics    : vraie difference d'applics (ajout ou suppression)
+      dm         : le DM lui-meme a disparu ou ete ajoute
+    Chaque element est (feuille, applics_ajoutees, applics_supprimees)."""
+    conformes, fusionnes, applics_ko, dm_ko = [], [], [], []
+
+    for f in racine.descendants:
+        if not f.feuille:
+            continue
+        v1 = {applic(d) for d in f.doc_v1}
+        v2 = {applic(d) for d in f.doc_v2}
+        ajoutees, supprimees = v2 - v1, v1 - v2
+
+        if not f.doc_v1 or not f.doc_v2:                    # DM absent d'un cote
+            dm_ko.append((f, ajoutees, supprimees))
+        elif not ajoutees and not supprimees:               # tout le monde a son correspondant
+            conformes.append((f, set(), set()))
+        elif (None in ajoutees and supprimees) or (None in supprimees and ajoutees):
+            fusionnes.append((f, ajoutees, supprimees))     # applics regroupees / eclatees
+        else:
+            applics_ko.append((f, ajoutees, supprimees))
+
+    return conformes, fusionnes, applics_ko, dm_ko
+
+
+def afficher_sets(racine):
+    conformes, fusionnes, applics_ko, dm_ko = separer_en_set(racine)
+    total = sum(map(len, (conformes, fusionnes, applics_ko, dm_ko)))
+    print(f"{total} DM : {len(conformes)} conformes, {len(fusionnes)} applics fusionnees/eclatees, "
+          f"{len(applics_ko)} applics modifiees, {len(dm_ko)} DM manquants\n")
+
+    for titre, items in (("APPLICS FUSIONNEES / ECLATEES", fusionnes),
+                         ("APPLICS MODIFIEES", applics_ko),
+                         ("DM AJOUTES / SUPPRIMES", dm_ko)):
+        print(f"--- {titre} ({len(items)}) ---")
+        for f, a, s in items:
+            sens = "" if (f.doc_v1 and f.doc_v2) else ("  [AJOUTE]" if f.doc_v2 else "  [SUPPRIME]")
+            print(f"  {f.dm_code}  {chemin(f)}{sens}")
+            if a:
+                print("      + " + ", ".join(sorted(map(nom_applic, a))))
+            if s:
+                print("      - " + ", ".join(sorted(map(nom_applic, s))))
+        print()
+
+
 def applic(doc):
     a = (doc.get("extra_information") or {}).get("Applic")
     return tuple(a) if isinstance(a, (list, tuple)) and len(a) == 2 else None
