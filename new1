@@ -1,4 +1,18 @@
 
+def remplir(racine, dico, dico_v2):
+    """Range les documents dans doc_v1 / doc_v2 par correspondance de dm_code."""
+    for docs, champ in ((dico, "doc_v1"), (dico_v2, "doc_v2")):
+        par_code = {}
+        for d in docs:
+            par_code.setdefault(d["extra_information"]["DM_code"], []).append(d)
+        for f in racine.descendants:
+            trouves = par_code.get(f.dm_code) if f.feuille else None
+            if trouves:
+                setattr(f, champ, trouves[0] if len(trouves) == 1 else fusionner_docs(trouves))
+    return racine
+
+
+
 def fusionner(racine_v1, racine_v2):
     """Insere l'arbre v2 dans l'arbre v1 : meme dm_code (feuille) ou meme nom (branche).
     Marque v1/v2 sur chaque noeud et renvoie la racine fusionnee."""
