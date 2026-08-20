@@ -1,4 +1,35 @@
 
+def fusionner(racine_v1, racine_v2):
+    """Insere l'arbre v2 dans l'arbre v1 : meme dm_code (feuille) ou meme nom (branche).
+    Marque v1/v2 sur chaque noeud et renvoie la racine fusionnee."""
+    for n in [racine_v1] + racine_v1.descendants:
+        n.v1, n.v2 = True, False
+    racine_v1.v2 = True
+
+    codes = {n.dm_code: n for n in racine_v1.descendants if n.dm_code}
+
+    def copier(node, parent):
+        copie = Node(node.name, parent=parent)
+        copie.dm_code, copie.feuille, copie.statut = node.dm_code, node.feuille, node.statut
+        copie.v1, copie.v2 = False, True
+        for enfant in node.children:
+            copier(enfant, copie)
+
+    def inserer(source, cible):
+        index = {c.name.lower(): c for c in cible.children if not c.dm_code}
+        for enfant in source.children:
+            jumeau = codes.get(enfant.dm_code) if enfant.dm_code else index.get(enfant.name.lower())
+            if jumeau is None:
+                copier(enfant, cible)          # inexistant en v1 : on greffe le sous-arbre
+            else:
+                jumeau.v2 = True               # deja la : on marque et on descend
+                inserer(enfant, jumeau)
+
+    inserer(racine_v2, racine_v1)
+    return racine_v1
+
+
+
 def dm_code(c):
 
     g = c.get
