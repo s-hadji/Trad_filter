@@ -1,14 +1,14 @@
 
 def remplir(racine, dico, dico_v2):
-    """Range les documents dans doc_v1 / doc_v2 par correspondance de dm_code."""
+    """doc_v1 / doc_v2 = LISTE des documents de ce dm_code (un par applic), sans fusion.
+    Liste vide si le code est absent de la version."""
     for docs, champ in ((dico, "doc_v1"), (dico_v2, "doc_v2")):
         par_code = {}
         for d in docs:
             par_code.setdefault(d["extra_information"]["DM_code"], []).append(d)
         for f in racine.descendants:
-            trouves = par_code.get(f.dm_code) if f.feuille else None
-            if trouves:
-                setattr(f, champ, trouves[0] if len(trouves) == 1 else fusionner_docs(trouves))
+            if f.feuille:
+                setattr(f, champ, par_code.get(f.dm_code, []))
     return racine
 
 
