@@ -1,4 +1,26 @@
 
+def rapport(racine):
+    """DM et applics ajoutes / supprimes entre les deux versions."""
+    dm_ajoutes, dm_supprimes = [], []
+    ap_ajoutees, ap_supprimees = [], []
+
+    for f in racine.descendants:
+        if not f.feuille:
+            continue
+        if not f.doc_v1 and f.doc_v2:
+            dm_ajoutes.append(f)
+        elif f.doc_v1 and not f.doc_v2:
+            dm_supprimes.append(f)
+        else:                                  # present des deux cotes : on compare les applics
+            v1 = {applic(d) for d in f.doc_v1}
+            v2 = {applic(d) for d in f.doc_v2}
+            ap_ajoutees += [(f, a) for a in v2 - v1]
+            ap_supprimees += [(f, a) for a in v1 - v2]
+
+    return dm_ajoutes, dm_supprimes, ap_ajoutees, ap_supprimees
+
+
+
 def separer_en_set(racine):
     f = [n for n in racine.descendants if n.feuille]
     return ([x for x in f if x.doc_v1 and x.doc_v2],          # commun
