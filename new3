@@ -1,4 +1,348 @@
 
+"""
+Modèle Procédure v2 — orienté chunks.
+
+Contrairement à la v1 (qui décompose tout en objets : Duration, Person, Item,
+Step...), cette version garde les 5 morceaux de texte produits tels quels par le
+code d'origine :
+
+    parse_procedure_prereq   -> [chunk_init, chunk_means, chunk_safety]
+    parse_procedure_main     -> [chunk_proc]
+    parse_procedure_closereq -> [chunk_close]
+
+On ne réécrit donc AUCUNE logique de parsing : on appelle les méthodes
+existantes de XmlCssParser. Ce qu'on ajoute, c'est le relevé des références
+sortantes (autres DM, outils, consommables, pièces, warnings du CIR) section par
+section — c'est ce qui permet ensuite de câbler le graphe au niveau du chunk et
+pas seulement au niveau du DM.
+"""
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+from bs4 import Tag
+
+# Ordre et noms des 5 sections, dans l'ordre de production du code d'origine.
+SECTION_KINDS = ("init", "means", "safety", "steps", "close")
+
+
+# =============================================================================
+# 1. Références sortantes
+# =============================================================================
+
+
+@dataclass
+class Refs:
+    """Tout ce qu'une section pointe en dehors d'elle-même."""
+
+    dm: List[str] = field(default_factory=list)          # codes DMC (dmref)
+    tools: List[str] = field(default_factory=list)       # toolnumber (CIR)
+    supplies: List[str] = field(default_factory=list)    # supplynumber (CIR)
+    parts: List[str] = field(default_factory=list)       # partnumbervalue (CIR)
+    catalog: List[str] = field(default_factory=list)     # codes catalogue
+    warnings: List[str] = field(default_factory=list)    # warningidentnumber
+    cautions: List[str] = field(default_factory=list)    # cautionidentnumber
+    internal: List[str] = field(default_factory=list)    # internalrefid
+
+    def __add__(self, other: "Refs") -> "Refs":
+        merged = Refs()
+        for f in vars(self):
+            seen = getattr(self, f) + getattr(other, f)
+            setattr(merged, f, list(dict.fromkeys(seen)))  # dédoublonne, garde l'ordre
+        return merged
+
+    def as_dict(self) -> Dict[str, List[str]]:
+        return {k: v for k, v in vars(self).items() if v}
+
+    @property
+    def is_empty(self) -> bool:
+        return not any(vars(self).values())
+
+
+def extract_refs(node: Optional[Tag]) -> Refs:
+    """
+    Relève les références d'un sous-arbre XML. Les clés extraites sont
+    exactement celles que les dictionnaires de build_dictionaries utilisent,
+    donc elles se résolvent directement contre tools_dict, supplies_dict, etc.
+    """
+    refs = Refs()
+    if node is None:
+        return refs
+
+    for n in node.find_all("dmref"):
+        node_code = n.find("dmcode")
+        if node_code is not None:
+            refs.dm.append(parse_dm_code(node_code))
+
+    for tag, attr, target in (
+        ("toolref", "toolnumber", refs.tools),
+        ("supplyref", "supplynumber", refs.supplies),
+        ("partref", "partnumbervalue", refs.parts),
+        ("warningref", "warningidentnumber", refs.warnings),
+        ("cautionref", "cautionidentnumber", refs.cautions),
+        ("internalref", "internalrefid", refs.internal),
+    ):
+        for n in node.find_all(tag):
+            if attr in n.attrs:
+                target.append(n[attr])
+
+    for n in node.find_all("catalogseqnumberref"):
+        refs.catalog.append(read_catalog_code(n, None))
+
+    # warningrefs / cautionrefs portés en attribut (safetyrqmts, levelledpara)
+    for n in node.find_all(attrs={"warningrefs": True}):
+        refs.warnings.extend(n["warningrefs"].split(" "))
+    for n in node.find_all(attrs={"cautionrefs": True}):
+        refs.cautions.extend(n["cautionrefs"].split(" "))
+
+    for f in vars(refs):
+        setattr(refs, f, list(dict.fromkeys(getattr(refs, f))))
+
+    return refs
+
+
+# =============================================================================
+# 2. Le modèle
+# =============================================================================
+
+
+@dataclass
+class Section:
+    kind: str            # "init" | "means" | "safety" | "steps" | "close"
+    text: str
+    refs: Refs = field(default_factory=Refs)
+
+
+@dataclass
+class ProcedureDoc:
+    dm_code: str = ""
+    dm_title: str = ""
+    subpart: str = ""
+    applic: Optional[Tuple[str, str]] = None
+    sections: List[Section] = field(default_factory=list)
+
+    @property
+    def uid(self) -> str:
+        return f"{self.dm_code}#{self.applic[0] if self.applic else 'ALL'}"
+
+    def section(self, kind: str) -> Optional[Section]:
+        return next((s for s in self.sections if s.kind == kind), None)
+
+    @property
+    def refs(self) -> Refs:
+        total = Refs()
+        for s in self.sections:
+            total = total + s.refs
+        return total
+
+    def to_chunks(self) -> List[Dict[str, Any]]:
+        """
+        Format compatible avec le pipeline existant (parse_xml_css), enrichi
+        de la section d'origine et des références du chunk.
+        """
+        return [{
+            "content": s.text,
+            "type": "XML_procedure",
+            "page": -1,
+            "length": len(s.text),
+            "subpart": self.subpart,
+            "extra_information": {
+                "DM_code": self.dm_code,
+                "DM_title": self.dm_title,
+                "Applic": self.applic,
+                "section": s.kind,
+                "refs": s.refs.as_dict(),
+                "chunk_uid": f"{self.uid}#{s.kind}",
+            },
+        } for s in self.sections if s.text.strip()]
+
+
+# =============================================================================
+# 3. Construction : on appelle le parser d'origine, rien de plus
+# =============================================================================
+
+
+def build_procedure_doc(
+    parser,
+    node_procedure: Tag,
+    dm_code: str,
+    subpart: str = "",
+    applic: Optional[Tuple[str, str]] = None,
+) -> ProcedureDoc:
+    title = parser.dm_title
+
+    node_prereq = node_procedure.find("preliminaryrqmts")
+    node_main = node_procedure.find("mainprocedure")
+    node_close = node_procedure.find("closerqmts")
+
+    # --- les 3 chunks du prereq, produits par la méthode d'origine ---
+    if node_prereq is not None:
+        init_txt, means_txt, safety_txt = parser.parse_procedure_prereq(
+            node_prereq, title
+        )
+        # Les refs sont relevées sur les mêmes sous-noeuds que ceux consommés
+        # par parse_procedure_prereq, pour rester alignées avec le texte.
+        init_refs = (
+            extract_refs(node_prereq.find("productionmaintdata"))
+            + extract_refs(node_prereq.find("reqcondgroup"))
+            + extract_refs(node_prereq.find("reqpersons"))
+        )
+        means_refs = (
+            extract_refs(node_prereq.find("reqsupportequips"))
+            + extract_refs(node_prereq.find("reqsupplies"))
+            + extract_refs(node_prereq.find("reqspares"))
+        )
+        safety_refs = extract_refs(node_prereq.find("reqsafety"))
+    else:
+        init_txt = means_txt = safety_txt = ""
+        init_refs = means_refs = safety_refs = Refs()
+
+    # --- le chunk procédure ---
+    main_chunks = parser.parse_procedure_main(node_main, title) if node_main else []
+    steps_txt = main_chunks[0] if main_chunks else ""
+
+    # --- le chunk close ---
+    close_txt = (
+        parser.parse_procedure_closereq(node_close, title)[0] if node_close else ""
+    )
+
+    texts = (init_txt, means_txt, safety_txt, steps_txt, close_txt)
+    all_refs = (
+        init_refs,
+        means_refs,
+        safety_refs,
+        extract_refs(node_main),
+        extract_refs(node_close),
+    )
+
+    return ProcedureDoc(
+        dm_code=dm_code,
+        dm_title=title,
+        subpart=subpart,
+        applic=applic,
+        sections=[
+            Section(kind=k, text=t, refs=r)
+            for k, t, r in zip(SECTION_KINDS, texts, all_refs)
+        ],
+    )
+
+
+# =============================================================================
+# 4. Point d'entrée : même boucle que parse_xml_css
+# =============================================================================
+
+
+def parse_procedure_docs(zip_folder: NamedTemporaryFile) -> List[ProcedureDoc]:
+    xml_dicts = build_dictionaries(zip_folder)
+    docs = []
+
+    with zipfile.ZipFile(zip_folder, "r") as zip_ref:
+        for file_name in zip_ref.namelist():
+            name = file_name.split("/")[-1]
+            if not (name.endswith(".xml") and name.startswith("DMC")):
+                continue
+
+            with zip_ref.open(file_name) as f:
+                filehandle = io.TextIOWrapper(f, encoding="utf-8")
+                c = unicodedata.normalize("NFKC", filehandle.read())
+
+                xml_file = BeautifulSoup(c, "lxml")
+                dm_title, code = read_code_and_title(xml_file)
+                dict_of_applic = {}
+
+                if "Z" in code or not is_procedure(xml_file):
+                    continue
+
+                if fill_dict_of_applic(xml_file, dict_of_applic):
+                    applic_files = filter_by_applic_id(xml_file, dict_of_applic)
+                    for applic, (name_applic, file) in applic_files.items():
+                        docs.append(
+                            _doc(file, xml_dicts, code, file_name,
+                                 (applic, name_applic))
+                        )
+                else:
+                    docs.append(_doc(xml_file, xml_dicts, code, file_name, None))
+
+    return docs
+
+
+def _doc(xml_file, xml_dicts, code, subpart, applic) -> ProcedureDoc:
+    parser = XmlCssParser(
+        xml_file,
+        dm_refs=xml_dicts["dm_dict"],
+        tools_dict=xml_dicts["tools_dict"],
+        supplies_dict=xml_dicts["supplies_dict"],
+        catalog_dict=xml_dicts["catalog_dict"],
+        parts_dict=xml_dicts["parts_dict"],
+        warnings_dict=xml_dicts["warnings_dict"],
+        cautions_dict=xml_dicts["cautions_dict"],
+    )
+    node_procedure = xml_file.find("content").find("procedure")
+
+    return build_procedure_doc(parser, node_procedure, code, subpart, applic)
+
+
+# =============================================================================
+# 5. Neo4j : le chunk devient un noeud du graphe
+# =============================================================================
+
+INGEST_DOC = """
+MERGE (dm:DataModule {dm_code: $dm_code}) SET dm.title = $dm_title
+MERGE (p:Procedure {uid: $uid})
+  SET p.dm_code = $dm_code, p.dm_title = $dm_title, p.subpart = $subpart,
+      p.applic_id = $applic_id, p.applic_name = $applic_name
+MERGE (dm)-[:HAS_VARIANT]->(p)
+
+WITH p
+UNWIND $sections AS s
+  MERGE (c:Chunk {uid: s.uid})
+    SET c.kind = s.kind, c.text = s.text, c.proc_uid = $uid,
+        c.dm_code = $dm_code, c.applic_id = $applic_id
+  MERGE (p)-[:HAS_SECTION {kind: s.kind}]->(c)
+
+  FOREACH (code IN s.refs_dm |
+    MERGE (t:DataModule {dm_code: code})
+    MERGE (c)-[:REFERENCES_DM]->(t))
+
+  FOREACH (k IN s.refs_tools |
+    MERGE (i:Item {kind: 'tool', ref_id: k})
+    MERGE (c)-[:USES_TOOL]->(i))
+
+  FOREACH (k IN s.refs_supplies |
+    MERGE (i:Item {kind: 'supply', ref_id: k})
+    MERGE (c)-[:USES_SUPPLY]->(i))
+
+  FOREACH (k IN s.refs_parts |
+    MERGE (i:Item {kind: 'part', ref_id: k})
+    MERGE (c)-[:USES_PART]->(i))
+
+  FOREACH (k IN s.refs_warnings |
+    MERGE (w:Safety {kind: 'warning', ref_id: k})
+    MERGE (c)-[:HAS_WARNING]->(w))
+"""
+
+
+def doc_payload(doc: ProcedureDoc) -> Dict[str, Any]:
+    return {
+        "uid": doc.uid,
+        "dm_code": doc.dm_code,
+        "dm_title": doc.dm_title,
+        "subpart": doc.subpart,
+        "applic_id": doc.applic[0] if doc.applic else None,
+        "applic_name": doc.applic[1] if doc.applic else None,
+        "sections": [{
+            "uid": f"{doc.uid}#{s.kind}",
+            "kind": s.kind,
+            "text": s.text,
+            "refs_dm": s.refs.dm,
+            "refs_tools": s.refs.tools,
+            "refs_supplies": s.refs.supplies,
+            "refs_parts": s.refs.parts,
+            "refs_warnings": s.refs.warnings,
+        } for s in doc.sections if s.text.strip()],
+    }
+
+
 
 """
 Structure de données décrivant complètement une procédure S1000D.
