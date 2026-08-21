@@ -1,5 +1,256 @@
 
 """
+Pipeline complet : zip XML -> Neo4j -> recherche GraphRAG.
+
+    1. create_schema()   contraintes + index vectoriel
+    2. ingest_docs()     ton INGEST_DOC, inchangé (noeuds, relations, texte)
+    3. embed_chunks()    calcule et écrit les embeddings manquants
+    4. search()          recherche vectorielle + remontée du graphe
+
+Les étapes 2 et 3 sont séparées volontairement : l'ingestion structurelle est
+rapide et rejouable, l'embedding est lent et coûteux. On ne veut pas tout
+recalculer quand on corrige une relation.
+"""
+
+from typing import Any, Dict, List, Optional
+
+from neo4j import GraphDatabase
+
+from procedure_chunks import parse_procedure_docs, doc_payload, INGEST_DOC
+
+URI = "bolt://localhost:7687"
+AUTH = ("neo4j", "mot_de_passe")
+
+# Vérifie la valeur réelle de ton modèle : un index créé avec la mauvaise
+# dimension rejette tous les vecteurs, sans message explicite.
+EMBEDDING_DIM = 768
+
+
+# =============================================================================
+# 1. Schéma
+# =============================================================================
+
+SCHEMA = [
+    # Unicité + index. Sans ces contraintes, chaque MERGE parcourt tous les
+    # noeuds du label un par un : l'ingestion passe de secondes à heures.
+    "CREATE CONSTRAINT dm_code IF NOT EXISTS "
+    "FOR (d:DataModule) REQUIRE d.dm_code IS UNIQUE",
+
+    "CREATE CONSTRAINT proc_uid IF NOT EXISTS "
+    "FOR (p:Procedure) REQUIRE p.uid IS UNIQUE",
+
+    "CREATE CONSTRAINT chunk_uid IF NOT EXISTS "
+    "FOR (c:Chunk) REQUIRE c.uid IS UNIQUE",
+
+    # Composites : le MERGE porte sur (kind, ref_id), la contrainte doit
+    # couvrir exactement les mêmes propriétés.
+    "CREATE CONSTRAINT item_ref IF NOT EXISTS "
+    "FOR (i:Item) REQUIRE (i.kind, i.ref_id) IS UNIQUE",
+
+    "CREATE CONSTRAINT safety_ref IF NOT EXISTS "
+    "FOR (s:Safety) REQUIRE (s.kind, s.ref_id) IS UNIQUE",
+
+    # Index vectoriel : c'est lui qui rend db.index.vector.queryNodes possible.
+    f"""CREATE VECTOR INDEX chunk_embedding IF NOT EXISTS
+        FOR (c:Chunk) ON (c.embedding)
+        OPTIONS {{indexConfig: {{
+            `vector.dimensions`: {EMBEDDING_DIM},
+            `vector.similarity_function`: 'cosine'
+        }}}}""",
+
+    # Plein texte : une référence type "F0120 - 45B" n'a aucune signature
+    # sémantique, un embedding ne la retrouvera jamais.
+    "CREATE FULLTEXT INDEX chunk_fulltext IF NOT EXISTS "
+    "FOR (c:Chunk) ON EACH [c.text]",
+]
+
+
+def create_schema(driver) -> None:
+    with driver.session() as session:
+        for stmt in SCHEMA:
+            session.run(stmt)
+
+
+# =============================================================================
+# 2. Ingestion structurelle — ton INGEST_DOC, inchangé
+# =============================================================================
+
+
+def ingest_docs(driver, docs) -> None:
+    with driver.session() as session:
+        for doc in docs:
+            payload = doc_payload(doc)
+            # execute_write ouvre une transaction, commit si tout passe,
+            # rollback si une exception est levée.
+            # Le p=payload fige la valeur : sans lui, la lambda capturerait
+            # la variable de boucle et toutes les transactions écriraient
+            # le dernier payload.
+            session.execute_write(
+                lambda tx, p=payload: tx.run(INGEST_DOC, **p).consume()
+            )
+
+
+# =============================================================================
+# 3. Embeddings — sur les chunks déjà présents
+# =============================================================================
+
+# On ne récupère QUE les chunks sans embedding : relancer le script ne
+# recalcule pas ce qui existe déjà.
+FETCH_TODO = """
+MATCH (c:Chunk)
+WHERE c.embedding IS NULL AND c.text IS NOT NULL AND c.text <> ''
+RETURN c.uid AS uid, c.text AS text
+"""
+
+# setNodeVectorProperty valide la dimension et stocke le vecteur au format
+# attendu par l'index. Un SET c.embedding = [...] classique fonctionne aussi
+# mais contourne cette validation.
+WRITE_VECTORS = """
+UNWIND $rows AS row
+  MATCH (c:Chunk {uid: row.uid})
+  CALL db.create.setNodeVectorProperty(c, 'embedding', row.embedding)
+"""
+
+
+def embed_chunks(driver, embeddings, batch_size: int = 32) -> int:
+    with driver.session() as session:
+        todo = [r.data() for r in session.run(FETCH_TODO)]
+
+        for i in range(0, len(todo), batch_size):
+            batch = todo[i:i + batch_size]
+
+            # Un seul appel HTTP pour tout le lot.
+            vectors = embeddings.embed_documents([r["text"] for r in batch])
+
+            rows = [
+                {"uid": r["uid"], "embedding": v}
+                for r, v in zip(batch, vectors)
+            ]
+            session.execute_write(
+                lambda tx, rr=rows: tx.run(WRITE_VECTORS, rows=rr).consume()
+            )
+            print(f"  {min(i + batch_size, len(todo))}/{len(todo)}")
+
+    return len(todo)
+
+
+# =============================================================================
+# 4. Recherche GraphRAG
+# =============================================================================
+
+SEARCH = """
+CALL db.index.vector.queryNodes('chunk_embedding', $k, $embedding)
+YIELD node AS c, score
+
+// Filtre applicabilité : on garde les chunks de l'applicabilité demandée
+// et ceux qui n'en ont pas (valables partout).
+WHERE $applic_id IS NULL OR c.applic_id IS NULL OR c.applic_id = $applic_id
+
+// À partir d'ici, on ne fait plus de sémantique : on remonte le graphe.
+MATCH (p:Procedure {uid: c.proc_uid})
+OPTIONAL MATCH (c)-[:USES_TOOL]->(tool:Item)
+OPTIONAL MATCH (c)-[:REFERENCES_DM]->(ref:DataModule)
+OPTIONAL MATCH (ref)-[:HAS_VARIANT]->(refp:Procedure)
+OPTIONAL MATCH (p)-[:HAS_SECTION {kind: 'safety'}]->(sec:Chunk)
+
+RETURN score,
+       c.kind                              AS section,
+       c.text                              AS extrait,
+       p.dm_code                           AS dm_code,
+       p.dm_title                          AS titre,
+       p.applic_name                       AS applicabilite,
+       collect(DISTINCT tool.ref_id)       AS outils,
+       collect(DISTINCT ref.dm_code)       AS renvoie_vers,
+       collect(DISTINCT refp.dm_title)     AS titres_references,
+       head(collect(sec.text))             AS securite_procedure
+ORDER BY score DESC
+"""
+
+
+def search(driver, question: str, embeddings,
+           applic_id: Optional[str] = None, k: int = 5) -> List[Dict[str, Any]]:
+    vector = embeddings.embed_query(question)
+    with driver.session() as session:
+        return [r.data() for r in session.run(
+            SEARCH, embedding=vector, k=k, applic_id=applic_id
+        )]
+
+
+# =============================================================================
+# 5. Contrôles
+# =============================================================================
+
+
+def check(driver) -> None:
+    counts = {
+        "Data Modules": "MATCH (d:DataModule) RETURN count(d) AS n",
+        "  fantômes (sans titre)":
+            "MATCH (d:DataModule) WHERE d.title IS NULL RETURN count(d) AS n",
+        "Procédures": "MATCH (p:Procedure) RETURN count(p) AS n",
+        "  avec applicabilité":
+            "MATCH (p:Procedure) WHERE p.applic_id IS NOT NULL RETURN count(p) AS n",
+        "Chunks": "MATCH (c:Chunk) RETURN count(c) AS n",
+        "  sans embedding":
+            "MATCH (c:Chunk) WHERE c.embedding IS NULL RETURN count(c) AS n",
+        "Items": "MATCH (i:Item) RETURN count(i) AS n",
+        "Relations": "MATCH ()-[r]->() RETURN count(r) AS n",
+    }
+    with driver.session() as session:
+        for label, q in counts.items():
+            print(f"{label:28} {session.run(q).single()['n']}")
+
+        print("\nDM à plusieurs variantes :")
+        for r in session.run("""
+            MATCH (d:DataModule)-[:HAS_VARIANT]->(p:Procedure)
+            WITH d, collect(p.applic_name) AS v WHERE size(v) > 1
+            RETURN d.dm_code AS dm, v LIMIT 10
+        """):
+            print(f"  {r['dm']:32} {r['v']}")
+
+
+# =============================================================================
+# 6. Exécution
+# =============================================================================
+
+if __name__ == "__main__":
+    import sys
+    from utils import embeddings          # ton OpenAIEmbeddingsCustom
+
+    zip_path = sys.argv[1]
+
+    print("Parsing du zip...")
+    docs = parse_procedure_docs(zip_path)
+    print(f"  {len(docs)} procédures, "
+          f"{sum(len(d.sections) for d in docs)} sections")
+
+    driver = GraphDatabase.driver(URI, auth=AUTH)
+    try:
+        driver.verify_connectivity()
+
+        print("Schéma...")
+        create_schema(driver)
+
+        print("Ingestion...")
+        ingest_docs(driver, docs)
+
+        print("Embeddings...")
+        n = embed_chunks(driver, embeddings)
+        print(f"  {n} chunks vectorisés")
+
+        print()
+        check(driver)
+
+        print("\nTest de recherche :")
+        for r in search(driver, "comment déposer le siège pilote", embeddings, k=3):
+            print(f"  [{r['score']:.3f}] {r['dm_code']} ({r['applicabilite']}) "
+                  f"section={r['section']} outils={r['outils']}")
+    finally:
+        driver.close()
+
+
+
+
+"""
 Modèle Procédure v2 — orienté chunks.
 
 Contrairement à la v1 (qui décompose tout en objets : Duration, Person, Item,
