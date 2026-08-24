@@ -1,4 +1,38 @@
 
+def separer_en_set(racine):
+    conformes, fusionnes, applics_ko, dm_ko = [], [], [], []
+
+    for f in racine.descendants:
+        if not f.feuille:
+            continue
+        f.doc_v1 = _fusionner(f.doc_v1)                  # un doc par applic
+        f.doc_v2 = _fusionner(f.doc_v2)
+
+        v1 = {applic(d) for d in f.doc_v1}
+        v2 = {applic(d) for d in f.doc_v2}
+        ajoutees, supprimees = v2 - v1, v1 - v2
+
+        if not f.doc_v1 or not f.doc_v2:                 # DM absent d'un cote
+            dm_ko.append((f, ajoutees, supprimees))
+        elif not ajoutees and not supprimees:            # tout le monde a son correspondant
+            conformes.append((f, set(), set()))
+        elif (None in ajoutees and supprimees) or (None in supprimees and ajoutees):
+            fusionnes.append((f, ajoutees, supprimees))  # applics regroupees / eclatees
+        else:
+            applics_ko.append((f, ajoutees, supprimees))
+
+    return conformes, fusionnes, applics_ko, dm_ko
+
+
+def _fusionner(docs):
+    """Un seul document par applic : champs du 1er, contents concatenes."""
+    groupes = {}
+    for d in docs:
+        groupes.setdefault(applic(d), []).append(d)
+    return [dict(g[0], content="\n".join(str(d.get("content") or "") for d in g))
+            for g in groupes.values()]
+
+
 """
 Pipeline complet : zip XML -> Neo4j -> recherche GraphRAG.
 
