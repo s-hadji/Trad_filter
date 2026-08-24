@@ -1,4 +1,13 @@
 
+def _fusionner(docs):
+    """Un document par applic : champs du 1er, contents concatenes."""
+    groupes = defaultdict(list)
+    for d in docs:
+        groupes[applic(d)].append(d)
+    return [dict(g[0], content="\n".join(d["content"] for d in g)) for g in groupes.values()]
+
+
+
 def separer_en_set(racine):
     conformes, fusionnes, applics_ko, dm_ko = [], [], [], []
 
