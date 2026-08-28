@@ -1,4 +1,44 @@
 
+import openpyxl
+import pandas as pd
+
+# 1. Votre DataFrame et export classique
+df = pd.DataFrame(
+    {
+        "Nom": ["Alice", "Bob"],
+        "Description": [
+            "Ceci est un texte très très long qui risque d'être caché.",
+            "Court texte.",
+        ],
+    }
+)
+
+fichier = "export.xlsx"
+df.to_excel(fichier, index=False, engine="openpyxl")
+
+# 2. Réouverture du fichier avec openpyxl pour ajuster les largeurs
+wb = openpyxl.load_workbook(fichier)
+ws = wb.active
+
+# Parcourir toutes les colonnes pour calculer la taille max
+for col in ws.columns:
+  max_length = 0
+  column_letter = col[0].column_letter  # Récupère la lettre de la colonne (A, B, C...)
+
+  for cell in col:
+    try:
+      if cell.value:
+        max_length = max(max_length, len(str(cell.value)))
+    except:
+      pass
+
+  # Appliquer la nouvelle largeur avec un peu de marge
+  ws.column_dimensions[column_letter].width = max(max_length + 3, 10)
+
+# 3. Sauvegarder le fichier mis à jour
+wb.save(fichier)
+
+
 def _fusionner(docs):
     """Un document par applic : champs du 1er, contents concatenes."""
     groupes = defaultdict(list)
