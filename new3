@@ -1,4 +1,141 @@
 
+
+"""
+DataFrame pandas -> PDF sobre, texte justifie, aucun contenu tronque.
+Le tableau occupe toute la largeur utile de la page (hors marges).
+"""
+
+
+import pandas as pd
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_JUSTIFY, TA_CENTER
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.pdfbase.pdfmetrics import stringWidth
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+
+def _prepare(v):
+    """Echappe les caracteres XML. La coupure des mots longs est geree
+    nativement par splitLongWords du style Paragraph."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    t = (str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+    return t.replace("\n", "<br/>")
+
+
+def df_to_pdf(
+    df,
+    chemin_sortie="sortie.pdf",
+    titre=None,
+    paysage=True,
+    taille_police=8.5,
+    interligne=1.45,      # espacement entre les lignes de texte
+    espacement=6,         # padding interne des cellules (points)
+    marge=12,             # marge de page en mm
+    largeurs=None,        # ex [10, 15, 65, 10] en % ; sinon auto
+    largeur_mini=16,      # mm
+):
+    page = landscape(A4) if paysage else A4
+    m = marge * mm
+
+    doc = SimpleDocTemplate(
+        chemin_sortie, pagesize=page,
+        leftMargin=m, rightMargin=m, topMargin=m, bottomMargin=m,
+        title=titre or "Export",
+    )
+    dispo = page[0] - 2 * m
+
+    cellule = ParagraphStyle(
+        "cellule",
+        fontName="Helvetica",
+        fontSize=taille_police,
+        leading=taille_police * interligne,
+        alignment=TA_JUSTIFY,
+        splitLongWords=True,
+        hyphenationLang="",     # pas de cesure automatique
+    )
+    entete = ParagraphStyle(
+        "entete", parent=cellule,
+        fontName="Helvetica-Bold",
+        alignment=TA_CENTER,
+        textColor=colors.HexColor("#1A1A1A"),
+    )
+
+    # --- largeurs : occupent exactement toute la largeur utile -------------
+    if largeurs is None:
+        poids, planchers = [], []
+        for col in df.columns:
+            s = df[col].astype(str)
+            poids.append(max(len(str(col)), s.str.len().mean() if len(s) else 1, 1))
+            # plancher = le mot le plus long doit tenir sans etre casse
+            mots = [str(col)] + [w for v in s for w in v.split()]
+            plus_long = max((stringWidth(w, "Helvetica", taille_police)
+                             for w in mots), default=0)
+            planchers.append(min(plus_long + 2 * espacement + 2,
+                                 dispo * 0.35))   # jamais plus de 35 % de la page
+        planchers = [max(pl, largeur_mini * mm) for pl in planchers]
+        if sum(planchers) >= dispo:                 # cas extreme : on rabote
+            cols = [p * dispo / sum(planchers) for p in planchers]
+        else:
+            reste = dispo - sum(planchers)
+            total = sum(poids)
+            cols = [pl + p / total * reste
+                    for pl, p in zip(planchers, poids)]
+    else:
+        cols = [p / 100 * dispo for p in largeurs]
+        cols = [c * dispo / sum(cols) for c in cols]
+
+    donnees = [[Paragraph(_prepare(c), entete) for c in df.columns]]
+    for _, ligne in df.iterrows():
+        donnees.append([Paragraph(_prepare(v), cellule) for v in ligne])
+
+    table = Table(
+        donnees, colWidths=cols,
+        repeatRows=1, splitByRow=1, splitInRow=1,
+    )
+
+    gris = colors.HexColor("#BFBFBF")
+    table.setStyle(TableStyle([
+        # grille fine et neutre
+        ("GRID", (0, 0), (-1, -1), 0.25, gris),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.8, colors.HexColor("#555555")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F2F2F2")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        # espacement interne
+        ("LEFTPADDING", (0, 0), (-1, -1), espacement),
+        ("RIGHTPADDING", (0, 0), (-1, -1), espacement),
+        ("TOPPADDING", (0, 0), (-1, -1), espacement),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), espacement),
+    ]))
+
+    histoire = []
+    if titre:
+        histoire.append(Paragraph(_prepare(titre), ParagraphStyle(
+            "titre", fontName="Helvetica-Bold", fontSize=12,
+            textColor=colors.HexColor("#1A1A1A"), spaceAfter=10)))
+    histoire.append(table)
+    doc.build(histoire)
+    return chemin_sortie
+
+
+if __name__ == "__main__":
+    long_txt = ("Ce commentaire est volontairement tres long afin de verifier "
+                "que le texte se justifie correctement des deux cotes et qu'il "
+                "n'est jamais tronque, meme au-dela d'une page complete. ") * 10
+    df = pd.DataFrame({
+        "Ref": ["A-001", "A-002", "A-003"],
+        "Produit": ["Vanne pneumatique", "Capteur de pression", "Module E/S"],
+        "Commentaire": [long_txt,
+                        "Court. REF-SUPERLONGUESANSESPACE-0123456789ABCDEFGHIJ",
+                        long_txt * 3],
+        "Qte": [12, 4, 7],
+    })
+    df_to_pdf(df, "/mnt/user-data/outputs/export_tableau.pdf",
+              titre="Export du tableau")
+    print("ok")
+
+
 import openpyxl
 import pandas as pd
 
