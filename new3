@@ -1,138 +1,197 @@
-"""
-DataFrame pandas -> PDF sobre, texte justifie, aucun contenu tronque.
-Le tableau occupe toute la largeur utile de la page (hors marges).
-"""
 
 
+"""
+DataFrame pandas -> PDF A4, sobre et lisible.
+
+- colonnes de largeur egale (1/3 chacune si 3 colonnes)
+- texte justifie quand il est long, aligne a gauche quand il est court
+- aucune ligne coupee entre deux pages : la police de la ligne est reduite
+  automatiquement jusqu'a ce qu'elle tienne sur une page
+- en-tete affiche une seule fois, en haut du document
+- police Unicode : accents, symboles, monnaies, fleches s'affichent
+"""
+
+import os
 import pandas as pd
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_JUSTIFY, TA_CENTER
+from reportlab.lib.enums import TA_JUSTIFY, TA_LEFT, TA_CENTER
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
-from reportlab.pdfbase.pdfmetrics import stringWidth
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
 
+# --- Police Unicode ------------------------------------------------------
+# DejaVu couvre le latin etendu, les symboles, les monnaies, les fleches.
+_CANDIDATS = [
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+    ("C:/Windows/Fonts/DejaVuSans.ttf", "C:/Windows/Fonts/DejaVuSans-Bold.ttf"),
+    ("C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/arialbd.ttf"),
+    ("/System/Library/Fonts/Supplemental/Arial.ttf",
+     "/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
+]
+POLICE, POLICE_G = "Helvetica", "Helvetica-Bold"
+for reg, gras in _CANDIDATS:
+    if os.path.exists(reg) and os.path.exists(gras):
+        pdfmetrics.registerFont(TTFont("Doc", reg))
+        pdfmetrics.registerFont(TTFont("Doc-Bold", gras))
+        POLICE, POLICE_G = "Doc", "Doc-Bold"
+        break
+
+
 def _prepare(v):
-    """Echappe les caracteres XML. La coupure des mots longs est geree
-    nativement par splitLongWords du style Paragraph."""
+    """Echappe le XML. Les caracteres speciaux passent tels quels."""
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return ""
-    t = (str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
-    return t.replace("\n", "<br/>")
+    return (str(v)
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace("\n", "<br/>"))
 
 
 def df_to_pdf(
     df,
     chemin_sortie="sortie.pdf",
     titre=None,
-    paysage=True,
-    taille_police=8.5,
-    interligne=1.45,      # espacement entre les lignes de texte
-    espacement=6,         # padding interne des cellules (points)
-    marge=12,             # marge de page en mm
-    largeurs=None,        # ex [10, 15, 65, 10] en % ; sinon auto
-    largeur_mini=16,      # mm
+    paysage=False,        # A4 portrait par defaut
+    taille_police=9,
+    police_mini=5.5,      # plancher de reduction automatique
+    interligne=1.45,
+    espacement=6,         # marge interieure des cellules (points)
+    marge=15,             # marge de page (mm)
+    seuil_justif=120,     # au-dela de N caracteres -> texte justifie
+    largeurs=None,        # ex [33, 34, 33] en % ; None = colonnes egales
 ):
     page = landscape(A4) if paysage else A4
     m = marge * mm
-
     doc = SimpleDocTemplate(
         chemin_sortie, pagesize=page,
         leftMargin=m, rightMargin=m, topMargin=m, bottomMargin=m,
         title=titre or "Export",
     )
-    dispo = page[0] - 2 * m
+    largeur_utile = page[0] - 2 * m
+    hauteur_utile = page[1] - 2 * m
 
-    cellule = ParagraphStyle(
-        "cellule",
-        fontName="Helvetica",
-        fontSize=taille_police,
-        leading=taille_police * interligne,
-        alignment=TA_JUSTIFY,
-        splitLongWords=True,
-        hyphenationLang="",     # pas de cesure automatique
-    )
-    entete = ParagraphStyle(
-        "entete", parent=cellule,
-        fontName="Helvetica-Bold",
-        alignment=TA_CENTER,
+    # colonnes de largeur egale, sauf indication contraire
+    n = len(df.columns)
+    if largeurs is None:
+        # largeur identique au centieme de point pres pour toutes les colonnes
+        unite = round(largeur_utile / n, 2)
+        cols = [unite] * n
+        largeur_utile = unite * n          # la table occupe exactement n x unite
+    else:
+        cols = [p / 100 * largeur_utile for p in largeurs]
+        cols = [c * largeur_utile / sum(cols) for c in cols]
+
+    def style_texte(taille, justifie, inter=None):
+        return ParagraphStyle(
+            "c", fontName=POLICE, fontSize=taille,
+            leading=taille * (inter if inter else interligne),
+            alignment=TA_JUSTIFY if justifie else TA_CENTER,
+            splitLongWords=True, hyphenationLang="",
+        )
+
+    def construire_ligne(valeurs, taille, inter=None):
+        cells = []
+        for v in valeurs:
+            txt = _prepare(v)
+            # justification seulement si le contenu est assez long,
+            # sinon les mots sont etires de facon disgracieuse
+            cells.append(Paragraph(
+                txt, style_texte(taille, len(txt) > seuil_justif, inter)))
+        return cells
+
+    st_entete = ParagraphStyle(
+        "e", fontName=POLICE_G, fontSize=taille_police,
+        leading=taille_police * 1.3, alignment=TA_CENTER,
         textColor=colors.HexColor("#1A1A1A"),
     )
 
-    # --- largeurs : occupent exactement toute la largeur utile -------------
-    if largeurs is None:
-        poids, planchers = [], []
-        for col in df.columns:
-            s = df[col].astype(str)
-            poids.append(max(len(str(col)), s.str.len().mean() if len(s) else 1, 1))
-            # plancher = le mot le plus long doit tenir sans etre casse
-            mots = [str(col)] + [w for v in s for w in v.split()]
-            plus_long = max((stringWidth(w, "Helvetica", taille_police)
-                             for w in mots), default=0)
-            planchers.append(min(plus_long + 2 * espacement + 2,
-                                 dispo * 0.35))   # jamais plus de 35 % de la page
-        planchers = [max(pl, largeur_mini * mm) for pl in planchers]
-        if sum(planchers) >= dispo:                 # cas extreme : on rabote
-            cols = [p * dispo / sum(planchers) for p in planchers]
-        else:
-            reste = dispo - sum(planchers)
-            total = sum(poids)
-            cols = [pl + p / total * reste
-                    for pl, p in zip(planchers, poids)]
-    else:
-        cols = [p / 100 * dispo for p in largeurs]
-        cols = [c * dispo / sum(cols) for c in cols]
-
-    donnees = [[Paragraph(_prepare(c), entete) for c in df.columns]]
-    for _, ligne in df.iterrows():
-        donnees.append([Paragraph(_prepare(v), cellule) for v in ligne])
-
-    table = Table(
-        donnees, colWidths=cols,
-        repeatRows=1, splitByRow=1, splitInRow=1,
-    )
-
-    gris = colors.HexColor("#BFBFBF")
-    table.setStyle(TableStyle([
-        # grille fine et neutre
-        ("GRID", (0, 0), (-1, -1), 0.25, gris),
-        ("LINEBELOW", (0, 0), (-1, 0), 0.8, colors.HexColor("#555555")),
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F2F2F2")),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        # espacement interne
+    STYLE = TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#B8B8B8")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("LEFTPADDING", (0, 0), (-1, -1), espacement),
         ("RIGHTPADDING", (0, 0), (-1, -1), espacement),
         ("TOPPADDING", (0, 0), (-1, -1), espacement),
         ("BOTTOMPADDING", (0, 0), (-1, -1), espacement),
-    ]))
+    ])
+
+    def hauteur(cells):
+        t = Table([cells], colWidths=cols)
+        t.setStyle(STYLE)
+        return t.wrap(largeur_utile, 10 ** 6)[1]
+
+    # --- construction ligne par ligne, avec reduction si necessaire -------
+    lignes, tailles, debordements = [], [], []
+    plafond = hauteur_utile - 4      # petite reserve
+    for i, (_, ligne) in enumerate(df.iterrows()):
+        taille = taille_police
+        inter = interligne
+        cells = construire_ligne(ligne, taille, inter)
+        # 1er passage : on reduit la police
+        while hauteur(cells) > plafond and taille > police_mini:
+            taille = round(taille - 0.5, 1)
+            cells = construire_ligne(ligne, taille, inter)
+        # 2e passage : on resserre l'interligne si la police est au plancher
+        while hauteur(cells) > plafond and inter > 1.02:
+            inter = round(inter - 0.05, 2)
+            cells = construire_ligne(ligne, taille, inter)
+        # 3e passage : dernier recours, on descend sous le plancher
+        while hauteur(cells) > plafond and taille > 3.0:
+            taille = round(taille - 0.25, 2)
+            cells = construire_ligne(ligne, taille, inter)
+        if hauteur(cells) > plafond:
+            debordements.append(i)   # contenu physiquement impossible a caser
+        lignes.append(cells)
+        tailles.append(taille)
+
+    entete = [Paragraph(_prepare(c), st_entete) for c in df.columns]
+
+    table = Table(
+        [entete] + lignes,
+        colWidths=cols,
+        repeatRows=0,     # en-tete affiche une seule fois
+        splitByRow=1,     # coupure entre les lignes uniquement
+        splitInRow=0,     # jamais a l'interieur d'une ligne
+    )
+    style = TableStyle(STYLE.getCommands())
+    style.add("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EFEFEF"))
+    style.add("LINEBELOW", (0, 0), (-1, 0), 0.8, colors.HexColor("#4D4D4D"))
+    table.setStyle(style)
 
     histoire = []
     if titre:
         histoire.append(Paragraph(_prepare(titre), ParagraphStyle(
-            "titre", fontName="Helvetica-Bold", fontSize=12,
+            "t", fontName=POLICE_G, fontSize=12,
             textColor=colors.HexColor("#1A1A1A"), spaceAfter=10)))
     histoire.append(table)
     doc.build(histoire)
+
+    reduites = sum(1 for t in tailles if t < taille_police)
+    if reduites:
+        print(f"[info] {reduites} ligne(s) reduite(s) pour tenir sur une page "
+              f"(min {min(tailles)} pt)")
+    if debordements:
+        print(f"[ATTENTION] lignes {debordements} : contenu trop volumineux "
+              f"meme a 3 pt. Elles seront coupees. Passez en paysage, "
+              f"reduisez les marges, ou scindez ces cellules.")
     return chemin_sortie
 
 
 if __name__ == "__main__":
-    long_txt = ("Ce commentaire est volontairement tres long afin de verifier "
-                "que le texte se justifie correctement des deux cotes et qu'il "
-                "n'est jamais tronque, meme au-dela d'une page complete. ") * 10
+    long_txt = ("Ce commentaire très long sert à vérifier la justification, "
+                "l'absence de troncature et le passage à la page suivante. ") * 9
     df = pd.DataFrame({
-        "Ref": ["A-001", "A-002", "A-003"],
-        "Produit": ["Vanne pneumatique", "Capteur de pression", "Module E/S"],
-        "Commentaire": [long_txt,
-                        "Court. REF-SUPERLONGUESANSESPACE-0123456789ABCDEFGHIJ",
-                        long_txt * 3],
-        "Qte": [12, 4, 7],
+        "Référence": ["A-001", "A-002", "A-003", "A-004"],
+        "Désignation": ["Vanne pneumatique Ø50", "Capteur de pression 0–10 bar",
+                        "Module E/S — 16 voies", "Écrou inox M8"],
+        "Commentaire": [long_txt, "Court.", long_txt * 4,
+                        "Prix : 12,50 € · tolérance ±0,05 mm · θ ≤ 80 °C → OK"],
     })
     df_to_pdf(df, "/mnt/user-data/outputs/export_tableau.pdf",
               titre="Export du tableau")
     print("ok")
-
 
 
 import openpyxl
