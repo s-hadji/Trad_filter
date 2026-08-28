@@ -1,6 +1,7 @@
 
 
 
+
 """
 DataFrame pandas -> PDF A4, sobre et lisible.
 
@@ -64,6 +65,7 @@ def df_to_pdf(
     seuil_justif=120,     # au-dela de N caracteres -> texte justifie
     largeurs=None,        # ex [33, 34, 33] en % ; None = colonnes egales
     taille_fixe=False,    # True = garde taille_police, quitte a couper une ligne
+    alignement="centre",  # "centre" (defaut) | "auto" | "gauche" | "justifie"
 ):
     page = landscape(A4) if paysage else A4
     m = marge * mm
@@ -72,8 +74,11 @@ def df_to_pdf(
         leftMargin=m, rightMargin=m, topMargin=m, bottomMargin=m,
         title=titre or "Export",
     )
-    largeur_utile = page[0] - 2 * m
-    hauteur_utile = page[1] - 2 * m
+    # Le cadre de ReportLab applique 6 pt de padding sur chaque bord :
+    # il faut les deduire, sinon le tableau deborde du cadre.
+    PAD = 12
+    largeur_utile = doc.width - PAD
+    hauteur_utile = doc.height - PAD
 
     # colonnes de largeur egale, sauf indication contraire
     n = len(df.columns)
@@ -86,23 +91,44 @@ def df_to_pdf(
         cols = [p / 100 * largeur_utile for p in largeurs]
         cols = [c * largeur_utile / sum(cols) for c in cols]
 
-    def style_texte(taille, justifie, inter=None):
+    # --- alignement decide PAR COLONNE, pas par cellule -----------------
+    # Une colonne contenant des listes ou des codes est centree en entier ;
+    # une colonne de prose est justifiee en entier. Deux cellules d'une meme
+    # colonne ne peuvent donc jamais avoir un alignement different.
+    def est_prose(serie):
+        txts = [str(v) for v in serie if v is not None and str(v).strip()]
+        if not txts:
+            return False
+        # une liste = beaucoup de retours a la ligne, peu de mots par ligne
+        lignes = [l for t in txts for l in t.splitlines() if l.strip()]
+        if not lignes:
+            return False
+        mots_par_ligne = sum(len(l.split()) for l in lignes) / len(lignes)
+        if mots_par_ligne < 4:            # codes, references, listes
+            return False
+        return max(len(t) for t in txts) > seuil_justif
+
+    if alignement == "centre":
+        aligns = [TA_CENTER] * len(df.columns)     # tout centre, sans exception
+    elif alignement == "auto":
+        aligns = [TA_JUSTIFY if est_prose(df[c]) else TA_CENTER
+                  for c in df.columns]
+    else:
+        fixe = {"centre": TA_CENTER, "gauche": TA_LEFT,
+                "justifie": TA_JUSTIFY}[alignement]
+        aligns = [fixe] * len(df.columns)
+
+    def style_texte(taille, align, inter=None):
         return ParagraphStyle(
             "c", fontName=POLICE, fontSize=taille,
             leading=taille * (inter if inter else interligne),
-            alignment=TA_JUSTIFY if justifie else TA_CENTER,
+            alignment=align,
             splitLongWords=True, hyphenationLang="",
         )
 
     def construire_ligne(valeurs, taille, inter=None):
-        cells = []
-        for v in valeurs:
-            txt = _prepare(v)
-            # justification seulement si le contenu est assez long,
-            # sinon les mots sont etires de facon disgracieuse
-            cells.append(Paragraph(
-                txt, style_texte(taille, len(txt) > seuil_justif, inter)))
-        return cells
+        return [Paragraph(_prepare(v), style_texte(taille, a, inter))
+                for v, a in zip(valeurs, aligns)]
 
     STYLE = TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#B8B8B8")),
