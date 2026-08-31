@@ -1,6 +1,76 @@
 
 
 
+import os
+from collections import defaultdict
+from bs4 import BeautifulSoup
+
+def get_bs4_signature(elem):
+    """
+    Génère une signature unique pour une balise via BeautifulSoup basée sur :
+    - Ses attributs (les clés)
+    - La structure récursive de ses enfants directs (balises et leurs propres signatures)
+    """
+    # Récupération triée des noms d'attributs
+    attrs = tuple(sorted(elem.attrs.keys())) if elem.attrs else ()
+    
+    # Récupération récursive des balises enfants directes
+    children_signatures = []
+    for child in elem.find_all(recursive=False):
+        # On s'assure qu'il s'agit bien d'une balise (Tag) et non d'un texte brut
+        if child.name:
+            children_signatures.append((child.name, get_bs4_signature(child)))
+            
+    return (attrs, tuple(children_signatures))
+
+def analyze_xml_folder_bs4(folder_path, target_tag):
+    patterns = defaultdict(list)
+    total_found = 0
+    
+    print(f"Analyse du dossier '{folder_path}' avec BeautifulSoup pour la balise <{target_tag}>...\n")
+
+    for filename in os.listdir(folder_path):
+        if filename.lower().endswith('.xml'):
+            filepath = os.path.join(folder_path, filename)
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    # Utilisation du parser 'xml' de BeautifulSoup
+                    soup = BeautifulSoup(f, 'xml')
+                    
+                    # Recherche de toutes les occurrences de la balise cible
+                    elements = soup.find_all(target_tag)
+                    for elem in elements:
+                        total_found += 1
+                        sig = get_bs4_signature(elem)
+                        patterns[sig].append(filename)
+                        
+            except Exception as e:
+                print(f"⚠️ Erreur avec le fichier {filename}: {e}")
+
+    # Affichage des résultats
+    print(f"Total de balises <{target_tag}> trouvées : {total_found}")
+    print(f"Nombre de pattern(s) différent(s) détecté(s) : {len(patterns)}\n")
+    
+    for idx, (sig, files) in enumerate(patterns.items(), 1):
+        attrs, children = sig
+        print(f"--- Pattern #{idx} (présent dans {len(set(files))} fichier(s)) ---")
+        print(f"  • Attributs présents : {list(attrs) if attrs else 'Aucun'}")
+        print(f"  • Structure des enfants : {children if children else 'Aucun descendant'}")
+        print(f"  • Fichiers concernés : {sorted(list(set(files)))}")
+        print("-" * 60)
+
+# --- Exemple d'utilisation ---
+if __name__ == "__main__":
+    DOSSIER_CIBLED = "./mes_fichiers_xml"  # Remplacez par le chemin de votre dossier
+    BALISE_CIBLE = "ma_balise"             # Remplacez par le nom de votre balise
+    
+    if os.path.exists(DOSSIER_CIBLED):
+        analyze_xml_folder_bs4(DOSSIER_CIBLED, BALISE_CIBLE)
+    else:
+        print(f"Le dossier '{DOSSIER_CIBLED}' n'existe pas. Veuillez ajuster le chemin.")
+
+
+
 
 """
 DataFrame pandas -> PDF A4, sobre et lisible.
