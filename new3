@@ -1,3 +1,88 @@
+"""Serveur MCP minimal, lancé en stdio par l'agent.
+Installation : pip install fastmcp
+"""
+from fastmcp import FastMCP
+
+mcp = FastMCP("Demo Clients")
+
+# Fausse base de données pour le test
+CLIENTS = {
+    "42": {"id": "42", "nom": "Dupont SA", "solde": 1250.0},
+    "7": {"id": "7", "nom": "Martin SARL", "solde": -300.0},
+}
+
+
+@mcp.tool
+def get_client(client_id: str) -> dict:
+    """Récupère la fiche d'un client par son identifiant."""
+    client = CLIENTS.get(client_id)
+    if client is None:
+        raise ValueError(f"Client {client_id} introuvable")
+    return client
+
+
+@mcp.tool
+def additionner(a: float, b: float) -> float:
+    """Additionne deux nombres."""
+    return a + b
+
+
+if __name__ == "__main__":
+    mcp.run()  # transport stdio par défaut
+
+
+"""Agent Pydantic AI qui lance serveur.py en sous-processus (stdio).
+Installation : pip install "pydantic-ai-slim[anthropic,mcp]"
+Variable d'env requise : ANTHROPIC_API_KEY
+Lancer : python agent.py
+"""
+import asyncio
+
+from pydantic_ai import Agent, UsageLimits
+from pydantic_ai.mcp import MCPToolset
+
+# Chemin vers un script .py => Pydantic AI le lance en stdio
+outils = MCPToolset("serveur.py")
+
+agent = Agent(
+    "anthropic:claude-sonnet-4-6",
+    toolsets=[outils],
+    instructions=(
+        "Tu es un assistant. Utilise les outils disponibles pour répondre. "
+        "Explique brièvement ce que tu fais avant chaque appel d'outil."
+    ),
+)
+
+
+async def main() -> None:
+    async with agent:  # démarre le serveur MCP et s'y connecte
+        result = await agent.run(
+            "Quel est le solde cumulé des clients 42 et 7 ?",
+            usage_limits=UsageLimits(request_limit=8),
+        )
+
+        print("\n=== Réponse ===")
+        print(result.output)
+
+        # Trace de la boucle ReAct : réflexion + appels d'outils
+        print("\n=== Trace ===")
+        for message in result.all_messages():
+            for part in message.parts:
+                kind = part.part_kind
+                if kind == "text":
+                    print(f"[réflexion] {part.content}")
+                elif kind == "tool-call":
+                    print(f"[appel]     {part.tool_name}({part.args})")
+                elif kind == "tool-return":
+                    print(f"[résultat]  {part.tool_name} -> {part.content}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+
+
 
 
 
