@@ -1,5 +1,102 @@
 
 
+
+"""Agent LangGraph qui consomme le même serveur.py en stdio.
+
+Installation :
+    pip install "langchain>=1.0" langgraph langchain-openai langchain-mcp-adapters
+
+Variables d'env : OPENAI_API_KEY (ou n'importe quoi si ton proxy ne vérifie pas)
+Lancer : python agent_langgraph.py
+"""
+import asyncio
+import os
+
+from langchain.agents import create_agent
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import InMemorySaver
+
+# --- Modèle : même URL que ton ChatOpenAI habituel ---------------------
+llm = ChatOpenAI(
+    model=os.getenv("LLM_MODEL", "nom-du-modele"),
+    base_url=os.getenv("LLM_BASE_URL", "https://ton-url/v1"),
+    api_key=os.getenv("OPENAI_API_KEY", "x"),
+    temperature=0,
+)
+
+SYSTEM_PROMPT = """Tu es un assistant. Utilise les outils disponibles pour répondre.
+Explique brièvement ce que tu fais avant chaque appel d'outil.
+Si un outil renvoie une erreur, lis-la et corrige ton appel, ne réessaie pas à l'identique.
+"""
+
+MAX_ITERATIONS = 8  # garde-fou anti boucle infinie
+
+
+async def main() -> None:
+    # --- Serveur MCP lancé en sous-processus stdio --------------------
+    client = MultiServerMCPClient(
+        {
+            "clients": {
+                "transport": "stdio",
+                "command": "python",
+                "args": ["serveur.py"],
+            }
+        }
+    )
+    tools = await client.get_tools()
+    print(f"Outils MCP chargés : {[t.name for t in tools]}\n")
+
+    # --- Agent ReAct préfabriqué + mémoire par thread ------------------
+    agent = create_agent(
+        llm,
+        tools,
+        system_prompt=SYSTEM_PROMPT,
+        checkpointer=InMemorySaver(),  # remplacer par PostgresSaver en prod
+    )
+
+    # thread_id = identifiant de conversation ; l'historique est persisté
+    config = {
+        "configurable": {"thread_id": "session-demo"},
+        "recursion_limit": MAX_ITERATIONS * 2 + 1,  # 1 tour = 2 nœuds (llm + tools)
+    }
+
+    # --- Tour 1 : streaming de la boucle ReAct -------------------------
+    print("=== Trace tour 1 ===")
+    async for chunk in agent.astream(
+        {"messages": [HumanMessage("Quel est le solde cumulé des clients 42 et 7 ?")]},
+        config=config,
+        stream_mode="updates",
+    ):
+        for node, update in chunk.items():
+            for msg in update.get("messages", []):
+                afficher(msg)
+
+    # --- Tour 2 : la mémoire est automatique grâce au thread_id --------
+    print("\n=== Tour 2 (mémoire) ===")
+    result = await agent.ainvoke(
+        {"messages": [HumanMessage("Et le solde du client 7 seul ?")]},
+        config=config,
+    )
+    print(result["messages"][-1].content)
+
+
+def afficher(msg) -> None:
+    """Affiche réflexion, appels d'outils et résultats."""
+    if isinstance(msg, AIMessage):
+        if msg.content:
+            print(f"[réflexion] {msg.content}")
+        for call in msg.tool_calls:
+            print(f"[appel]     {call['name']}({call['args']})")
+    elif isinstance(msg, ToolMessage):
+        print(f"[résultat]  {msg.name} -> {msg.content}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
