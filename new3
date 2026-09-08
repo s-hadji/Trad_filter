@@ -1,24 +1,31 @@
 
-import os
+import os, glob
 from lxml import etree
 
-DTD_DIR = r"C:/dtd"          # dossier contenant ISOEntities
+DTD_DIR = r"C1/ent"          # ton dossier d'entités
+XML_DIR = r"C2"              # dossier des XML
 
 class S1000DResolver(etree.Resolver):
     def resolve(self, url, id_, context):
-        nom = url.rsplit("/", 1)[-1]          # "ISOEntities"
+        nom = url.rsplit("/", 1)[-1]
         chemin = os.path.join(DTD_DIR, nom)
         if os.path.exists(chemin):
             return self.resolve_filename(chemin, context)
-        print("MANQUANT :", url)              # pour repérer les autres
+        print("MANQUANT :", url)
         return None
 
 parser = etree.XMLParser(load_dtd=True, resolve_entities=True,
                          no_network=True, recover=True, huge_tree=True)
 parser.resolvers.add(S1000DResolver())
 
-tree = etree.parse("fichier.xml", parser)
-print(len(tree.getroot()))                    # doit être > 0 maintenant
+for chemin in glob.glob(os.path.join(XML_DIR, "**", "*.xml"), recursive=True):
+    try:
+        tree = etree.parse(chemin, parser)
+        root = tree.getroot()
+        print(os.path.basename(chemin), "->", root.tag, len(root), "enfants")
+        # ton traitement ici
+    except etree.XMLSyntaxError as e:
+        print("ECHEC", os.path.basename(chemin), ":", e)
 
 
 
