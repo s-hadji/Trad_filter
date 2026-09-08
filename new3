@@ -1,4 +1,39 @@
 
+import os
+from lxml import etree
+from bs4 import BeautifulSoup
+
+DTD_DIR  = r"C1/ent"
+XML_FILE = r"C2/DMC-MANPADSFUNG-A-02-00-00-00A-342A-A_000-01_FR-FR.xml"
+
+class S1000DResolver(etree.Resolver):
+    def resolve(self, url, id_, context):
+        chemin = os.path.join(DTD_DIR, url.rsplit("/", 1)[-1])
+        if os.path.exists(chemin):
+            return self.resolve_filename(chemin, context)
+        print("MANQUANT :", url)
+        return None
+
+parser = etree.XMLParser(load_dtd=True, resolve_entities=True,
+                         no_network=True, recover=True, huge_tree=True)
+parser.resolvers.add(S1000DResolver())
+
+tree = etree.parse(XML_FILE, parser)
+root = tree.getroot()
+
+# --- contrôles de bonne lecture ---
+print("Racine   :", root.tag)
+print("Éléments :", sum(1 for _ in root.iter()))
+print("Balises  :", sorted({el.tag for el in root.iter()})[:30])
+print("Erreurs  :", parser.error_log)          # vide = parfait
+
+# --- passage à bs4 ---
+soup = BeautifulSoup(etree.tostring(tree, encoding="unicode"), "xml")
+print(soup.prettify()[:2000])
+
+
+
+
 import os, glob
 from lxml import etree
 
