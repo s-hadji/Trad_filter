@@ -1,4 +1,27 @@
 
+import os
+from lxml import etree
+
+DTD_DIR = r"C:/dtd"          # dossier contenant ISOEntities
+
+class S1000DResolver(etree.Resolver):
+    def resolve(self, url, id_, context):
+        nom = url.rsplit("/", 1)[-1]          # "ISOEntities"
+        chemin = os.path.join(DTD_DIR, nom)
+        if os.path.exists(chemin):
+            return self.resolve_filename(chemin, context)
+        print("MANQUANT :", url)              # pour repérer les autres
+        return None
+
+parser = etree.XMLParser(load_dtd=True, resolve_entities=True,
+                         no_network=True, recover=True, huge_tree=True)
+parser.resolvers.add(S1000DResolver())
+
+tree = etree.parse("fichier.xml", parser)
+print(len(tree.getroot()))                    # doit être > 0 maintenant
+
+
+
 import re
 from lxml import etree
 
