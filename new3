@@ -1,4 +1,33 @@
 
+import re
+from lxml import etree
+
+path = "fichier.xml"
+raw = open(path, "rb").read()
+
+print("Taille :", len(raw), "octets")
+print("Début  :", raw[:200])
+
+# 1. l'encodage réel
+try:
+    raw.decode("utf-8")
+    print("Décodage utf-8 : OK")
+except UnicodeDecodeError as e:
+    print("Décodage utf-8 : ECHEC ->", e)
+
+# 2. l'erreur XML exacte
+try:
+    etree.parse(path)
+    print("XML : bien formé")
+except etree.XMLSyntaxError as e:
+    print("XML : ECHEC ->", e)
+
+# 3. ce qui est récupérable en mode tolérant
+tree = etree.parse(path, etree.XMLParser(recover=True, huge_tree=True))
+root = tree.getroot()
+print("Racine :", root.tag, "| enfants :", len(root))
+print("Noms des balises :", {el.tag for el in root.iter()})
+
 
 
 """Agent LangGraph qui consomme le même serveur.py en stdio.
