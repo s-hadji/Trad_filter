@@ -1,4 +1,18 @@
 
+
+{
+  "mcpServers": {
+    "mon-serveur-conda": {
+      "command": "/chemin/absolu/vers/miniconda3/envs/nom_de_votre_env/bin/python",
+      "args": [
+        "/chemin/absolu/vers/votre_script.py"
+      ],
+      "disabled": false
+    }
+  }
+}
+
+
 import os
 from lxml import etree
 from bs4 import BeautifulSoup
