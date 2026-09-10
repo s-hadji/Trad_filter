@@ -1,5 +1,13 @@
 
 
+H=$(grep -o '"commit": *"[^"]*"' ~/vscode-server-linux-x64/product.json | cut -d'"' -f4)
+mkdir -p ~/.vscode-server/bin/$H
+cp -r ~/vscode-server-linux-x64/. ~/.vscode-server/bin/$H/
+touch ~/.vscode-server/bin/$H/0
+ls ~/.vscode-server/bin/$H/bin
+
+
+
 {
   "mcpServers": {
     "mon-serveur-conda": {
