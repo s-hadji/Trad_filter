@@ -1,4 +1,36 @@
 
+from operator import add
+from typing import Annotated
+from langchain.agents import AgentState
+from langchain.agents.middleware import AgentMiddleware
+from langchain.messages import ToolMessage
+from langgraph.types import Command
+
+def fusion(a: dict, b: dict) -> dict:
+    return {**a, **b}
+
+class SuiviState(AgentState):
+    appels_outils: Annotated[list[dict], add]      # reducer : on accumule
+    sorties_outils: Annotated[dict, fusion]        # clé = nom du tool
+
+class SuiviOutils(AgentMiddleware):
+    state_schema = SuiviState
+
+    def wrap_tool_call(self, request, handler):
+        call = request.tool_call
+        result = handler(request)
+        contenu = result.content if isinstance(result, ToolMessage) else str(result)
+        return Command(update={
+            "messages": [result],                          # indispensable : le LLM doit voir la sortie
+            "appels_outils": [{"tool": call["name"], "args": call["args"], "id": call["id"]}],
+            "sorties_outils": {call["name"]: contenu},
+        })
+
+deep = create_deep_agent(model=..., tools=mcp_tools, middleware=[SuiviOutils(), garde_creer_facture])
+
+
+
+
 
 
 from fastmcp.client import Client
