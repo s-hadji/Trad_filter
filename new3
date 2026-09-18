@@ -1,5 +1,28 @@
 
 
+
+from fastmcp.client import Client
+from fastmcp.client.transports import StreamableHttpTransport
+from langchain.mcp import MCPAdapter
+
+transport = StreamableHttpTransport(
+    "http://127.0.0.1:8000/mcp",
+    auth=token,                              # → Authorization: Bearer <token>, sans écrire "Bearer"
+    headers={                                # headers custom, envoyés à chaque requête
+        "X-Locale": "fr-FR",
+        "X-Trace-Id": trace_id,
+        "X-Tenant": "acme",
+    },
+)
+
+async with MCPAdapter(Client(transport)) as adapter:
+    tools = await adapter.list_tools()       # tools/list, déjà filtré par le serveur
+
+agent = create_agent(model, tools, middleware=[garde_creer_facture])
+
+
+
+
 H=$(grep -o '"commit": *"[^"]*"' ~/vscode-server-linux-x64/product.json | cut -d'"' -f4)
 mkdir -p ~/.vscode-server/bin/$H
 cp -r ~/vscode-server-linux-x64/. ~/.vscode-server/bin/$H/
