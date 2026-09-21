@@ -1,5 +1,19 @@
 
 
+
+async def noeud_deep_agent(state: GraphState):
+    question = state.get("standalone_question") or state["question"]
+    out = await deep.ainvoke({"messages": [{"role": "user", "content": question}]})
+
+    docs = list(dict.fromkeys(out.get("documents_outils", [])))   # dédoublonne, garde l'ordre
+    return {
+        "documents": docs,
+        "generation": out["messages"][-1].content,
+    }
+
+builder.add_node("deep_agent", noeud_deep_agent)
+
+
 from operator import add
 from typing import Annotated
 
