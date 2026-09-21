@@ -1,4 +1,53 @@
 
+
+from operator import add
+from typing import Annotated
+
+from langchain.agents import AgentState
+from langchain.agents.middleware import AgentMiddleware
+from langchain.messages import ToolMessage
+from langgraph.types import Command
+
+# Nom exact du tool MCP tel que l'agent le voit (préfixé si tu utilises ClientGroup)
+OUTILS_RECHERCHE = {"recherche_vectorielle"}
+
+
+def extraire_textes(msg: ToolMessage) -> list[str]:
+    """Le contenu d'un ToolMessage MCP est soit une chaîne, soit une liste de blocs."""
+    if isinstance(msg.content, str):
+        return [msg.content]
+    return [b["text"] for b in msg.content
+            if isinstance(b, dict) and b.get("type") == "text"]
+
+
+class CaptureState(AgentState):
+    documents_outils: Annotated[list[str], add]   # on accumule sur tous les appels
+
+
+class CaptureDocuments(AgentMiddleware):
+    state_schema = CaptureState
+
+    def _capturer(self, request, result):
+        if (request.tool_call["name"] not in OUTILS_RECHERCHE
+                or not isinstance(result, ToolMessage)
+                or result.status == "error"):
+            return result
+        return Command(update={
+            "messages": [result],                        # le LLM doit toujours voir la sortie
+            "documents_outils": extraire_textes(result),
+        })
+
+    def wrap_tool_call(self, request, handler):
+        return self._capturer(request, handler(request))
+
+    async def awrap_tool_call(self, request, handler):
+        return self._capturer(request, await handler(request))
+
+
+
+
+
+
 from operator import add
 from typing import Annotated
 from langchain.agents import AgentState
