@@ -1,3 +1,12 @@
+from deepagents import create_deep_agent
+
+deep = create_deep_agent(
+    model="anthropic:claude-sonnet-4-6",
+    tools=mcp_tools,
+    system_prompt="Tu réponds aux questions en cherchant dans la base documentaire.",
+    middleware=[CaptureDocuments()],
+    # pas de checkpointer ici : c'est celui de ton graphe parent qui compte
+)
 
 
 
