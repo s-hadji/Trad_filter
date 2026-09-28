@@ -1,5 +1,148 @@
 
 
+
+import json
+
+from langchain_core.documents import Document
+from langchain_core.messages import AIMessage
+from pydantic_ai.messages import RetryPromptPart, ToolCallPart, ToolReturnPart
+
+DIAG = True  # passe à False une fois que tout marche
+TEXT_KEYS = ("page_content", "content", "text")
+
+
+# ---------- Conversion en Document (sérialisable par le checkpointer) ----------
+def to_doc(doc) -> Document:
+    if isinstance(doc, Document):
+        return doc
+    if isinstance(doc, dict):
+        # On garde TOUS les champs du doc brut dans metadata (pas seulement doc["metadata"])
+        metadata = {k: v for k, v in doc.items() if k not in TEXT_KEYS and k != "metadata"}
+        metadata.update(doc.get("metadata") or {})
+        # Fallback si le nom du document est sous une autre clé
+        if not metadata.get("doc_name"):
+            metadata["doc_name"] = metadata.get("title") or metadata.get("source") or metadata.get("name") or "inconnu"
+        content = next((doc[k] for k in TEXT_KEYS if doc.get(k)), "")
+        return Document(page_content=str(content), metadata=metadata)
+    return Document(page_content=str(doc), metadata={"doc_name": "inconnu"})
+
+
+def parse_content(content):
+    """Parse le JSON texte renvoyé par certains serveurs MCP."""
+    if isinstance(content, str):
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            return content
+    return content
+
+
+# ---------- Diagnostic ----------
+def log_tool_calls(result, preview: int = 300) -> None:
+    for msg in result.all_messages():
+        for part in getattr(msg, "parts", []):
+            if isinstance(part, ToolCallPart):
+                log.info(f"[APPEL] {part.tool_name} args={part.args_as_dict()}")
+            elif isinstance(part, ToolReturnPart):
+                c = parse_content(part.content)
+                log.info(f"[RETOUR] {part.tool_name} type={type(c).__name__} aperçu={str(c)[:preview]}")
+            elif isinstance(part, RetryPromptPart):
+                log.warning(f"[ERREUR OUTIL] {part.tool_name}: {part.content}")
+    log.info(f"[DIAG] OUTILS_RECHERCHE = {OUTILS_RECHERCHE}")
+
+
+def diag_docs(extracted_docs, docs, n: int = 3) -> None:
+    try:
+        from app.data.conversation_db import Localisation
+        requis = [k for k, f in Localisation.model_fields.items() if f.is_required()]
+    except Exception as e:
+        requis = ["doc_name"]
+        log.warning(f"[DIAG] Import Localisation impossible ({e}), vérif sur doc_name seulement")
+    log.info(f"[DIAG] Champs requis par Localisation : {requis}")
+    log.info(f"[DIAG] {len(extracted_docs)} bruts -> {len(docs)} Documents")
+
+    for i, raw in enumerate(extracted_docs[:n]):
+        if isinstance(raw, dict):
+            log.info(f"[BRUT {i}] clés={list(raw.keys())} metadata={raw.get('metadata')}")
+        else:
+            log.info(f"[BRUT {i}] type={type(raw).__name__} aperçu={str(raw)[:200]}")
+
+    for i, d in enumerate(docs[:n]):
+        manquants = [k for k in requis if d.metadata.get(k) is None]
+        log.info(f"[DOC {i}] metadata={d.metadata}")
+        if manquants:
+            log.warning(f"[DOC {i}] MANQUANTS pour Localisation : {manquants}")
+
+
+# ---------- Nœud ----------
+async def noeud_pydantic_agent(state: dict) -> dict:
+    """Nœud du graphe qui utilise le pydantic_agent. Point de sortie final du graphe."""
+    # 1. Question
+    question = state.get("standalone_question") or state.get("question")
+    if not question:
+        raise ValueError("Aucune question trouvée dans le state.")
+
+    # 2. Agent
+    agent = await get_pydantic_agent()
+
+    # 3. Dépendances
+    user_info = state.get("user_info")
+    deps = AgentDeps(
+        user_id=user_info[0] if user_info else "unknown",
+        token=user_info[1] if user_info else "",
+        accessible_docs=fetch_accessible_docs(user_info, state.get("message_create")),
+    )
+
+    # 4. Exécution
+    result = await agent.run(question, deps=deps)
+    if DIAG:
+        log_tool_calls(result)
+
+    # 5. Capture des documents via les appels d'outils
+    extracted_docs = []
+    for msg in result.all_messages():
+        for part in getattr(msg, "parts", []):
+            if isinstance(part, ToolReturnPart) and part.tool_name in OUTILS_RECHERCHE:
+                content = parse_content(part.content)
+                if content is None:
+                    continue
+                if isinstance(content, list):
+                    extracted_docs.extend(content)
+                else:
+                    extracted_docs.append(content)
+
+    # 6. Dédoublonnage + conversion
+    docs: list[Document] = []
+    seen_ids = set()
+    for doc in extracted_docs:
+        doc_id = doc.get("id") if isinstance(doc, dict) else None
+        if doc_id is not None:
+            if doc_id in seen_ids:
+                continue
+            seen_ids.add(doc_id)
+        docs.append(to_doc(doc))
+
+    if DIAG:
+        diag_docs(extracted_docs, docs)
+    log.info(f"Documents extraits via le pydantic_agent {len(docs)} pour la question: {question}")
+
+    # 7. Réponse finale
+    final_answer = getattr(result, "output", None) or getattr(result, "data", None)
+    if final_answer is None:
+        final_answer = "Désolé, aucune réponse générée."
+    elif not isinstance(final_answer, str):
+        final_answer = str(final_answer)
+
+    # 8. Retour
+    return {
+        "documents": docs,
+        "generation": final_answer,
+        "messages": [AIMessage(content=final_answer)],
+        "route": "pydantic_agent",
+    }
+
+
+
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage
 from pydantic_ai.messages import ToolReturnPart
