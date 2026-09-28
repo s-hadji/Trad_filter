@@ -2,6 +2,58 @@
 
 import json
 from dataclasses import dataclass, field
+from langchain_core.messages import AIMessage
+from pydantic_ai.messages import ToolReturnPart
+
+
+@dataclass
+class DocObject:  # dataclass = sérialisable par le checkpointer
+    page_content: str
+    metadata: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_mcp(cls, d) -> "DocObject":
+        if not isinstance(d, dict):
+            return cls(str(d), {"source": "inconnu"})
+        meta = {**{k: v for k, v in d.items() if k not in ("content", "page_content", "metadata")}, **(d.get("metadata") or {})}
+        meta["source"] = meta.get("source") or meta.get("DM_code") or meta.get("DM_title") or "inconnu"  # lu par la DB
+        meta.setdefault("id_document", meta.get("id"))
+        return cls(str(d.get("page_content") or d.get("content") or ""), meta)
+
+
+async def noeud_pydantic_agent(state: dict) -> dict:
+    question = state.get("standalone_question") or state.get("question")
+    user_info = state.get("user_info") or ("unknown", "")
+    deps = AgentDeps(user_id=user_info[0], token=user_info[1],
+                     accessible_docs=fetch_accessible_docs(user_info, state.get("message_create")))
+
+    agent = await get_pydantic_agent()
+    result = await agent.run(question, deps=deps)
+
+    # Documents renvoyés par les outils de recherche, dédoublonnés par id
+    docs = {}
+    for msg in result.all_messages():
+        for part in getattr(msg, "parts", []):
+            if isinstance(part, ToolReturnPart) and any(x in part.tool_name for x in ("search", "get_chunks")):
+                c = json.loads(part.content) if isinstance(part.content, str) else part.content
+                items = c.get("results", []) if isinstance(c, dict) else c or []
+                for d in items:
+                    doc = DocObject.from_mcp(d)
+                    docs[str(doc.metadata.get("id") or len(docs))] = doc
+
+    answer = str(result.output or "Désolé, aucune réponse générée.")
+    log.info(f"{len(docs)} documents pour : {question}")
+
+    return {
+        "documents": list(docs.values()),
+        "generation": answer,
+        "messages": [AIMessage(content=answer)],
+        "route": "pydantic_agent",
+    }
+
+
+import json
+from dataclasses import dataclass, field
 
 from langchain_core.messages import AIMessage
 from pydantic_ai.messages import RetryPromptPart, ToolCallPart, ToolReturnPart
