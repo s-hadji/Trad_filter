@@ -1,3 +1,23 @@
+
+from pydantic_ai.messages import ToolReturnPart
+
+# 5. Capture des documents
+extracted_docs: list[str] = []
+for msg in result.all_messages():
+    for part in msg.parts:
+        if isinstance(part, ToolReturnPart) and part.tool_name in OUTILS_RECHERCHE:
+            content = part.content if isinstance(part.content, str) else part.model_response_str()
+            extracted_docs.append(content)
+
+docs = list(dict.fromkeys(extracted_docs))  # dédoublonnage en gardant l'ordre
+log.info(f"Documents extraits via le pydantic_agent {len(docs)} pour la question: {question}")
+
+final_answer = result.output
+
+return {"documents": docs, "generation": final_answer}
+
+
+
 from deepagents import create_deep_agent
 
 deep = create_deep_agent(
