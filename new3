@@ -2,6 +2,108 @@
 
 import json
 from dataclasses import dataclass, field
+
+from langchain_core.messages import AIMessage
+from pydantic_ai.messages import RetryPromptPart, ToolCallPart, ToolReturnPart
+
+OUTILS_DOCS = ("search", "get_chunks")             # morceaux de noms des outils qui renvoient des documents
+LIST_KEYS = ("results", "chunks", "documents")     # clés possibles contenant la liste de documents
+
+
+# ---------- Objet document (dataclass = sérialisable par le checkpointer) ----------
+@dataclass
+class DocObject:
+    page_content: str
+    metadata: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_mcp(cls, d) -> "DocObject":
+        if not isinstance(d, dict):
+            return cls(str(d), {"source": "inconnu"})
+        meta = {**{k: v for k, v in d.items() if k not in ("content", "page_content", "metadata")},
+                **(d.get("metadata") or {})}
+        meta["source"] = meta.get("source") or meta.get("DM_code") or meta.get("DM_title") or "inconnu"  # lu par la DB
+        meta.setdefault("id_document", meta.get("id"))
+        return cls(str(d.get("page_content") or d.get("content") or ""), meta)
+
+
+# ---------- Capture des documents + logs de tous les appels d'outils ----------
+def capture_docs(result) -> dict:
+    docs = {}
+    for msg in result.all_messages():
+        for part in getattr(msg, "parts", []):
+            if isinstance(part, ToolCallPart):
+                log.info(f"[APPEL] {part.tool_name} args={part.args_as_dict()}")
+
+            elif isinstance(part, RetryPromptPart):
+                log.warning(f"[ERREUR OUTIL] {part.tool_name}: {part.content}")
+
+            elif isinstance(part, ToolReturnPart):
+                c = part.content
+                if isinstance(c, str):
+                    try:
+                        c = json.loads(c)
+                    except json.JSONDecodeError:
+                        pass
+                apercu = str(c)[:300]
+
+                if not any(x in part.tool_name for x in OUTILS_DOCS):
+                    log.info(f"[IGNORÉ hors filtre] {part.tool_name} | {apercu}")
+                    continue
+
+                if isinstance(c, dict):
+                    items = next((c[k] for k in LIST_KEYS if k in c), None)
+                    if items is None:
+                        log.warning(f"[PERDU aucune clé {LIST_KEYS}] {part.tool_name} clés={list(c)} | {apercu}")
+                        items = []
+                elif isinstance(c, list):
+                    items = c
+                else:
+                    log.warning(f"[PERDU format inattendu] {part.tool_name} type={type(c).__name__} | {apercu}")
+                    items = []
+                if not isinstance(items, list):
+                    items = [items]
+
+                avant = len(docs)
+                for d in items:
+                    doc = DocObject.from_mcp(d)
+                    docs[str(doc.metadata.get("id") or f"sans_id_{len(docs)}")] = doc
+                log.info(f"[CAPTURÉ] {part.tool_name} : {len(items)} éléments -> {len(docs) - avant} nouveaux docs")
+    return docs
+
+
+# ---------- Nœud du graphe ----------
+async def noeud_pydantic_agent(state: dict) -> dict:
+    question = state.get("standalone_question") or state.get("question")
+    if not question:
+        raise ValueError("Aucune question trouvée dans le state.")
+
+    user_info = state.get("user_info") or ("unknown", "")
+    deps = AgentDeps(
+        user_id=user_info[0],
+        token=user_info[1],
+        accessible_docs=fetch_accessible_docs(user_info, state.get("message_create")),
+    )
+
+    agent = await get_pydantic_agent()
+    result = await agent.run(question, deps=deps)
+
+    docs = capture_docs(result)
+    answer = str(result.output or "Désolé, aucune réponse générée.")
+    log.info(f"{len(docs)} documents pour : {question}")
+
+    return {
+        "documents": list(docs.values()),
+        "generation": answer,
+        "messages": [AIMessage(content=answer)],
+        "route": "pydantic_agent",
+    }
+
+
+
+
+import json
+from dataclasses import dataclass, field
 from langchain_core.messages import AIMessage
 from pydantic_ai.messages import ToolReturnPart
 
