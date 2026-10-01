@@ -1,5 +1,121 @@
 
 
+import asyncio
+from collections.abc import AsyncIterator, Sequence
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
+from pydantic_ai import Agent, AgentRunResultEvent, AgentStreamEvent
+from pydantic_ai.messages import ModelMessage
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.openai import OpenAIProvider
+
+# --- Garde tes imports existants pour ces éléments ---
+# from ... import MCPToolset          # même import qu'avant
+# from app.config import Settings, get_settings
+# BASE_SYSTEM_PROMPT = """..."""      # inchangé
+# OUTILS_RECHERCHE = {...}            # inchangé
+
+MCP_URL = "http://localhost:8000/mcp"  # idéalement : settings.URL_MCP
+
+
+# =============================================================================
+# DEPS : visibles uniquement par TON code Python (tools, hooks), jamais envoyés au MCP
+# =============================================================================
+@dataclass
+class AgentDeps:
+    user_id: str
+    token: str
+    accessible_docs: List[str] = field(default_factory=list)   # pré-filtre seulement ; le MCP revérifie
+    documents_outils: List[str] = field(default_factory=list)
+
+
+# def fetch_accessible_docs(...)  -> inchangé
+
+
+# =============================================================================
+# AGENT PARTAGÉ : modèle + prompt, SANS toolset MCP (pas d'identité dedans)
+# =============================================================================
+pydantic_agent: Optional[Agent] = None
+_init_lock = asyncio.Lock()
+
+
+async def init_pydantic_agent() -> Agent:
+    global pydantic_agent
+    settings: Settings = get_settings()
+
+    openai_provider = OpenAIProvider(
+        base_url=settings.URL_LLM_RAG,
+        api_key=settings.API_KEY_RAG,
+    )
+    model = OpenAIChatModel(settings.MODEL_NAME, provider=openai_provider)
+
+    pydantic_agent = Agent(
+        model=model,
+        deps_type=AgentDeps,
+        system_prompt=BASE_SYSTEM_PROMPT,
+        # pas de toolsets=[...] ici : il est ajouté à chaque run avec le token de l'utilisateur
+    )
+    return pydantic_agent
+
+
+async def get_pydantic_agent() -> Agent:
+    global pydantic_agent
+    if pydantic_agent is None:
+        async with _init_lock:
+            if pydantic_agent is None:
+                await init_pydantic_agent()
+    return pydantic_agent
+
+
+# =============================================================================
+# TOOLSET MCP PAR REQUÊTE : un client = une identité
+# =============================================================================
+def build_mcp_toolset(token: str) -> MCPToolset:
+    transport = StreamableHttpTransport(MCP_URL, auth=token)  # token brut, FastMCP ajoute "Bearer "
+    return MCPToolset(Client(transport))
+
+
+# =============================================================================
+# POINTS D'ENTRÉE À APPELER DEPUIS agents_flow.py
+# =============================================================================
+async def run_agent(
+    prompt: str,
+    deps: AgentDeps,
+    message_history: Sequence[ModelMessage] | None = None,
+):
+    """Version non streamée : renvoie le même AgentRunResult que agent.run()
+    (donc .output et .all_messages() marchent comme avant, capture_docs inchangé)."""
+    if not deps.token:
+        raise ValueError(f"Pas de token pour l'utilisateur {deps.user_id!r} : appel MCP impossible.")
+    agent = await get_pydantic_agent()
+    return await agent.run(
+        prompt,
+        deps=deps,
+        message_history=message_history,
+        toolsets=[build_mcp_toolset(deps.token)],  # identité de CETTE requête uniquement
+    )
+
+
+async def run_agent_events(
+    prompt: str,
+    deps: AgentDeps,
+    message_history: Sequence[ModelMessage] | None = None,
+) -> AsyncIterator[AgentStreamEvent | AgentRunResultEvent]:
+    agent = await get_pydantic_agent()
+    async with agent.run_stream_events(
+        prompt,
+        deps=deps,
+        message_history=message_history,
+        toolsets=[build_mcp_toolset(deps.token)],  # identité de CETTE requête uniquement
+    ) as events:
+        async for event in events:
+            yield event
+
+
+
 import json
 from dataclasses import dataclass, field
 
