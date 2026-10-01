@@ -1,5 +1,26 @@
 
 
+import httpx
+from fastmcp.server.auth import AccessToken, TokenVerifier
+from app.config import settings
+
+class AuthentTokenVerifier(TokenVerifier):
+    async def verify_token(self, token: str) -> AccessToken | None:
+        try:
+            async with httpx.AsyncClient(timeout=5, verify=False) as http:   # même verify=False que ton code
+                r = await http.get(f"{settings.URL_AUTHENT}/token",
+                                   headers={"Authorization": f"Bearer {token}"})
+        except httpx.HTTPError:
+            return None                      # timeout / connexion → 401, comme ton FastAPI
+        if r.status_code != 200:
+            return None                      # token refusé → 401
+        data = r.json()
+        sub = data.get("sub")
+        if not sub:
+            return None
+        return AccessToken(token=token, client_id=sub, scopes=[], claims=data)
+
+
 # app/auth/acl.py
 # Dépendance FastMCP : fournit aux outils l'ensemble des documents accessibles à l'utilisateur.
 # Lit d'abord la UserSession ; si absente ou périmée, interroge le VCS puis met à jour la session.
