@@ -1,5 +1,79 @@
 
 
+import time
+
+import httpx
+from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.server.auth.providers.jwt import JWTVerifier
+from fastmcp.server.dependencies import get_access_token
+from fastmcp.server.sessions import UserSession
+
+URL_VCS = "https://vcs.intra"   # -> settings.URL_VCS
+ACL_TTL = 300                    # secondes : délai max avant qu'une révocation VCS soit prise en compte
+
+# -----------------------------------------------------------------------------
+# 1. VÉRIFICATION : faite par FastMCP AVANT chaque outil.
+#    Token invalide / expiré / mauvais iss ou aud -> 401, l'outil ne tourne jamais.
+# -----------------------------------------------------------------------------
+mcp = FastMCP(
+    "genai-mcp",
+    auth=JWTVerifier(
+        jwks_uri="https://<ton-idp>/.well-known/jwks.json",
+        issuer="https://<ton-idp>",
+        audience="<aud présent dans tes tokens>",
+    ),
+)
+
+
+# -----------------------------------------------------------------------------
+# 2. RÉUTILISATION : le token brut sert à appeler le VCS au nom de l'utilisateur
+# -----------------------------------------------------------------------------
+async def fetch_docs_from_vcs(user_token: str) -> list[str]:
+    async with httpx.AsyncClient(timeout=10) as http:
+        r = await http.get(
+            f"{URL_VCS}/bases/",
+            headers={"Authorization": f"Bearer {user_token}", "Accept": "application/json"},
+        )
+        r.raise_for_status()
+        return [str(d["id"]) for d in r.json()]   # TODO : adapter au format réel de ta réponse VCS
+
+
+# -----------------------------------------------------------------------------
+# 3. CACHE PAR UTILISATEUR : UserSession = casier de l'utilisateur authentifié
+# -----------------------------------------------------------------------------
+async def allowed_docs(session: UserSession) -> set[str]:
+    acl = await session.get("acl")
+    if acl and time.time() - acl["fetched_at"] < ACL_TTL:
+        return set(acl["docs"])                       # cache valide : 0 appel VCS
+    token = get_access_token()                        # le token déjà vérifié à l'étape 1
+    docs = await fetch_docs_from_vcs(token.token)     # .token = chaîne brute du JWT
+    await session.set("acl", {"docs": docs, "fetched_at": time.time()})
+    return set(docs)
+
+
+# -----------------------------------------------------------------------------
+# 4. OUTILS : filtrent leurs résultats avec les droits de l'appelant
+# -----------------------------------------------------------------------------
+@mcp.tool
+async def search_content(query: str, session: UserSession) -> list[dict]:
+    allowed = await allowed_docs(session)
+    chunks = await my_search(query)                   # ta recherche existante
+    return [c for c in chunks if str(c.get("id_document")) in allowed]
+
+
+@mcp.tool
+async def get_chunks_by_dm_code(dm_code: str, id_document: str, session: UserSession) -> list[dict]:
+    if id_document not in await allowed_docs(session):
+        raise ToolError(f"Accès refusé : {id_document}")
+    return await my_get_chunks(dm_code, id_document)  # ta fonction existante
+
+
+if __name__ == "__main__":
+    mcp.run(transport="http", host="0.0.0.0", port=8000)   # endpoint : /mcp
+
+
+
 import asyncio
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
