@@ -1,5 +1,43 @@
 
 
+# app/auth/acl.py
+# Dépendance FastMCP : fournit aux outils l'ensemble des documents accessibles à l'utilisateur.
+# Lit d'abord la UserSession ; si absente ou périmée, interroge le VCS puis met à jour la session.
+import time
+
+import httpx
+from fastmcp.dependencies import CurrentAccessToken
+from fastmcp.server.auth import AccessToken
+from fastmcp.server.sessions import CurrentSession, UserSession
+
+from app.config import settings
+
+SESSION_KEY = "accessible_docs"
+
+
+async def _fetch_from_vcs(user_token: str) -> list[str]:
+    async with httpx.AsyncClient(timeout=10) as http:
+        r = await http.get(
+            f"{settings.URL_VCS}/bases/",
+            headers={"Authorization": f"Bearer {user_token}", "Accept": "application/json"},
+        )
+        r.raise_for_status()
+    return [str(d["id"]) for d in r.json()]   # TODO : adapter au format réel de la réponse VCS
+
+
+async def get_accessible_docs(
+    session: UserSession = CurrentSession(),      # casier de l'utilisateur authentifié
+    token: AccessToken = CurrentAccessToken(),    # token vérifié par auth= du serveur
+) -> set[str]:
+    cached = await session.get(SESSION_KEY)
+    if cached and time.time() - cached["fetched_at"] < settings.ACL_TTL:
+        return set(cached["docs"])                # présent et frais → aucun appel VCS
+
+    docs = await _fetch_from_vcs(token.token)
+    await session.set(SESSION_KEY, {"docs": docs, "fetched_at": time.time()})   # liste : JSON-sérialisable
+    return set(docs)
+
+
 import time
 
 import httpx
