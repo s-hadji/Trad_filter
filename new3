@@ -1,5 +1,108 @@
 
 
+import re
+import difflib
+
+SKIP_DEFAUT = " \t\n\r\f\v.,;:!?-_/\\|()[]{}'\"`~^*+=<>&#@$%°"
+
+
+def _tokens_et_cles(texte: str, skip: str):
+    """Découpe sans perte + clés normalisées pour la comparaison.
+
+    toks   : partition exacte du texte ("".join(toks) == texte)
+    cles   : tokens débarrassés des skip characters (les tokens vides sont retirés)
+    bornes : bornes[k] = index du premier token appartenant à la clé k ;
+             bornes[0] = 0 et bornes[-1] = len(toks), donc une plage de clés
+             [i1, i2) correspond aux tokens toks[bornes[i1]:bornes[i2]]
+             (la ponctuation / les espaces qui suivent une clé lui sont rattachés).
+    """
+    toks = re.findall(r"\S+|\s+", texte)
+    table = str.maketrans("", "", skip)
+    cles, idx = [], []
+    for k, tok in enumerate(toks):
+        c = tok.translate(table)
+        if c:  # token non négligeable
+            cles.append(c)  # ajouter .lower() ici pour ignorer la casse
+            idx.append(k)
+    bornes = [0] + idx[1:] + [len(toks)]
+    return toks, cles, bornes
+
+
+def _entoure(ref: str, contenu: str) -> str:
+    """Remet autour de la balise les espaces de début/fin du texte d'origine."""
+    debut = ref[: len(ref) - len(ref.lstrip())]
+    fin = ref[len(ref.rstrip()):]
+    return f"{debut}{contenu}{fin}"
+
+
+def diff_unifie(
+    v1: str,
+    v2: str,
+    seuil_fusion: int = 5,
+    contexte_mots: int = 7,
+    skip_characters: str = SKIP_DEFAUT,
+) -> str:
+    ta, ka, ba = _tokens_et_cles(v1, skip_characters)
+    tb, kb, bb = _tokens_et_cles(v2, skip_characters)
+
+    # 1) Alignement sur les clés (sans skip chars), sans heuristique autojunk
+    ops_cles = difflib.SequenceMatcher(None, ka, kb, autojunk=False).get_opcodes()
+
+    # 2) Retour aux plages de tokens d'origine
+    opcodes = [(t, ba[i1], ba[i2], bb[j1], bb[j2]) for t, i1, i2, j1, j2 in ops_cles]
+
+    # 3) Un petit bloc égal coincé ENTRE deux changements est absorbé.
+    #    get_opcodes alterne equal / non-equal, donc "entre deux" <=> 0 < k < n-1.
+    n = len(opcodes)
+    fusionnes = []
+    for k, (tag, i1, i2, j1, j2) in enumerate(opcodes):
+        court = tag == "equal" and len("".join(tb[j1:j2]).strip()) < seuil_fusion
+        if court and 0 < k < n - 1:
+            tag = "replace"
+        fusionnes.append((tag, i1, i2, j1, j2))
+
+    # 4) Compactage des changements consécutifs
+    compacts = []
+    for tag, i1, i2, j1, j2 in fusionnes:
+        if compacts and tag != "equal" and compacts[-1][0] != "equal":
+            _, pi1, _, pj1, _ = compacts[-1]
+            compacts[-1] = ("replace", pi1, i2, pj1, j2)
+        else:
+            compacts.append((tag, i1, i2, j1, j2))
+
+    # 5) Rendu
+    limite = contexte_mots * 2  # approx. : un mot + un espace par mot
+    sortie = []
+    for idx, (tag, i1, i2, j1, j2) in enumerate(compacts):
+        avant, apres = "".join(ta[i1:i2]), "".join(tb[j1:j2])
+        if tag == "equal":
+            mots = tb[j1:j2]  # on affiche la version v2 du texte inchangé
+            debut, fin = idx > 0, idx < len(compacts) - 1
+            if debut and fin and len(mots) > 2 * limite:
+                sortie.append("".join(mots[:limite]) + " [...] " + "".join(mots[-limite:]))
+            elif fin and not debut and len(mots) > limite:
+                sortie.append("[...] " + "".join(mots[-limite:]))
+            elif debut and not fin and len(mots) > limite:
+                sortie.append("".join(mots[:limite]) + " [...]")
+            else:
+                sortie.append("".join(mots))
+        elif tag == "replace":
+            sortie.append(_entoure(apres or avant,
+                                   f"[MODIFIE | avant: {avant.strip()} | apres: {apres.strip()}]"))
+        elif tag == "delete":
+            sortie.append(_entoure(avant, f"[SUPPRIME | avant: {avant.strip()}]"))
+        elif tag == "insert":
+            sortie.append(_entoure(apres, f"[AJOUTE | apres: {apres.strip()}]"))
+    return "".join(sortie)
+
+
+if __name__ == "__main__":
+    print(diff_unifie("Le chat, noir.", "Le chat noir"))
+    print(diff_unifie("le gros chat dort", "le chat dort"))
+    print(diff_unifie("x y", "z y"))
+
+
+
 import httpx
 from fastmcp.server.auth import AccessToken, TokenVerifier
 from app.config import settings
