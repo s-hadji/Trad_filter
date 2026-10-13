@@ -2,6 +2,170 @@
 
 import re
 import difflib
+from html import escape
+
+SKIP_DEFAUT = " \t\n\r\f\v.,;:!?-_/\\|()[]{}'\"`~^*+=<>&#@$%°"
+
+
+# ---------------------------------------------------------------- découpe / alignement
+
+def _tokens_et_cles(texte: str, skip: str):
+    """toks : partition exacte du texte ; cles : tokens sans skip chars (vides retirés) ;
+    bornes : la plage de clés [i1, i2) correspond à toks[bornes[i1]:bornes[i2]]."""
+    toks = re.findall(r"\S+|\s+", texte)
+    table = str.maketrans("", "", skip)
+    cles, idx = [], []
+    for k, tok in enumerate(toks):
+        c = tok.translate(table)
+        if c:
+            cles.append(c)  # .lower() ici pour ignorer la casse
+            idx.append(k)
+    bornes = [0] + idx[1:] + [len(toks)]
+    return toks, cles, bornes
+
+
+def _aligner(v1: str, v2: str, seuil_fusion: int, skip: str):
+    ta, ka, ba = _tokens_et_cles(v1, skip)
+    tb, kb, bb = _tokens_et_cles(v2, skip)
+    ops = difflib.SequenceMatcher(None, ka, kb, autojunk=False).get_opcodes()
+    ops = [(t, ba[i1], ba[i2], bb[j1], bb[j2]) for t, i1, i2, j1, j2 in ops]
+
+    # petit bloc égal coincé entre deux changements -> absorbé
+    n = len(ops)
+    ops = [("replace", *o[1:]) if o[0] == "equal" and 0 < k < n - 1
+           and len("".join(tb[o[3]:o[4]]).strip()) < seuil_fusion else o
+           for k, o in enumerate(ops)]
+
+    # changements consécutifs -> un seul
+    compacts = []
+    for tag, i1, i2, j1, j2 in ops:
+        if compacts and tag != "equal" and compacts[-1][0] != "equal":
+            _, pi1, _, pj1, _ = compacts[-1]
+            compacts[-1] = ("replace", pi1, i2, pj1, j2)
+        else:
+            compacts.append((tag, i1, i2, j1, j2))
+    return ta, tb, compacts
+
+
+# ---------------------------------------------------------------- utilitaires de rendu
+
+def _derniers_mots(toks, k):
+    """Les k derniers mots d'une liste de tokens (espaces d'origine conservés)."""
+    vus = 0
+    for p in range(len(toks) - 1, -1, -1):
+        if not toks[p].isspace():
+            vus += 1
+            if vus == k:
+                return "".join(toks[p:])
+    return "".join(toks)
+
+
+def _premiers_mots(toks, k):
+    vus = 0
+    for p, t in enumerate(toks):
+        if not t.isspace():
+            vus += 1
+            if vus == k:
+                return "".join(toks[:p + 1])
+    return "".join(toks)
+
+
+def _ligne(toks, k):
+    """Numéro de ligne (1-indexé) du token k."""
+    return "".join(toks[:k]).count("\n") + 1
+
+
+def _x(t: str) -> str:
+    """Échappe < > & pour que le texte ne puisse jamais ressembler à une balise."""
+    return escape(t.strip(), quote=False)
+
+
+def _plat(t: str) -> str:
+    """Contexte sur une seule ligne (espaces et retours à la ligne -> un espace)."""
+    return _x(" ".join(t.split()))
+
+
+TYPES = {"replace": "remplacement", "delete": "suppression", "insert": "ajout"}
+
+
+# ---------------------------------------------------------------- fonction principale
+
+def diff_unifie(
+    v1: str,
+    v2: str,
+    seuil_fusion: int = 5,
+    contexte_mots: int = 7,
+    skip_characters: str = SKIP_DEFAUT,
+) -> str:
+    """Liste des modifications de v1 -> v2, au format XML, prévue pour un LLM.
+
+    Chaque <modification> est autonome : type, ligne dans chaque version,
+    texte exact <ancien>/<nouveau>, et quelques mots de contexte (tirés de v2,
+    ou de v1 s'il n'y a pas de contexte dans v2) pour la situer.
+    """
+    ta, tb, ops = _aligner(v1, v2, seuil_fusion, skip_characters)
+    nb = sum(o[0] != "equal" for o in ops)
+
+    def bloc_egal(k):
+        """Tokens du bloc INCHANGÉ en position k (vide s'il n'y en a pas) :
+        le contexte ne peut donc jamais déborder sur une autre modification."""
+        if 0 <= k < len(ops) and ops[k][0] == "equal":
+            _, i1, i2, j1, j2 = ops[k]
+            return tb[j1:j2]
+        return []
+
+    lignes = [f'<diff nb_modifications="{nb}">']
+    num = 0
+    for k, (tag, i1, i2, j1, j2) in enumerate(ops):
+        if tag == "equal":
+            continue
+        num += 1
+        avant, apres = "".join(ta[i1:i2]), "".join(tb[j1:j2])
+        ctx_g = _plat(_derniers_mots(bloc_egal(k - 1), contexte_mots))
+        ctx_d = _plat(_premiers_mots(bloc_egal(k + 1), contexte_mots))
+
+        lignes.append(f'<modification id="{num}" type="{TYPES[tag]}" '
+                      f'ligne_v1="{_ligne(ta, i1)}" ligne_v2="{_ligne(tb, j1)}">')
+        lignes.append(f"  <contexte_avant>{ctx_g or '(début du document)'}</contexte_avant>")
+        if tag in ("replace", "delete"):
+            lignes.append(f"  <ancien>{_x(avant)}</ancien>")
+        if tag in ("replace", "insert"):
+            lignes.append(f"  <nouveau>{_x(apres)}</nouveau>")
+        lignes.append(f"  <contexte_apres>{ctx_d or '(fin du document)'}</contexte_apres>")
+        lignes.append("</modification>")
+    lignes.append("</diff>")
+    return "\n".join(lignes)
+
+
+# Texte à mettre une fois dans le prompt système du LLM qui lit la sortie
+CONSIGNE_LLM = """Le diff entre deux versions d'un document est fourni dans <diff>.
+Chaque <modification> est un changement réel et unique :
+- type="remplacement" : <ancien> a été remplacé par <nouveau>
+- type="suppression"  : <ancien> a été retiré, rien ne le remplace
+- type="ajout"        : <nouveau> a été inséré, rien n'existait avant
+<contexte_avant> et <contexte_apres> sont du texte INCHANGÉ (aplati sur une ligne), fourni
+seulement pour situer la modification : ne le traite jamais comme modifié.
+ligne_v1 / ligne_v2 = numéro de ligne où commence la modification dans chaque version.
+Les différences de ponctuation, d'espaces et de retours à la ligne sont ignorées volontairement.
+nb_modifications="0" signifie que les deux versions sont équivalentes."""
+
+
+if __name__ == "__main__":
+    v1 = ("Le contrat est conclu pour une durée de 12 mois.\n"
+          "Le prix est fixé à 1 000 euros par mois, payable le 5.\n"
+          "Le client peut résilier avec un préavis de 30 jours.")
+    v2 = ("Le contrat est conclu pour une durée de 24 mois.\n"
+          "Le prix est fixé à 1 000 euros par mois payable le 10.\n"
+          "Le client peut résilier sans frais avec un préavis de 30 jours.\n"
+          "Toute clause <spéciale> & annexe prévaut.")
+    print(diff_unifie(v1, v2))
+    print()
+    print(diff_unifie("Le chat, noir.", "Le chat noir"))
+    print(diff_unifie("le gros chat dort", "le chat dort"))
+
+
+import re
+import difflib
 
 SKIP_DEFAUT = " \t\n\r\f\v.,;:!?-_/\\|()[]{}'\"`~^*+=<>&#@$%°"
 
