@@ -1,6 +1,202 @@
 
 
 
+"""Compare deux versions d'une liste de chunks et génère un rapport HTML.
+
+Entrée : listes de dicts {"content": str, "extra_information": {"Dm_code": ..., "Applic": ...}}
+Usage  : write_html(compare(v1, v2), "diff.html")
+"""
+import difflib, json, re
+from collections import defaultdict
+from pathlib import Path
+
+KEY_DM, KEY_APPLIC = "Dm_code", "Applic"
+TOKEN = re.compile(r"\w+|\s+|[^\w\s]")  # mots, espaces, ponctuation
+SIMILAR = 0.5                            # seuil pour apparier deux lignes modifiées
+
+
+def group(items):
+    """{(dm_code, applic): contenu fusionné} ; ignore les items sans Dm_code."""
+    docs = defaultdict(list)
+    for it in items:
+        ex = it.get("extra_information") or {}
+        if KEY_DM in ex:
+            applic = ex.get(KEY_APPLIC, "")
+            applic = applic if isinstance(applic, str) else json.dumps(applic, sort_keys=True, ensure_ascii=False)
+            docs[(str(ex[KEY_DM]), applic)].append(it["content"])
+    return {k: "\n".join(v) for k, v in docs.items()}
+
+
+def inline(a, b):
+    """Diff intra-ligne par mots : segments [changé(0/1), texte] pour chaque côté."""
+    ta, tb = TOKEN.findall(a), TOKEN.findall(b)
+    left, right = [], []
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, ta, tb, autojunk=False).get_opcodes():
+        if i2 > i1: left.append([int(op != "equal"), "".join(ta[i1:i2])])
+        if j2 > j1: right.append([int(op != "equal"), "".join(tb[j1:j2])])
+    return left, right
+
+
+def row(t, a=None, l=None, b=None, r=None):
+    return {"t": t, "a": a, "l": l, "b": b, "r": r}
+
+
+def diff_lines(a, b):
+    """Liste de lignes alignées : eq / mod / del / add."""
+    A, B, rows = a.splitlines(), b.splitlines(), []
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, A, B, autojunk=False).get_opcodes():
+        if op == "equal":
+            rows += [row("eq", i + 1, [[0, A[i]]], j + 1, [[0, B[j]]]) for i, j in zip(range(i1, i2), range(j1, j2))]
+            continue
+        for k in range(max(i2 - i1, j2 - j1)):
+            i, j = i1 + k, j1 + k
+            x = A[i] if i < i2 else None
+            y = B[j] if j < j2 else None
+            if x is not None and y is not None and difflib.SequenceMatcher(None, x, y).ratio() >= SIMILAR:
+                l, r = inline(x, y)
+                rows.append(row("mod", i + 1, l, j + 1, r))
+            else:
+                if x is not None: rows.append(row("del", i + 1, [[0, x]]))
+                if y is not None: rows.append(row("add", b=j + 1, r=[[0, y]]))
+    return rows
+
+
+def compare(v1, v2):
+    g1, g2 = group(v1), group(v2)
+    docs = []
+    for key in sorted(g1.keys() | g2.keys()):
+        a, b = g1.get(key, ""), g2.get(key, "")
+        rows = diff_lines(a, b)
+        status = "added" if key not in g1 else "removed" if key not in g2 else "same" if a == b else "modified"
+        docs.append({"dm": key[0], "applic": key[1], "status": status, "rows": rows,
+                     "add": sum(r["t"] in ("add", "mod") for r in rows),
+                     "del": sum(r["t"] in ("del", "mod") for r in rows)})
+    return docs
+
+
+def write_html(docs, path="diff.html"):
+    data = json.dumps(docs, ensure_ascii=False).replace("</", "<\\/")
+    Path(path).write_text(TEMPLATE.replace("__DATA__", data), encoding="utf-8")
+
+
+TEMPLATE = r"""<!doctype html><html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Diff V1 → V2</title>
+<style>
+:root{--bg:#f6f6f8;--panel:#fff;--fg:#1c1c21;--mute:#8b8b96;--line:#e8e8ee;--acc:#5b5bd6;
+--add:#e9f8ef;--addh:#a6e3bd;--del:#fdeeee;--delh:#f6b8b8;--same:#c3c3cc;--mod:#f0a020}
+@media (prefers-color-scheme:dark){:root{--bg:#0e0f12;--panel:#16171b;--fg:#e8e8ec;--mute:#777883;--line:#25262c;
+--acc:#8d8dff;--add:#10261a;--addh:#1e5b36;--del:#2a1316;--delh:#702529;--same:#45464e}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
+display:grid;grid-template-columns:290px 1fr;height:100vh}
+aside{border-right:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:0}
+aside h1{font-size:15px;margin:18px 16px 10px;letter-spacing:-.01em}
+#q{margin:0 12px 10px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:inherit;font:inherit}
+#list{overflow:auto;padding:0 8px 12px}
+.doc{all:unset;display:grid;grid-template-columns:10px 1fr auto;gap:2px 10px;align-items:center;width:100%;box-sizing:border-box;
+padding:8px 10px;border-radius:8px;cursor:pointer}
+.doc:hover{background:var(--bg)}.doc.on{background:color-mix(in srgb,var(--acc) 12%,transparent)}
+.doc::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--mod);grid-row:span 2}
+.doc.same::before{background:var(--same)}.doc.added::before{background:#2fb36b}.doc.removed::before{background:#e5484d}
+.doc b{font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis}.doc small{color:var(--mute);grid-column:2}
+.doc span{grid-row:1/3;grid-column:3;font:12px ui-monospace,monospace}.doc i{font-style:normal;margin-left:6px}
+.a{color:#2fb36b}.d{color:#e5484d}
+main{display:flex;flex-direction:column;min-width:0;min-height:0}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel)}
+#title{flex:1;min-width:200px;font-weight:600}#title small{color:var(--mute);font-weight:400;margin-left:8px}
+.pill{font-size:11px;padding:2px 8px;border-radius:99px;background:var(--bg);color:var(--mute);margin-left:8px;font-weight:500}
+.seg{display:flex;background:var(--bg);border-radius:8px;padding:3px}
+.seg button{all:unset;padding:5px 12px;border-radius:6px;cursor:pointer;color:var(--mute);font-size:13px}
+.seg button.on{background:var(--panel);color:var(--fg);box-shadow:0 1px 3px #0002}
+label{font-size:13px;color:var(--mute);display:flex;gap:6px;align-items:center;cursor:pointer}
+#wrap{overflow:auto;flex:1}
+table{border-collapse:collapse;width:100%;table-layout:fixed;font:12.5px/1.6 ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+td{vertical-align:top;padding:0 10px;white-space:pre-wrap;word-break:break-word}
+td.n{width:52px;text-align:right;color:var(--mute);user-select:none;padding-right:8px}
+td.s{width:18px;color:var(--mute);user-select:none;padding:0}
+td.del{background:var(--del)}td.add{background:var(--add)}td.empty{background:repeating-linear-gradient(135deg,transparent 0 6px,var(--line) 6px 7px)}
+td.n.del,td.n.add{filter:brightness(.97)}
+mark{border-radius:3px;color:inherit;padding:0 1px}mark.del{background:var(--delh)}mark.add{background:var(--addh)}
+tr:hover td.c{outline:1px solid color-mix(in srgb,var(--acc) 25%,transparent);outline-offset:-1px}
+.split td.c{border-left:1px solid var(--line)}
+.empty-state{padding:60px;text-align:center;color:var(--mute)}
+@media (max-width:760px){body{grid-template-columns:1fr;grid-template-rows:38vh 1fr}}
+</style></head><body>
+<aside><h1>Diff V1 → V2</h1><input id="q" placeholder="Filtrer DM code / Applic…"><div id="list"></div></aside>
+<main><header><div id="title"></div>
+<div class="seg" id="views"><button data-v="split" class="on">Côte à côte</button><button data-v="unified">Unifié</button>
+<button data-v="v1">V1</button><button data-v="v2">V2</button></div>
+<label><input type="checkbox" id="only"> Changements seuls</label></header>
+<div id="wrap"><table id="diff"></table></div></main>
+<script>
+const D = __DATA__, $ = s => document.querySelector(s);
+const LABEL = {same: "identique", modified: "modifié", added: "ajouté en V2", removed: "supprimé en V2"};
+let cur = D.findIndex(d => d.status != "same"), view = "split";
+if (cur < 0) cur = 0;
+const esc = s => s.replace(/[&<>"]/g, c => `&#${c.charCodeAt(0)};`);
+const seg = (s, m) => s ? s.map(([h, t]) => h ? `<mark class="${m}">${esc(t)}</mark>` : esc(t)).join("") : "";
+const td = (n, s, m, cls) => `<td class="n ${cls}">${n ?? ""}</td><td class="c ${cls}">${seg(s, m)}</td>`;
+const uni = (a, b, sign, s, m) => `<tr><td class="n ${m}">${a ?? ""}</td><td class="n ${m}">${b ?? ""}</td><td class="s ${m}">${sign}</td><td class="c ${m}">${seg(s, m)}</td></tr>`;
+
+function render() {
+  const d = D[cur], only = $("#only").checked;
+  if (!d) return $("#diff").innerHTML = `<tr><td class="empty-state">Aucun document</td></tr>`;
+  $("#title").innerHTML = `${esc(d.dm)}<small>${esc(d.applic)}</small><span class="pill">${LABEL[d.status]}</span>`;
+  let h = "";
+  for (const r of d.rows) {
+    const ch = r.t != "eq", L = r.a != null, R = r.b != null;
+    if (only && !ch) continue;
+    if (view == "split")
+      h += `<tr>${td(r.a, r.l, "del", !L ? "empty" : ch ? "del" : "")}${td(r.b, r.r, "add", !R ? "empty" : ch ? "add" : "")}</tr>`;
+    else if (view == "unified")
+      h += !ch ? uni(r.a, r.b, " ", r.l, "") : (L ? uni(r.a, null, "−", r.l, "del") : "") + (R ? uni(null, r.b, "+", r.r, "add") : "");
+    else {
+      const v1 = view == "v1", n = v1 ? r.a : r.b, m = v1 ? "del" : "add";
+      if (n != null) h += `<tr>${td(n, v1 ? r.l : r.r, m, ch ? m : "")}</tr>`;
+    }
+  }
+  const t = $("#diff");
+  t.className = view;
+  const COLS = {split: "52,,52,", unified: "52,52,18,", v1: "52,", v2: "52,"};
+  t.innerHTML = `<colgroup>${COLS[view].split(",").map(w => `<col style="width:${w ? w + "px" : "auto"}">`).join("")}</colgroup>`
+    + (h || `<tr><td class="empty-state">Aucune différence</td></tr>`);
+}
+
+function list() {
+  const q = $("#q").value.toLowerCase(), only = $("#only").checked;
+  $("#list").innerHTML = D.map((d, i) =>
+    (only && d.status == "same") || !`${d.dm} ${d.applic}`.toLowerCase().includes(q) ? "" :
+    `<button class="doc ${d.status} ${i == cur ? "on" : ""}" data-i="${i}" title="${LABEL[d.status]}">
+     <b>${esc(d.dm)}</b><small>${esc(d.applic) || "—"}</small>
+     <span>${d.add ? `<i class="a">+${d.add}</i>` : ""}${d.del ? `<i class="d">−${d.del}</i>` : ""}</span></button>`).join("");
+}
+
+$("#list").onclick = e => { const b = e.target.closest(".doc"); if (b) { cur = +b.dataset.i; list(); render(); } };
+$("#views").onclick = e => { const v = e.target.dataset.v; if (!v) return;
+  view = v; document.querySelectorAll("#views button").forEach(b => b.classList.toggle("on", b == e.target)); render(); };
+$("#q").oninput = list;
+$("#only").onchange = () => { list(); render(); };
+list(); render();
+</script></body></html>"""
+
+
+if __name__ == "__main__":
+    def item(dm, applic, content): return {"content": content, "extra_information": {"Dm_code": dm, "Applic": applic}}
+    v1 = [item("DMC-A-00-10", "MSN 001-050", "Remove the access panel 312AR.\nDisconnect connector J12."),
+          item("DMC-A-00-10", "MSN 001-050", "Torque the bolts to 12 N.m.\nInstall the panel."),
+          item("DMC-A-00-10", "MSN 051-099", "Remove the access panel 312AR."),
+          item("DMC-B-20-30", "ALL", "Check the hydraulic pressure.\nRecord the value."),
+          item("DMC-C-40-00", "ALL", "Obsolete procedure."),
+          {"content": "chunk sans dm code", "extra_information": {}}]
+    v2 = [item("DMC-A-00-10", "MSN 001-050", "Remove the access panel 312AR.\nDisconnect connectors J12 and J13."),
+          item("DMC-A-00-10", "MSN 001-050", "Torque the bolts to 14 N.m.\nMake sure the seal is clean.\nInstall the panel."),
+          item("DMC-A-00-10", "MSN 051-099", "Remove the access panel 312AR."),
+          item("DMC-B-20-30", "ALL", "Check the hydraulic pressure.\nRecord the value."),
+          item("DMC-D-50-10", "ALL", "New inspection task.")]
+    write_html(compare(v1, v2), "exemple_diff.html")
+    print("ok -> exemple_diff.html")
+
+
+
 
 from typing import List, Dict, Set, Iterator, Tuple
 from pydantic import BaseModel, Field
