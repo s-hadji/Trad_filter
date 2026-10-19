@@ -1,5 +1,10 @@
 
 
+
+grep -rnE "from langchain\.|import langchain\." --include=*.py . \
+ | grep -vE "langchain\.(agents|messages|tools|chat_models|embeddings)"
+
+
 import re
 import difflib
 from html import escape
