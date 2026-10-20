@@ -1,4 +1,196 @@
 
+.venv
+.env
+.env.*
+.git
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+
+
+# =============================================================================
+# Lance l'app + Qdrant sur un réseau privé commun
+#   podman compose up -d --build
+# =============================================================================
+name: mon-projet
+
+services:
+  qdrant:
+    build:
+      context: .
+      dockerfile: Dockerfile.qdrant
+    image: mon-projet/qdrant:local
+    container_name: qdrant            # = nom d'hôte sur le réseau "backend"
+    restart: unless-stopped
+    ports:
+      - "6333:6333"                   # REST + dashboard (accès depuis ta machine)
+      - "6334:6334"                   # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage:Z
+    # environment:
+    #   QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY}
+    networks:
+      - backend
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+      secrets:
+        - netrc
+    image: mon-projet/app:local
+    container_name: app
+    restart: unless-stopped
+    environment:
+      QDRANT_URL: http://qdrant:6333  # "qdrant" = nom du service ci-dessus
+    depends_on:
+      - qdrant
+    networks:
+      - backend
+
+  # Tests : lancés seulement à la demande
+  #   podman compose --profile test run --rm tests
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test
+      secrets:
+        - netrc
+    image: mon-projet/app-test:local
+    env_file:
+      - .env.test
+    environment:
+      QDRANT_URL: http://qdrant:6333
+    depends_on:
+      - qdrant
+    networks:
+      - backend
+    profiles:
+      - test
+
+networks:
+  backend:
+    driver: bridge
+
+volumes:
+  qdrant_data:
+
+secrets:
+  netrc:
+    file: ~/.netrc
+
+
+
+# =============================================================================
+# Qdrant depuis Harbor, épinglé par digest (immuable : toujours la même image)
+# Format : <registre>/<projet>/<image>@sha256:<64 caractères hexa>
+# =============================================================================
+ARG QDRANT_IMAGE=registry-im.mondomaine.com/mon-projet/qdrant@sha256:REMPLACE_PAR_TON_DIGEST
+
+FROM ${QDRANT_IMAGE}
+
+# Ports : 6333 = API REST (+ dashboard sur /dashboard), 6334 = gRPC
+ENV QDRANT__SERVICE__HTTP_PORT=6333 \
+    QDRANT__SERVICE__GRPC_PORT=6334
+
+# Optionnel : clé d'API. Ne la mets PAS ici en dur ; passe-la au lancement :
+#   podman run -e QDRANT__SERVICE__API_KEY=... 
+# Optionnel : config personnalisée
+# COPY config/production.yaml /qdrant/config/production.yaml
+
+EXPOSE 6333 6334
+
+# Données persistées (à monter sur un volume au lancement)
+VOLUME ["/qdrant/storage"]
+
+# ENTRYPOINT/CMD hérités de l'image Qdrant : ne pas les redéfinir
+
+
+
+
+
+
+# =============================================================================
+# Image Python depuis Harbor, épinglée par digest
+# Format : <registre>/<projet>/<image>@sha256:<64 caractères hexa>
+# =============================================================================
+ARG PYTHON_IMAGE=registry-im.mondomaine.com/mon-projet/python@sha256:REMPLACE_PAR_TON_DIGEST
+
+# =============================================================================
+# Stage "base" : Python de Harbor + uv installé avec le pip de l'image
+# =============================================================================
+FROM ${PYTHON_IMAGE} AS base
+
+ARG PIP_INDEX=https://nexus.mondomaine.com/repository/pypi-proxy/simple
+ARG UV_VERSION=0.9.*
+
+ENV PYTHONUNBUFFERED=1 \
+    UV_PYTHON_DOWNLOADS=0 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
+
+# Secret "netrc" = identifiants du proxy PyPI (lu par pip ET par uv)
+RUN --mount=type=secret,id=netrc,target=/root/.netrc \
+    pip install --no-cache-dir --index-url "${PIP_INDEX}" "uv==${UV_VERSION}"
+
+WORKDIR /app
+
+# =============================================================================
+# Stage "builder" : dépendances de prod (index lu dans pyproject.toml)
+# =============================================================================
+FROM base AS builder
+
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=secret,id=netrc,target=/root/.netrc \
+    uv sync --locked --no-install-project --no-dev
+
+COPY . .
+RUN --mount=type=secret,id=netrc,target=/root/.netrc \
+    uv sync --locked --no-dev
+
+# =============================================================================
+# Stage "test" : prod + dev (pytest...)
+# =============================================================================
+FROM base AS test
+
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=secret,id=netrc,target=/root/.netrc \
+    uv sync --locked --no-install-project
+
+COPY . .
+RUN --mount=type=secret,id=netrc,target=/root/.netrc \
+    uv sync --locked
+
+ENV PATH="/app/.venv/bin:${PATH}"
+CMD ["uv", "run", "--no-sync", "pytest"]
+
+# =============================================================================
+# Stage "runtime" (dernier = cible par défaut) : image finale, sans uv
+# =============================================================================
+FROM ${PYTHON_IMAGE} AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PATH="/app/.venv/bin:${PATH}" \
+    QDRANT_URL=http://qdrant:6333
+
+RUN useradd --create-home --uid 1000 appuser
+WORKDIR /app
+
+# Même image de base que "builder" -> le venv pointe vers le même Python
+COPY --from=builder --chown=appuser:appuser /app /app
+
+USER appuser
+CMD ["python", "main.py"]
+
+
+
+
+
 
 def separer_en_set(racine):
     """Range chaque feuille dans un set, du plus sain au plus problematique :
