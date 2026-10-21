@@ -1,5 +1,144 @@
 
 
+
+import json
+import logging
+import time
+from collections.abc import AsyncIterator
+
+import httpx
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
+from pydantic_ai.toolsets import FunctionToolset
+
+logger = logging.getLogger(__name__)
+
+MCP_TIMEOUT_S = 5.0     # temps max pour conclure que le serveur ne répond pas
+MCP_COOLDOWN_S = 30.0   # durée pendant laquelle on n'essaie plus MCP après une panne
+
+
+# ---------- Disjoncteur ----------
+
+class _McpCircuitBreaker:
+    def __init__(self, cooldown_s: float) -> None:
+        self._cooldown_s = cooldown_s
+        self._down_until = 0.0
+        self._is_down = False
+
+    def available(self) -> bool:
+        return time.monotonic() >= self._down_until
+
+    def mark_down(self, exc: BaseException) -> None:
+        if not self._is_down:
+            logger.warning(
+                "MCP injoignable, bascule sans outils pendant %.0fs : %r",
+                self._cooldown_s, exc,
+            )
+        self._is_down = True
+        self._down_until = time.monotonic() + self._cooldown_s
+
+    def mark_up(self) -> None:
+        if self._is_down:
+            logger.info("MCP de nouveau joignable")
+        self._is_down = False
+
+
+_breaker = _McpCircuitBreaker(MCP_COOLDOWN_S)
+
+
+def _is_unreachable(exc: BaseException) -> bool:
+    """True pour les pannes réseau/serveur MCP, False pour les bugs et les 401/403."""
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_is_unreachable(e) for e in exc.exceptions)
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, (httpx.TransportError, ConnectionError)):
+            return True  # connexion refusée, timeout, serveur coupé en plein échange
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500:
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+# ---------- Construction des toolsets ----------
+
+def build_mcp_toolset(token: str, bases: list[str]) -> MCPToolset:
+    transport = StreamableHttpTransport(
+        MCP_URL,
+        auth=token,
+        headers={"X-Bases": json.dumps(bases)},
+    )
+    return MCPToolset(Client(transport, timeout=MCP_TIMEOUT_S))
+
+
+def _toolsets(deps: AgentDeps, use_mcp: bool) -> list:
+    if use_mcp:
+        return [build_mcp_toolset(deps.token, deps.bases)]
+    return [FunctionToolset()]  # toolset vide : l'agent répond sans outils
+
+
+def _check_token(deps: AgentDeps) -> None:
+    if not deps.token:
+        raise ValueError(f"Pas de token pour l'utilisateur {deps.user_id!r}")
+
+
+# ---------- Exécution non streamée ----------
+
+async def run_agent(prompt: str, deps: AgentDeps):
+    _check_token(deps)
+    agent = await get_pydantic_agent()
+    use_mcp = _breaker.available()
+
+    try:
+        result = await agent.run(prompt, deps=deps, toolsets=_toolsets(deps, use_mcp))
+    except Exception as exc:
+        if not (use_mcp and _is_unreachable(exc)):
+            raise
+        _breaker.mark_down(exc)
+        return await agent.run(prompt, deps=deps, toolsets=_toolsets(deps, False))
+
+    if use_mcp:
+        _breaker.mark_up()
+    return result
+
+
+# ---------- Exécution streamée ----------
+
+async def run_agent_events(
+    prompt: str,
+    deps: AgentDeps,
+) -> AsyncIterator[AgentStreamEvent | AgentRunResultEvent]:
+    _check_token(deps)
+    agent = await get_pydantic_agent()
+    use_mcp = _breaker.available()
+    started = False
+
+    try:
+        async with agent.run_stream_events(
+            prompt, deps=deps, toolsets=_toolsets(deps, use_mcp),
+        ) as events:
+            async for event in events:
+                started = True
+                yield event
+    except Exception as exc:
+        if not (use_mcp and _is_unreachable(exc)):
+            raise
+        _breaker.mark_down(exc)
+        if started:
+            raise  # des événements sont déjà partis au client : on ne peut pas rejouer
+        async with agent.run_stream_events(
+            prompt, deps=deps, toolsets=_toolsets(deps, False),
+        ) as events:
+            async for event in events:
+                yield event
+        return
+
+    if use_mcp:
+        _breaker.mark_up()
+
+
+
 import json
 import logging
 from typing import List
