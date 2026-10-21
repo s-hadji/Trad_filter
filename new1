@@ -1,4 +1,26 @@
 
+import time
+
+MCP_PAUSE_S = 30
+_mcp_down_until = 0.0   # tant que time.monotonic() < cette valeur : pas de MCP
+
+
+def _toolsets(deps):
+    if time.monotonic() < _mcp_down_until:
+        return [FunctionToolset()]                         # MCP en pause : sans outils
+    return [build_mcp_toolset(deps.token, deps.bases)]
+
+
+async def run_agent(prompt: str, deps: AgentDeps):
+    global _mcp_down_until
+    agent = await get_pydantic_agent()
+    try:
+        return await agent.run(prompt, deps=deps, toolsets=_toolsets(deps))
+    except Exception:
+        logger.exception("Échec avec MCP : pause de %ss, nouvelle tentative sans outils", MCP_PAUSE_S)
+        _mcp_down_until = time.monotonic() + MCP_PAUSE_S
+        return await agent.run(prompt, deps=deps, toolsets=[FunctionToolset()])
+
 
 def _is_unreachable(exc: BaseException | None, _seen: set[int] | None = None) -> bool:
     """True pour les pannes réseau/serveur MCP, False pour les bugs et les 401/403."""
