@@ -1,3 +1,111 @@
+
+import asyncio
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Optional
+
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
+from langchain.agents import create_agent
+from langchain.agents.middleware import AgentMiddleware
+from langchain.mcp import MCPAdapter
+from langchain.messages import ToolMessage
+from langchain.tools import BaseTool
+from langchain_openai import ChatOpenAI
+
+logger = logging.getLogger(__name__)
+
+
+# ===== CONTEXT : ce qui change à chaque appel =====
+@dataclass
+class AgentContext:
+    mcp_tools: list[BaseTool] = field(default_factory=list)
+
+
+# ===== MIDDLEWARE : branche les outils du run =====
+class RuntimeToolsMiddleware(AgentMiddleware):
+    async def awrap_model_call(self, request, handler):
+        extra = request.runtime.context.mcp_tools
+        if extra:
+            request = request.override(tools=[*request.tools, *extra])
+        return await handler(request)
+
+    async def awrap_tool_call(self, request, handler):
+        by_name = {t.name: t for t in request.runtime.context.mcp_tools}
+        tool = by_name.get(request.tool_call["name"])
+        if tool is not None:
+            request = request.override(tool=tool)
+        try:
+            return await handler(request)
+        except Exception as e:                      # serveur MCP tombé en plein run
+            logger.warning("Outil MCP en échec : %s", e)
+            return ToolMessage(
+                content="Outil indisponible pour le moment, réponds sans.",
+                tool_call_id=request.tool_call["id"],
+            )
+
+
+# ===== AGENT PARTAGÉ : créé une seule fois =====
+langchain_agent = None
+_init_lock = asyncio.Lock()
+
+
+async def get_langchain_agent():
+    global langchain_agent
+    async with _init_lock:
+        if langchain_agent is None:
+            settings: Settings = get_settings()
+            model = ChatOpenAI(
+                model=settings.MODEL_NAME,
+                base_url=settings.URL_LLM_RAG,
+                api_key=settings.API_KEY_RAG,
+            )
+            langchain_agent = create_agent(
+                model=model,
+                tools=[],                            # aucun outil fixe
+                system_prompt=BASE_SYSTEM_PROMPT,
+                middleware=[RuntimeToolsMiddleware()],
+                context_schema=AgentContext,
+            )
+    return langchain_agent
+
+
+# ===== OUTILS MCP : récupérés à chaque appel =====
+MCP_PAUSE_S = 30
+_mcp_down_until = 0.0
+
+
+async def get_mcp_tools(token: str, bases: list[str]) -> list[BaseTool]:
+    global _mcp_down_until
+    if time.monotonic() < _mcp_down_until:
+        return []                                    # MCP en pause : pas d'outils
+    transport = StreamableHttpTransport(
+        MCP_URL, auth=token, headers={"X-Bases": json.dumps(bases)},
+    )
+    try:
+        async with MCPAdapter(Client(transport)) as adapter:
+            return await adapter.list_tools()
+    except Exception:
+        logger.exception("MCP injoignable : pause de %ss, run sans outils", MCP_PAUSE_S)
+        _mcp_down_until = time.monotonic() + MCP_PAUSE_S
+        return []
+
+
+# ===== APPEL : même agent, outils différents =====
+async def run_agent(prompt: str, deps: AgentDeps):
+    agent = await get_langchain_agent()
+    tools = await get_mcp_tools(deps.token, deps.bases)
+    return await agent.ainvoke(
+        {"messages": [{"role": "user", "content": prompt}]},
+        context=AgentContext(mcp_tools=tools),
+    )
+
+
+
+
+
 import json
 import logging
 import time
