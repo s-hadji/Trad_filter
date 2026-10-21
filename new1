@@ -1,4 +1,90 @@
 
+import json
+import logging
+
+from langchain.messages import AIMessage, ToolMessage
+
+from app.agent.langchain_agent import AgentDeps, run_agent as run_langchain_agent
+# DocObject : même import que dans ton fichier pydantic
+
+log = logging.getLogger(__name__)
+
+
+def _tool_payload(msg: ToolMessage):
+    """Extrait les données renvoyées par un outil MCP."""
+    # 1. Format structuré (le plus fiable)
+    artifact = getattr(msg, "artifact", None)
+    if isinstance(artifact, dict) and artifact.get("structured_content") is not None:
+        sc = artifact["structured_content"]
+        if isinstance(sc, dict) and set(sc) == {"result"}:   # liste emballée dans {"result": [...]}
+            return sc["result"]
+        return sc
+
+    # 2. Repli : le texte JSON des content blocks
+    content = msg.content
+    texts = [content] if isinstance(content, str) else [
+        b.get("text", "") for b in content
+        if isinstance(b, dict) and b.get("type") == "text"
+    ]
+    payload = []
+    for t in texts:
+        try:
+            v = json.loads(t)
+        except (json.JSONDecodeError, TypeError):
+            log.warning(f"[PERDU texte non JSON] {msg.name} : {t[:80]!r}")
+            continue
+        payload.extend(v if isinstance(v, list) else [v])
+    return payload
+
+
+def capture_docs(result: dict) -> dict:
+    docs: dict = {}
+    for msg in result["messages"]:
+        if not isinstance(msg, ToolMessage) or msg.status == "error":
+            continue
+        items = _tool_payload(msg)
+        if not isinstance(items, list):
+            items = [items]
+
+        avant = len(docs)
+        for d in items:
+            if not isinstance(d, dict):
+                log.warning(f"[PERDU format inattendu] {msg.name} type={type(d).__name__}")
+                continue
+            doc = DocObject.from_mcp(d)
+            docs[str(doc.metadata.get("id") or f"sans_id_{len(docs)}")] = doc
+        log.info(f"[CAPTURÉ] {msg.name} : {len(items)} éléments -> {len(docs) - avant} nouveaux")
+    return docs
+
+
+# ---------- Nœud du graphe ----------
+async def noeud_langchain_agent(state: dict) -> dict:
+    question = state.get("standalone_question") or state.get("question")
+    if not question:
+        raise ValueError("Aucune question trouvée dans le state.")
+
+    deps = AgentDeps(
+        user_id="None",
+        token=state.get("user_token"),
+        bases=state.get("bases") or [],
+    )
+
+    result = await run_langchain_agent(question, deps=deps)
+
+    docs = capture_docs(result)
+    answer = result["messages"][-1].text or "Désolé, aucune réponse générée."
+    log.info(f"{len(docs)} documents pour : {question}")
+
+    return {
+        "documents": list(docs.values()),
+        "generation": answer,
+        "messages": [AIMessage(content=answer)],
+        "route": "langchain_agent",
+    }
+
+
+
+
 import asyncio
 import json
 import logging
