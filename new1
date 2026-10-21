@@ -1,5 +1,39 @@
 
 
+import json
+import logging
+from typing import List
+
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
+from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
+
+logger = logging.getLogger(__name__)
+
+
+def _make_client(token: str, bases: List[str]) -> Client:
+    transport = StreamableHttpTransport(
+        MCP_URL,
+        auth=token,
+        headers={"X-Bases": json.dumps(bases)},
+    )
+    return Client(transport)
+
+
+async def build_mcp_toolset(token: str, bases: List[str]) -> AbstractToolset:
+    # 1. Vérifie que le serveur MCP répond vraiment
+    try:
+        async with _make_client(token, bases) as probe:
+            await probe.ping()
+    except Exception:
+        logger.exception("Serveur MCP injoignable : l'agent tourne sans outils MCP")
+        return FunctionToolset()  # toolset vide, valide pour pydantic-ai
+
+    # 2. Serveur OK : on crée le vrai toolset avec un client neuf
+    return MCPToolset(_make_client(token, bases))
+
+
+
 # Image Python depuis Harbor, épinglée par digest
 ARG PYTHON_IMAGE=registry-im.mondomaine.com/mon-projet/python@sha256:REMPLACE_PAR_TON_DIGEST
 FROM ${PYTHON_IMAGE}
