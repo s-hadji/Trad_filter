@@ -1,5 +1,22 @@
 
 
+def _is_unreachable(exc: BaseException | None, _seen: set[int] | None = None) -> bool:
+    """True pour les pannes réseau/serveur MCP, False pour les bugs et les 401/403."""
+    seen = _seen if _seen is not None else set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        # ExceptionGroup n'importe où dans la chaîne : on fouille chaque sous-exception
+        if isinstance(exc, BaseExceptionGroup):
+            if any(_is_unreachable(e, seen) for e in exc.exceptions):
+                return True
+        if isinstance(exc, (httpx.TransportError, ConnectionError)):
+            return True  # connexion refusée, timeout, serveur coupé
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500:
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
 
 import json
 import logging
