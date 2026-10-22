@@ -1,0 +1,118 @@
+
+"""
+Agent back-office.
+
+L'agent est construit à chaque requête avec les tools MCP de l'appelant : ces tools
+portent son token, ils ne peuvent donc pas vivre dans un agent global. Construire le
+graphe coûte peu devant un appel LLM (à mesurer chez toi), et c'est le schéma documenté
+par LangChain pour l'auth MCP par utilisateur.
+
+Requiert Python >= 3.11 (asyncio.timeout).
+"""
+import asyncio
+import json
+import logging
+from dataclasses import dataclass
+from functools import lru_cache
+
+from deepagents import create_deep_agent
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
+from langchain.agents.middleware import AgentMiddleware
+from langchain.mcp import MCPAdapter
+from langchain.messages import ToolMessage
+from langchain.tools import BaseTool, tool
+from langchain_openai import ChatOpenAI
+from langgraph.errors import GraphBubbleUp
+
+from app.config import get_settings  # adapte le chemin à ton projet
+
+log = logging.getLogger("agent")
+
+PROMPT = "Tu es un assistant back-office. Appelle en parallèle tous les outils utiles."
+MCP_DOWN_NOTE = "(Service documentaire indisponible : signale-le si la réponse en dépend.)"
+
+MCP_DISCOVERY_TIMEOUT_S = 5   # connexion + list_tools
+TOOL_TIMEOUT_S = 60           # par appel de tool (sauf sous-agent "task")
+RUN_TIMEOUT_S = 300           # run complet
+RECURSION_LIMIT = 60
+
+
+@dataclass(frozen=True)
+class Deps:
+    user_id: str
+    token: str
+    bases: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.token:
+            raise ValueError(f"Pas de token pour l'utilisateur {self.user_id!r} : appel MCP impossible.")
+
+
+# ---------- partagé entre les requêtes (créé une fois)
+@lru_cache(maxsize=1)
+def get_model() -> ChatOpenAI:
+    s = get_settings()
+    return ChatOpenAI(model=s.MODEL_NAME, base_url=s.URL_LLM_RAG, api_key=s.API_KEY_RAG)
+
+
+class ToolErrorsAsMessages(AgentMiddleware):
+    """Un tool qui plante ou dépasse son délai renvoie un ToolMessage d'erreur au modèle
+    au lieu de faire échouer tout le run."""
+
+    async def awrap_tool_call(self, request, handler):
+        name = request.tool_call["name"]
+        # "task" = sous-agent deepagents : plusieurs tours LLM, il a besoin du budget du run.
+        timeout = None if name == "task" else TOOL_TIMEOUT_S
+        try:
+            async with asyncio.timeout(timeout):
+                return await handler(request)
+        except GraphBubbleUp:  # interrupts / commandes LangGraph : contrôle de flux, pas des erreurs
+            raise
+        except Exception as e:
+            log.warning("tool %s en échec", name, exc_info=True)  # pas les args : données métier
+            return ToolMessage(
+                f"Outil {name} indisponible ({type(e).__name__}). Ne le rappelle pas.",
+                tool_call_id=request.tool_call["id"], name=name, status="error",
+            )
+
+
+# ---------- propre à chaque requête
+def profil_tool(deps: Deps) -> BaseTool:
+    @tool
+    def profil_utilisateur() -> str:
+        """Identifiant et bases autorisées de l'utilisateur courant."""
+        return json.dumps({"user_id": deps.user_id, "bases": deps.bases})
+
+    return profil_utilisateur
+
+
+async def load_mcp_tools(deps: Deps) -> list[BaseTool] | None:
+    """Tools MCP de l'utilisateur. None = serveur injoignable ; [] = aucun outil autorisé."""
+    transport = StreamableHttpTransport(get_settings().MCP_URL, auth=deps.token,
+                                        headers={"X-Bases": json.dumps(deps.bases)})
+    try:
+        async with asyncio.timeout(MCP_DISCOVERY_TIMEOUT_S), MCPAdapter(Client(transport)) as mcp:
+            return await mcp.list_tools()  # les tools restent utilisables après la sortie du bloc
+    except Exception:
+        log.warning("MCP indisponible (user=%s)", deps.user_id, exc_info=True)
+        return None
+
+
+# ---------- point d'entrée
+async def run_agent(prompt: str, deps: Deps) -> dict:
+    mcp_tools = await load_mcp_tools(deps)
+    if mcp_tools is None:
+        prompt = f"{MCP_DOWN_NOTE}\n{prompt}"
+
+    agent = create_deep_agent(
+        model=get_model(),
+        tools=[profil_tool(deps), *(mcp_tools or [])],
+        system_prompt=PROMPT,
+        middleware=[ToolErrorsAsMessages()],
+    )
+    async with asyncio.timeout(RUN_TIMEOUT_S):
+        return await agent.ainvoke(
+            {"messages": [{"role": "user", "content": prompt}]},
+            config={"recursion_limit": RECURSION_LIMIT},
+        )
