@@ -1,5 +1,129 @@
 
 # %% [markdown]
+# # LLM-as-judge : réponses de l'agent vs réponses attendues
+# 1. L'agent répond à chaque question de df_valide (réponses sauvegardées dans reponses_agent.json).
+# 2. Un LLM juge chaque réponse par rapport à la "Réponse attendue", qui fait foi.
+#    "Unnamed: 3", s'il est rempli, décrit une erreur déjà observée : le juge vérifie si elle est refaite.
+# 3. Sortie : df_eval (note, erreur_signalee_commise, justification) et evaluation_juge.xlsx.
+#
+# À exécuter cellule par cellule dans la fenêtre interactive / un notebook (Run Cell),
+# pas avec `python llm_as_judge.py` : la cellule 1 utilise `await` hors fonction.
+# df_valide doit déjà exister ; sinon, par exemple : df_valide = pd.read_excel("questions.xlsx")
+
+# %% 0. Paramètres
+import json, os
+from pathlib import Path
+from typing import Literal, Optional
+
+import pandas as pd
+from pydantic import BaseModel, Field
+from tqdm.auto import tqdm
+
+from app.agent.agents_flow import noeud_langg_agent
+from app.agent.agent_conf_langchain import get_model
+
+TOKEN = os.environ["AGENT_TEST_TOKEN"]   # token d'un utilisateur de test
+BASES = ["1"]                            # bases sur lesquelles l'agent cherche
+COL_Q, COL_REF = "Question", "Réponse attendue"
+
+df = df_valide.copy()
+df.columns = df.columns.str.strip()
+# "Unnamed: 3" = erreur déjà observée sur cette question ; vide -> <NA>
+df["vigilance"] = df["Unnamed: 3"].astype("string").str.strip().replace("", pd.NA)
+
+
+# %% 1. Réponses de l'agent, sauvegardées dans un JSON : relancer ne refait que les questions manquantes
+CACHE = Path("reponses_agent.json")
+reponses = json.loads(CACHE.read_text(encoding="utf-8")) if CACHE.exists() else {}
+
+for q in tqdm(df[COL_Q].dropna().unique(), desc="Agent"):
+    if q in reponses:
+        continue
+    try:
+        out = await noeud_langg_agent({"question": q, "user_token": TOKEN, "bases": BASES, "user_id": "eval"})
+    except Exception as e:  # pas sauvegardé : sera retenté au prochain lancement
+        print(f"échec sur {q[:60]!r} : {e!r}")
+        continue
+    reponses[q] = out["generation"]
+    CACHE.write_text(json.dumps(reponses, ensure_ascii=False, indent=2), encoding="utf-8")
+
+df["reponse_agent"] = df[COL_Q].map(reponses)
+
+
+# %% 2. Le juge
+judge_llm = get_model()  # même modèle que l'agent ; un modèle différent éviterait qu'il favorise son propre style
+
+
+class Jugement(BaseModel):
+    # L'ordre des champs compte : le LLM écrit sa justification AVANT de donner la note.
+    justification: str = Field(description="2 à 4 phrases : ce qui est juste, faux ou manquant par rapport à la réponse attendue.")
+    erreur_signalee_commise: Optional[bool] = Field(
+        description="Si un point de vigilance est fourni : true si la réponse commet cette erreur, sinon false. null s'il n'y en a pas.")
+    note: Literal[1, 2, 3, 4, 5]
+
+
+juge = judge_llm.with_structured_output(Jugement)
+
+SYSTEM = """Tu évalues la réponse d'un assistant de maintenance technique.
+- La RÉPONSE ATTENDUE fait foi : ne juge pas d'après tes propres connaissances.
+- Les équivalences de forme sont acceptées (5100 mm = 5,1 m) ; une valeur différente est une erreur.
+- Une réponse plus longue n'est pas meilleure.
+- Un POINT DE VIGILANCE, s'il est fourni, décrit une erreur déjà observée sur cette question :
+  vérifie si la réponse la commet.
+
+Note de 1 à 5 :
+5 = correcte et complète
+4 = correcte, un détail secondaire manque
+3 = information principale correcte, mais une erreur ou un manque secondaire notable
+2 = information principale partiellement fausse ou incomplète
+1 = fausse, hors sujet ou sans réponse"""
+
+
+def juger(question, attendue, reponse, vigilance=None) -> Jugement:
+    msg = f"<question>\n{question}\n</question>\n\n<reponse_attendue>\n{attendue}\n</reponse_attendue>\n\n"
+    if vigilance:
+        msg += f"<point_de_vigilance>\n{vigilance}\n</point_de_vigilance>\n\n"
+    msg += f"<reponse_agent>\n{reponse}\n</reponse_agent>"
+    return juge.invoke([("system", SYSTEM), ("human", msg)])
+
+
+# %% 3. Jugement de chaque ligne
+resultats = []
+for _, row in tqdm(df.iterrows(), total=len(df), desc="Juge"):
+    if pd.isna(row["reponse_agent"]):
+        resultats.append({"erreur": "pas de réponse agent"})
+        continue
+    vigilance = row["vigilance"] if pd.notna(row["vigilance"]) else None
+    try:
+        j = juger(row[COL_Q], row[COL_REF], row["reponse_agent"], vigilance)
+    except Exception as e:
+        resultats.append({"erreur": repr(e)})
+        continue
+    resultats.append({
+        # Choix : refaire l'erreur signalée plafonne la note à 2, appliqué ici plutôt que confié au LLM
+        "note": min(j.note, 2) if j.erreur_signalee_commise else j.note,
+        "erreur_signalee_commise": j.erreur_signalee_commise,
+        "justification": j.justification,
+    })
+
+df_eval = df.join(pd.DataFrame(resultats, index=df.index))
+
+
+# %% 4. Synthèse et export
+print("répartition des notes :\n", df_eval["note"].value_counts().sort_index())
+print("note moyenne :", round(df_eval["note"].mean(), 2))
+print("erreurs signalées refaites :", int(df_eval["erreur_signalee_commise"].eq(True).sum()),
+      "sur", int(df_eval["vigilance"].notna().sum()), "questions avec point de vigilance")
+if "erreur" in df_eval:
+    print("lignes en erreur :", int(df_eval["erreur"].notna().sum()))
+
+df_eval.to_excel("evaluation_juge.xlsx", index=False)
+
+
+
+
+
+# %% [markdown]
 # # LLM-as-judge — Chatbot SCALP
 # Entrée : df_valide (Question | Réponse attendue | Data Module -référence | Unnamed: 3)
 # 1. On fait tourner l'agent sur chaque question (réponses mises en cache).
