@@ -1,8 +1,63 @@
 
+def extraire_reponse(result: dict) -> str:
+    """Texte du DERNIER message IA sans appel d'outil : la réponse finale de l'agent.
+    Le premier message IA est presque toujours un appel d'outil au contenu vide."""
+    for msg in reversed(result.get("messages", [])):
+        if getattr(msg, "type", None) == "ai" and not getattr(msg, "tool_calls", None):
+            texte = msg.text
+            texte = texte() if callable(texte) else texte  # propriété ou méthode selon la version de langchain-core
+            if isinstance(texte, str) and texte.strip():
+                return texte
+    return ""
 
-Je réécris le notebook pour la version simplifiée et je l'exécute d'abord avec de faux services pour m'assurer qu'il tourne.
 
-Voici les 11 cellules pour la version simplifiée. Je les ai exécutées de bout en bout avec de faux services, et elles passent toutes.
+# ---------- Nœud du graphe ----------
+async def noeud_langg_agent(state: dict) -> dict:
+    question = state.get("standalone_question") or state.get("question")
+    if not question:
+        raise ValueError("Aucune question trouvée dans le state.")
+
+    # Pas de valeur par défaut pour le token : sans token, AgentDeps lève une erreur claire
+    # au lieu de laisser échouer l'authentification MCP plus loin.
+    deps = AgentDeps(
+        user_id=state.get("user_id") or "inconnu",  # adapte la clé si l'identifiant est ailleurs dans le state
+        token=state.get("user_token"),
+        bases=tuple(state.get("bases") or ()),
+    )
+
+    result = await run_agent_langg(question, deps=deps)
+
+    # Documents renvoyés par les outils ; en cas d'échec, on continue sans documents.
+    try:
+        docs = capture_docs_lang(result)
+        log.info("%d documents capturés pour : %s", len(docs), question)
+    except Exception:
+        log.exception("Erreur lors de la capture des documents (clés de result : %s)",
+                      list(result) if isinstance(result, dict) else type(result).__name__)
+        log.debug("result brut : %r", result)
+        docs = {}
+
+    # Réponse : le DERNIER message IA sans appel d'outil (le premier est souvent un appel d'outil vide).
+    if not isinstance(result, dict):
+        answer = "Désolé, format de réponse inattendu."
+    else:
+        answer = extraire_reponse(result)
+        if not answer:
+            log.warning("Aucune réponse finale ; dernier message : %r", (result.get("messages") or [None])[-1])
+            answer = "Désolé, aucune réponse générée."
+
+    log.info("Réponse générée pour : %s", question)
+
+    return {
+        "documents": list(docs.values()) if docs else [],
+        "generation": answer,
+        "messages": [AIMessage(content=answer)],
+        "route": "lang-agent",
+    }
+
+
+
+
 
 ### Cellule 1 : import du module
 ```python
