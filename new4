@@ -1,3 +1,302 @@
+import asyncio
+import json
+import logging
+import time
+import warnings
+from collections import defaultdict
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from functools import lru_cache, partial
+from typing import Any
+
+import httpx
+import mcp.types as mt
+from deepagents import create_deep_agent
+from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
+from langchain.agents.middleware import AgentMiddleware
+from langchain.messages import ToolMessage
+from langchain.tools import BaseTool, ToolRuntime, tool
+from langchain_core._api import LangChainBetaWarning
+from langchain_openai import ChatOpenAI
+from langgraph.errors import GraphBubbleUp
+
+warnings.filterwarnings("ignore", category=LangChainBetaWarning)
+from langchain.mcp import MCPAdapter, as_langchain_tool  # noqa: E402  (après le filtre du warning beta)
+
+from app.utils.config import get_settings  # noqa: E402
+
+log = logging.getLogger("agent")
+
+PROMPT = "Tu es un assistant "
+MCP_DOWN_NOTE = "(Services documentaires indisponibles : {} ; signale-le si la réponse en dépend.)"
+
+VCS_TIMEOUT_S = 5             # GET {URL_VCS}/bases/{base_id}/mcp
+MCP_CONFIG_TTL_S = 60         # durée de vie de la config MCP d'une base
+MCP_DISCOVERY_TIMEOUT_S = 5   # connexion + list_tools, par serveur (serveurs interrogés en parallèle)
+MCP_TOOLS_TTL_S = 60          # durée de vie de la liste d'outils d'un serveur ; 0 = list_tools à chaque requête
+RETRY_S = 30                  # après un échec (VCS ou MCP) : délai avant de réessayer
+TOOL_TIMEOUT_S = 60           # par appel de tool (sauf sous-agent "task")
+RUN_TIMEOUT_S = 300           # run complet
+RECURSION_LIMIT = 60
+
+
+@dataclass(frozen=True)
+class Deps:
+    user_id: str
+    token: str = field(repr=False)  # repr=False : le token n'apparaît pas dans les logs ni les traces
+    bases: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.token:
+            raise ValueError(f"Pas de token pour l'utilisateur {self.user_id!r} : appel MCP impossible.")
+
+
+@dataclass(frozen=True)
+class McpServer:
+    """Un serveur MCP tel que décrit par l'API VCS. Identifié par son url."""
+    name: str
+    url: str
+    toolset: frozenset[str]  # seuls ces outils du serveur sont donnés à l'agent
+
+
+@dataclass
+class RunContext:
+    """Contexte d'UN run, passé à ainvoke(context=...) et lu par les outils et le middleware."""
+    deps: Deps
+    tools: dict[str, BaseTool] = field(default_factory=dict)   # outils MCP retenus (tous serveurs), par nom
+    tool_server: dict[str, str] = field(default_factory=dict)  # nom d'outil -> url du serveur qui le fournit
+    mcp: dict[str, Client] = field(default_factory=dict)       # url du serveur -> client MCP portant le token
+    _held: set[str] = field(default_factory=set)
+    _locks: defaultdict[str, asyncio.Lock] = field(default_factory=lambda: defaultdict(asyncio.Lock))
+
+    async def hold_mcp(self, server: str) -> None:
+        """Ouvre la session MCP de `server` au 1er appel d'un de ses outils et la garde jusqu'à la fin du run.
+        Sinon chaque lot d'appels d'outils rouvrirait sa propre session (handshake compris).
+        Un verrou par serveur : ouvrir le serveur A ne fait pas attendre les appels vers B."""
+        async with self._locks[server]:
+            if server in self.mcp and server not in self._held:
+                await self.mcp[server].__aenter__()
+                self._held.add(server)
+
+    async def aclose(self) -> None:
+        """Ferme les sessions ouvertes ; l'échec d'une fermeture n'empêche pas de fermer les autres."""
+        held, self._held = self._held, set()
+        for server in held:
+            try:
+                await self.mcp[server].__aexit__(None, None, None)
+            except Exception:
+                log.warning("fermeture de la session MCP %s en échec", server, exc_info=True)
+
+
+# ---------- cache avec TTL (configs VCS et listes d'outils MCP)
+class TTLCache:
+    """Résultats d'appels réseau par clé, avec TTL. La clé commence toujours par user_id.
+
+    Si le chargement échoue, l'ancienne valeur (même expirée) est servie, sinon None, et
+    l'échec est mémorisé RETRY_S secondes : un service en panne ne coûte pas son timeout
+    à chaque requête. On ne met en cache que des données, jamais un client ou un outil."""
+
+    def __init__(self, ttl_s: float, max_entries: int = 10_000) -> None:
+        self.ttl_s, self.max_entries = ttl_s, max_entries
+        self._entries: dict[tuple, tuple[float, Any]] = {}
+
+    async def get(self, key: tuple, load: Callable[[], Awaitable[Any]], label: str) -> Any | None:
+        """None = chargement en échec et rien en cache."""
+        now = time.monotonic()
+        hit = self._entries.get(key)
+        if hit is not None and hit[0] > now:
+            return hit[1]
+        try:
+            value = await load()
+        except Exception:
+            log.warning("%s indisponible (user=%s)", label, key[0], exc_info=True)
+            stale = hit[1] if hit is not None else None
+            self._entries[key] = (now + RETRY_S, stale)
+            return stale
+        if len(self._entries) >= self.max_entries:
+            self._entries = {k: v for k, v in self._entries.items() if v[0] > now}
+        self._entries[key] = (now + self.ttl_s, value)
+        return value
+
+    def invalidate(self, user_id: str) -> None:
+        """Droits ou config modifiés : oublie tout ce qui concerne cet utilisateur."""
+        self._entries = {k: v for k, v in self._entries.items() if k[0] != user_id}
+
+
+MCP_CONFIGS = TTLCache(MCP_CONFIG_TTL_S)  # clé : (user_id, base_id)          -> JSON brut de l'API VCS
+TOOL_SPECS = TTLCache(MCP_TOOLS_TTL_S)    # clé : (user_id, bases, url)       -> list[mt.Tool] complète
+
+
+# ---------- découverte : quels serveurs, puis quels outils
+async def fetch_base_mcp_config(deps: Deps, base_id: str) -> list[dict]:
+    """GET {URL_VCS}/bases/{base_id}/mcp -> [{"name": ..., "url": ..., "toolset": [...]}, ...]"""
+    url = f"{get_settings().URL_VCS}/bases/{base_id}/mcp"
+    headers = {"Authorization": f"Bearer {deps.token}", "Accept": "application/json"}
+    async with httpx.AsyncClient(timeout=VCS_TIMEOUT_S) as http:
+        r = await http.get(url, headers=headers)
+        r.raise_for_status()  # lève sur 4xx/5xx ; 200 et autres 2xx passent
+        data = r.json()
+    if not isinstance(data, list):
+        raise ValueError(f"réponse inattendue pour la base {base_id} : {type(data).__name__}, liste attendue")
+    return data
+
+
+async def load_mcp_servers(deps: Deps) -> tuple[list[McpServer], list[str]]:
+    """Serveurs MCP de toutes les bases de l'utilisateur, et bases dont la config est injoignable.
+    Un même serveur (même url) cité par plusieurs bases n'apparaît qu'une fois, avec l'union des toolsets."""
+    configs = await asyncio.gather(*(
+        MCP_CONFIGS.get((deps.user_id, b), partial(fetch_base_mcp_config, deps, b), f"config MCP de la base {b}")
+        for b in deps.bases
+    ))
+    servers: dict[str, McpServer] = {}
+    for base_id, entries in zip(deps.bases, configs):
+        for e in entries or []:
+            try:
+                name, url, toolset = e["name"], e["url"], frozenset(e.get("toolset") or ())
+            except (KeyError, TypeError):
+                log.warning("entrée MCP mal formée ignorée (base %s) : %r", base_id, e)
+                continue
+            prev = servers.get(url)
+            servers[url] = McpServer(prev.name if prev else name, url, (prev.toolset if prev else frozenset()) | toolset)
+    down = [f"configuration de la base {b}" for b, c in zip(deps.bases, configs) if c is None]
+    return list(servers.values()), down
+
+
+def mcp_transport(deps: Deps, server: McpServer) -> StreamableHttpTransport:
+    """Transport vers `server`, portant le token de l'utilisateur. Le construire ne fait aucun appel réseau."""
+    return StreamableHttpTransport(server.url, auth=deps.token, headers={"X-Bases": json.dumps(deps.bases)})
+
+
+async def list_server_tools(deps: Deps, server: McpServer) -> list[mt.Tool]:
+    async with asyncio.timeout(MCP_DISCOVERY_TIMEOUT_S), Client(mcp_transport(deps, server)) as c:
+        return await c.list_tools()
+
+
+# ---------- outils et middleware (sans état : partagés par toutes les requêtes)
+@tool
+def profil_utilisateur(runtime: ToolRuntime[RunContext]) -> str:
+    """Identifiant et bases autorisées de l'utilisateur courant."""
+    d = runtime.context.deps
+    return json.dumps({"user_id": d.user_id, "bases": d.bases})
+
+
+class RequestTools(AgentMiddleware):
+    """Branche les outils de la requête (runtime.context.tools) sur un graphe compilé sans eux."""
+
+    async def awrap_model_call(self, request, handler):
+        extra = request.runtime.context.tools
+        if extra:
+            taken = {t.name for t in request.tools if isinstance(t, BaseTool)}
+            for name in extra.keys() & taken:
+                log.warning("outil MCP %r ignoré : ce nom est déjà pris par un outil intégré", name)
+            request = request.override(tools=[*request.tools, *(t for n, t in extra.items() if n not in taken)])
+        return await handler(request)
+
+    async def awrap_tool_call(self, request, handler):
+        ctx: RunContext = request.runtime.context
+        name = request.tool_call["name"]
+        mcp_tool = ctx.tools.get(name)
+        if mcp_tool is not None and request.tool is None:  # request.tool is None : pas un outil intégré
+            await ctx.hold_mcp(ctx.tool_server[name])      # n'ouvre que le serveur qui fournit cet outil
+            request = request.override(tool=mcp_tool)
+        return await handler(request)
+
+
+class ToolErrorsAsMessages(AgentMiddleware):
+    """Un tool qui plante ou dépasse son délai renvoie un ToolMessage d'erreur au modèle
+    au lieu de faire échouer tout le run."""
+
+    async def awrap_tool_call(self, request, handler):
+        name = request.tool_call["name"]
+        # "task" = sous-agent deepagents : plusieurs tours LLM, il a besoin du budget du run.
+        timeout = None if name == "task" else TOOL_TIMEOUT_S
+        try:
+            async with asyncio.timeout(timeout):
+                return await handler(request)
+        except GraphBubbleUp:  # interrupts / commandes LangGraph : contrôle de flux, pas des erreurs
+            raise
+        except Exception as e:
+            log.warning("tool %s en échec", name, exc_info=True)  # pas les args : données métier
+            return ToolMessage(
+                f"Outil {name} indisponible ({type(e).__name__}). Ne le rappelle pas.",
+                tool_call_id=request.tool_call["id"], name=name, status="error",
+            )
+
+
+# ---------- partagé entre les requêtes (créé une fois)
+@lru_cache(maxsize=1)
+def get_model() -> ChatOpenAI:
+    s = get_settings()
+    return ChatOpenAI(model=s.MODEL_NAME, base_url=s.URL_LLM_RAG, api_key=s.API_KEY_RAG)
+
+
+@lru_cache(maxsize=1)
+def get_agent():
+    # 1er de la liste = le plus externe : il rattrape aussi les échecs d'ouverture de session MCP.
+    middleware = [ToolErrorsAsMessages(), RequestTools()]
+    return create_deep_agent(
+        model=get_model(),
+        tools=[profil_utilisateur],
+        system_prompt=PROMPT,
+        middleware=middleware,
+        context_schema=RunContext,
+        # Sous-agent "general-purpose" déclaré explicitement : celui créé par défaut ne reçoit pas
+        # le middleware utilisateur, donc il ne verrait pas les outils MCP de la requête.
+        subagents=[{**GENERAL_PURPOSE_SUBAGENT, "middleware": middleware}],
+    )
+
+
+# ---------- point d'entrée
+async def run_agent_langg(prompt: str, deps: Deps) -> dict:
+    # 1) quels serveurs : une requête VCS par base, en parallèle
+    servers, down = await load_mcp_servers(deps)
+
+    # 2) quels outils : un list_tools par serveur, en parallèle (liste complète en cache, filtrée ensuite)
+    all_specs = await asyncio.gather(*(
+        TOOL_SPECS.get((deps.user_id, deps.bases, s.url), partial(list_server_tools, deps, s), f"MCP {s.name}")
+        for s in servers
+    ))
+    down += [s.name for s, specs in zip(servers, all_specs) if specs is None]
+    if down:
+        prompt = f"{MCP_DOWN_NOTE.format(', '.join(down))}\n{prompt}"
+
+    # 3) filtre par toolset, puis outils LangChain liés au client de leur serveur
+    ctx = RunContext(deps)
+    for server, specs in zip(servers, all_specs):
+        if specs is None:
+            continue
+        allowed = [spec for spec in specs if spec.name in server.toolset]
+        missing = server.toolset - {spec.name for spec in specs}
+        if missing:
+            log.warning("MCP %s : outils du toolset absents du serveur : %s", server.name, sorted(missing))
+        if not allowed:
+            continue
+        client = MCPAdapter(Client(mcp_transport(deps, server))).client  # MCPAdapter
+        ctx.mcp[server.url] = client
+        for spec in allowed:
+            t = await as_langchain_tool(spec, client)
+            if t.name in ctx.tools:  # même règle que pour les outils intégrés : le premier arrivé garde le nom
+                log.warning("outil MCP %r de %s ignoré : déjà fourni par %s", t.name, server.name, ctx.tool_server[t.name])
+                continue
+            ctx.tools[t.name] = t
+            ctx.tool_server[t.name] = server.url
+
+    try:
+        async with asyncio.timeout(RUN_TIMEOUT_S):
+            return await get_agent().ainvoke(
+                {"messages": [{"role": "user", "content": prompt}]},
+                config={"recursion_limit": RECURSION_LIMIT},
+                context=ctx,
+            )
+    finally:
+        await ctx.aclose()
+
+
+
+
+
 
 
 import asyncio
