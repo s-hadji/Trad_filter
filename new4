@@ -1,4 +1,253 @@
 
+
+Je réécris le notebook pour la version simplifiée et je l'exécute d'abord avec de faux services pour m'assurer qu'il tourne.
+
+Voici les 11 cellules pour la version simplifiée. Je les ai exécutées de bout en bout avec de faux services, et elles passent toutes.
+
+### Cellule 1 : import du module
+```python
+import importlib, json, logging, os, sys, time
+from getpass import getpass
+from pathlib import Path
+from pprint import pprint
+
+# Racine du projet : le dossier qui contient app/agent/agent_conf_langchain.py, cherché en remontant depuis ici.
+PROJECT_ROOT = None  # ou Path("/chemin/vers/genai-api") si la recherche échoue
+if PROJECT_ROOT is None:
+    PROJECT_ROOT = next((p for p in [Path.cwd(), *Path.cwd().parents]
+                         if (p / "app" / "agent" / "agent_conf_langchain.py").exists()), None)
+    if PROJECT_ROOT is None:
+        raise FileNotFoundError("app/agent/agent_conf_langchain.py introuvable : renseigne PROJECT_ROOT")
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# Logs du module : config injoignable, entrée mal formée, serveur MCP en panne, doublon de nom...
+logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s : %(message)s", force=True)
+logging.getLogger("agent").setLevel(logging.INFO)
+
+import app.agent.agent_conf_langchain as ag
+ag = importlib.reload(ag)  # recharge le fichier s'il a changé
+
+print("module  :", ag.__file__)
+print("URL_VCS :", ag.get_settings().URL_VCS)
+print("modèle  :", ag.get_settings().MODEL_NAME)
+```
+
+### Cellule 2 : les Deps
+```python
+USER_ID = "test_user"   # à adapter
+BASES = ("1",)          # identifiants de base, comme dans /bases/{base_id}/mcp
+TOKEN = os.environ.get("AGENT_TEST_TOKEN") or getpass("Token utilisateur : ")
+
+deps = ag.Deps(user_id=USER_ID, token=TOKEN, bases=tuple(BASES))
+print(deps)  # le token n'apparaît pas (repr=False)
+
+try:
+    ag.Deps(user_id="sans_token", token="")
+except ValueError as e:
+    print("attendu :", e)
+```
+
+### Cellule 3 : config brute de l'API VCS
+```python
+import httpx
+
+HEADERS = {"Authorization": f"Bearer {deps.token}", "Accept": "application/json"}  # comme dans load_mcp_tools
+CONFIGS = {}  # base_id -> réponse brute de l'API VCS
+async with httpx.AsyncClient(timeout=ag.DISCOVERY_TIMEOUT_S, headers=HEADERS) as http:
+    for b in deps.bases:
+        try:
+            CONFIGS[b] = raw = await ag.fetch_config(http, b)
+            print(f"base {b} : {len(raw)} serveur(s)")
+            pprint(raw, width=120)
+        except Exception as e:
+            print(f"base {b} : ÉCHEC {type(e).__name__} : {e}")
+```
+
+### Cellule 4 : serveurs fusionnés
+```python
+# Même fusion que dans load_mcp_tools : une entrée par url, union des toolsets de toutes les bases.
+SERVERS = {}  # url -> (name, toolset)
+for b, cfg in CONFIGS.items():
+    for s in cfg:
+        if isinstance(s, dict) and "url" in s:
+            SERVERS.setdefault(s["url"], (s.get("name", s["url"]), set()))[1].update(s.get("toolset") or ())
+        else:
+            print(f"entrée mal formée ignorée (base {b}) : {s!r}")
+
+for url, (name, toolset) in SERVERS.items():
+    print(f"- {name!r} -> {url}")
+    print(f"    toolset = {sorted(toolset)}")
+```
+
+### Cellule 5 : outils de chaque serveur et filtre toolset
+```python
+TOOLS = {}  # url -> outils LangChain du serveur, avant filtre
+for url, (name, toolset) in SERVERS.items():
+    t0 = time.perf_counter()
+    try:
+        TOOLS[url] = tools = await ag.list_tools(deps, url)
+    except Exception as e:
+        print(f"{name} : INJOIGNABLE ({type(e).__name__} : {e})  <- vérifie l'url (chemin /mcp ?) et le token")
+        continue
+    print(f"{name} ({url}) : {len(tools)} outil(s) en {time.perf_counter() - t0:.2f} s")
+    for t in tools:
+        print(f"   {'✅' if t.name in toolset else '❌'} {t.name}")
+    missing = toolset - {t.name for t in tools}
+    if missing:
+        print(f"   ⚠ dans le toolset mais absents du serveur : {sorted(missing)}")
+```
+
+### Cellule 6 : schéma JSON reçu par le LLM
+```python
+from langchain_core.utils.function_calling import convert_to_openai_tool
+
+ALLOWED = [t for url, (name, toolset) in SERVERS.items() for t in TOOLS.get(url, []) if t.name in toolset]
+print("outils retenus :", [t.name for t in ALLOWED])
+
+INDEX = 0  # change l'indice pour voir un autre outil
+if ALLOWED:
+    print(json.dumps(convert_to_openai_tool(ALLOWED[INDEX]), indent=2, ensure_ascii=False))
+```
+
+### Cellule 7 : appel direct d'un outil (sans LLM)
+```python
+TOOL_NAME = None  # ex. "get_chunks_by_dm_code"
+ARGS = {}         # ex. {"dm_code": "..."} : voir "parameters" dans le schéma ci-dessus
+
+if TOOL_NAME:
+    t = next((t for t in ALLOWED if t.name == TOOL_NAME), None)
+    if t is None:
+        print(f"{TOOL_NAME!r} n'est pas dans les outils retenus (cellule 6)")
+    else:
+        res = await t.ainvoke(ARGS)  # exactement l'appel que fait l'agent
+        pprint(res)
+else:
+    print("Renseigne TOOL_NAME et ARGS pour tester un appel.")
+```
+
+### Cellule 8 : la découverte complète, et son coût
+```python
+# Ce que run_agent_langg fait avant de créer l'agent : les cellules 3 à 6 en un seul appel.
+for passage in (1, 2):
+    t0 = time.perf_counter()
+    mcp_tools, down = await ag.load_mcp_tools(deps)
+    print(f"passage {passage} : {(time.perf_counter() - t0) * 1000:.0f} ms")
+print("outils MCP   :", [t.name for t in mcp_tools])
+print("injoignables :", down or "aucun")
+# Pas de cache : les deux passages coûtent pareil. C'est ce temps qui s'ajoute à chaque requête.
+```
+
+### Cellule 9 : l'agent complet, tracé nœud par nœud
+```python
+QUESTION = "Quelles sont mes bases autorisées, et quels outils documentaires as-tu ?"  # à adapter
+
+
+def texte(msg) -> str:
+    t = getattr(msg, "text", "")
+    t = t() if callable(t) else t  # .text : propriété en langchain-core >= 1.0, méthode avant
+    return t if isinstance(t, str) else str(msg.content)
+
+
+def resume(msg, n=200) -> str:
+    kind = type(msg).__name__
+    if getattr(msg, "tool_calls", None):
+        calls = "; ".join(f"{c['name']}({json.dumps(c['args'], ensure_ascii=False)})" for c in msg.tool_calls)
+        return f"{kind} -> appelle {calls}"
+    if kind == "ToolMessage":
+        return f"{kind} [{msg.name}, {getattr(msg, 'status', '?')}] {texte(msg)[:n]!r}"
+    return f"{kind} {texte(msg)[:n]!r}"
+
+
+class Traceur:
+    """Même agent, exécuté en astream pour afficher chaque étape du graphe."""
+
+    def __init__(self, agent):
+        self.agent = agent
+
+    async def ainvoke(self, inp, config=None, **kwargs):
+        print("Prompt :", inp["messages"][0]["content"][:300], "\n")
+        final = None
+        async for mode, chunk in self.agent.astream(inp, config=config, stream_mode=["updates", "values"], **kwargs):
+            if mode == "values":
+                final = chunk  # état complet après chaque étape ; le dernier = le résultat
+                continue
+            for node, update in (chunk or {}).items():
+                msgs = update.get("messages") if isinstance(update, dict) else None
+                if msgs is None:
+                    print(f"[{node}]")
+                    continue
+                for m in getattr(msgs, "value", msgs):  # Overwrite(...) éventuel
+                    print(f"[{node}] {resume(m)}")
+        return final
+
+
+vrai_create = ag.create_deep_agent
+
+
+def create_trace(*args, **kwargs):
+    t0 = time.perf_counter()
+    agent = vrai_create(*args, **kwargs)
+    print(f"graphe construit en {(time.perf_counter() - t0) * 1000:.0f} ms")
+    print("outils donnés à l'agent :", [t.name for t in kwargs.get("tools", [])])
+    return Traceur(agent)
+
+
+ag.create_deep_agent = create_trace  # run_agent_langg appelle create_deep_agent du module : on l'intercepte
+try:
+    t0 = time.perf_counter()
+    result = await ag.run_agent_langg(QUESTION, deps)
+finally:
+    ag.create_deep_agent = vrai_create  # toujours restaurer, même si le run plante
+print(f"\nrun terminé en {time.perf_counter() - t0:.1f} s")
+```
+
+### Cellule 10 : lire le résultat
+```python
+from langchain_core.messages import AIMessage
+
+for i, m in enumerate(result["messages"]):
+    print(f"{i:2} {resume(m, 120)}")
+
+
+def extraire_reponse(result: dict) -> str:
+    for msg in reversed(result.get("messages", [])):
+        if isinstance(msg, AIMessage) and not msg.tool_calls and texte(msg).strip():
+            return texte(msg)
+    return ""
+
+
+reponse = extraire_reponse(result)
+print("\n--- réponse finale ---\n" + (reponse or "(vide)"))
+dernier = result["messages"][-1]
+print("\nfinish_reason :", getattr(dernier, "response_metadata", {}).get("finish_reason"))
+print("autres clés de l'état :", [k for k in result if k != "messages"])
+```
+
+### Cellule 11 : cas d'erreur
+```python
+# Résultat = (outils, injoignables). Erreur HTTP -> la base est dans "injoignables" ; réponse [] -> aucun serveur.
+deps_ko = ag.Deps(user_id=USER_ID, token=TOKEN, bases=("base_inexistante",))
+tools_ko, down_ko = await ag.load_mcp_tools(deps_ko)
+print("base inexistante -> outils :", [t.name for t in tools_ko], "| injoignables :", down_ko)
+
+deps_vide = ag.Deps(user_id=USER_ID, token=TOKEN, bases=())
+tools_vide, down_vide = await ag.load_mcp_tools(deps_vide)
+print("sans base        -> outils :", [t.name for t in tools_vide], "| injoignables :", down_vide)
+
+# Décommente pour voir l'agent sans aucun outil MCP (appel LLM réel) :
+# result_vide = await ag.run_agent_langg("Quels outils as-tu ?", deps_vide)
+# print(extraire_reponse(result_vide))
+```
+
+**Ce qui change par rapport au notebook précédent**
+- **Cellule 7** : l'outil est appelé avec `t.ainvoke(ARGS)`, exactement comme le fait l'agent, et non plus par un client MCP séparé.
+- **Cellule 8** : la section sur le cache est remplacée par une mesure du coût de la découverte, puisqu'il n'y a plus de cache. Les deux passages doivent prendre à peu près le même temps.
+- **Cellule 9** : le traceur intercepte `create_deep_agent` au lieu de `get_agent`, et affiche le temps de construction du graphe. C'est la mesure qui confirme ou non que construire l'agent à chaque requête est négligeable.
+
+
+
+
 """
 Agent back-office, construit à chaque requête avec les outils MCP de l'appelant.
 
