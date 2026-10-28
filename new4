@@ -1,3 +1,172 @@
+
+"""
+Agent back-office, construit à chaque requête avec les outils MCP de l'appelant.
+
+Les outils MCP portent le token de l'utilisateur : ils ne peuvent pas vivre dans un agent
+global. Construire le graphe coûte peu devant un appel LLM (à mesurer chez toi).
+
+Requiert Python >= 3.11 (asyncio.timeout).
+"""
+import asyncio
+import json
+import logging
+import warnings
+from dataclasses import dataclass, field
+from functools import lru_cache
+
+import httpx
+from deepagents import create_deep_agent
+from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
+from langchain.agents.middleware import AgentMiddleware
+from langchain.messages import ToolMessage
+from langchain.tools import BaseTool, tool
+from langchain_core._api import LangChainBetaWarning
+from langchain_openai import ChatOpenAI
+from langgraph.errors import GraphBubbleUp
+
+warnings.filterwarnings("ignore", category=LangChainBetaWarning)
+from langchain.mcp import MCPAdapter  # noqa: E402  (après le filtre du warning beta)
+
+from app.utils.config import get_settings  # noqa: E402
+
+log = logging.getLogger("agent")
+
+PROMPT = "Tu es un assistant "
+MCP_DOWN_NOTE = "(Services documentaires indisponibles : {} ; signale-le si la réponse en dépend.)"
+
+DISCOVERY_TIMEOUT_S = 5   # par appel VCS et par list_tools (tout est fait en parallèle)
+TOOL_TIMEOUT_S = 60       # par appel de tool (sauf sous-agent "task")
+RUN_TIMEOUT_S = 300       # run complet
+RECURSION_LIMIT = 60
+
+
+@dataclass(frozen=True)
+class Deps:
+    user_id: str
+    token: str = field(repr=False)  # repr=False : le token n'apparaît pas dans les logs ni les traces
+    bases: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.token:
+            raise ValueError(f"Pas de token pour l'utilisateur {self.user_id!r} : appel MCP impossible.")
+
+
+@lru_cache(maxsize=1)
+def get_model() -> ChatOpenAI:
+    s = get_settings()
+    return ChatOpenAI(model=s.MODEL_NAME, base_url=s.URL_LLM_RAG, api_key=s.API_KEY_RAG)
+
+
+class ToolErrorsAsMessages(AgentMiddleware):
+    """Un tool qui plante ou dépasse son délai renvoie un ToolMessage d'erreur au modèle
+    au lieu de faire échouer tout le run."""
+
+    async def awrap_tool_call(self, request, handler):
+        name = request.tool_call["name"]
+        # "task" = sous-agent deepagents : plusieurs tours LLM, il a besoin du budget du run.
+        timeout = None if name == "task" else TOOL_TIMEOUT_S
+        try:
+            async with asyncio.timeout(timeout):
+                return await handler(request)
+        except GraphBubbleUp:  # interrupts / commandes LangGraph : contrôle de flux, pas des erreurs
+            raise
+        except Exception as e:
+            log.warning("tool %s en échec", name, exc_info=True)  # pas les args : données métier
+            return ToolMessage(
+                f"Outil {name} indisponible ({type(e).__name__}). Ne le rappelle pas.",
+                tool_call_id=request.tool_call["id"], name=name, status="error",
+            )
+
+
+# ---------- propre à chaque requête
+def profil_tool(deps: Deps) -> BaseTool:
+    @tool
+    def profil_utilisateur() -> str:
+        """Identifiant et bases autorisées de l'utilisateur courant."""
+        return json.dumps({"user_id": deps.user_id, "bases": deps.bases})
+
+    return profil_utilisateur
+
+
+async def fetch_config(http: httpx.AsyncClient, base_id: str) -> list[dict]:
+    """GET {URL_VCS}/bases/{base_id}/mcp -> [{"name": ..., "url": ..., "toolset": [...]}, ...]"""
+    r = await http.get(f"{get_settings().URL_VCS}/bases/{base_id}/mcp")
+    r.raise_for_status()
+    return r.json()
+
+
+async def list_tools(deps: Deps, url: str) -> list[BaseTool]:
+    transport = StreamableHttpTransport(url, auth=deps.token, headers={"X-Bases": json.dumps(deps.bases)})
+    async with asyncio.timeout(DISCOVERY_TIMEOUT_S), MCPAdapter(Client(transport)) as mcp:
+        return await mcp.list_tools()  # les tools restent utilisables après la sortie du bloc
+
+
+async def load_mcp_tools(deps: Deps) -> tuple[list[BaseTool], list[str]]:
+    """Outils MCP autorisés pour l'utilisateur, et liste de ce qui est injoignable.
+    return_exceptions=True : un échec devient une valeur dans la liste au lieu d'interrompre les autres."""
+    # 1) quels serveurs : une requête VCS par base
+    headers = {"Authorization": f"Bearer {deps.token}", "Accept": "application/json"}
+    async with httpx.AsyncClient(timeout=DISCOVERY_TIMEOUT_S, headers=headers) as http:
+        configs = await asyncio.gather(*(fetch_config(http, b) for b in deps.bases), return_exceptions=True)
+
+    servers: dict[str, tuple[str, set[str]]] = {}  # url -> (name, union des toolsets)
+    down = []
+    for base_id, cfg in zip(deps.bases, configs):
+        if isinstance(cfg, BaseException):
+            log.warning("config MCP de la base %s indisponible", base_id, exc_info=cfg)
+            down.append(f"configuration de la base {base_id}")
+            continue
+        for s in cfg:
+            if not isinstance(s, dict) or "url" not in s:
+                log.warning("entrée MCP mal formée ignorée (base %s) : %r", base_id, s)
+                continue
+            servers.setdefault(s["url"], (s.get("name", s["url"]), set()))[1].update(s.get("toolset") or ())
+
+    # 2) quels outils : un list_tools par serveur, puis filtre par toolset
+    urls = list(servers)
+    results = await asyncio.gather(*(list_tools(deps, u) for u in urls), return_exceptions=True)
+    tools: dict[str, BaseTool] = {}
+    for url, res in zip(urls, results):
+        name, toolset = servers[url]
+        if isinstance(res, BaseException):
+            log.warning("MCP %s indisponible", name, exc_info=res)
+            down.append(name)
+            continue
+        for t in res:
+            if t.name in toolset:
+                if t.name in tools:  # deux serveurs, même nom : le premier garde le nom
+                    log.warning("outil MCP %r de %s ignoré : nom déjà pris", t.name, name)
+                tools.setdefault(t.name, t)
+    return list(tools.values()), down
+
+
+# ---------- point d'entrée (même signature, même sortie qu'avant)
+async def run_agent_langg(prompt: str, deps: Deps) -> dict:
+    mcp_tools, down = await load_mcp_tools(deps)
+    if down:
+        prompt = f"{MCP_DOWN_NOTE.format(', '.join(down))}\n{prompt}"
+
+    middleware = [ToolErrorsAsMessages()]
+    agent = create_deep_agent(
+        model=get_model(),
+        tools=[profil_tool(deps), *mcp_tools],
+        system_prompt=PROMPT,
+        middleware=middleware,
+        # Le sous-agent par défaut ne reçoit pas le middleware : on le redéclare pour qu'un outil
+        # qui plante dans un sous-agent renvoie aussi un message d'erreur au lieu de tout arrêter.
+        subagents=[{**GENERAL_PURPOSE_SUBAGENT, "middleware": middleware}],
+    )
+    async with asyncio.timeout(RUN_TIMEOUT_S):
+        return await agent.ainvoke(
+            {"messages": [{"role": "user", "content": prompt}]},
+            config={"recursion_limit": RECURSION_LIMIT},
+        )
+
+
+
+
 import asyncio
 import json
 import logging
