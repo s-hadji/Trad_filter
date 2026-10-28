@@ -1,4 +1,228 @@
 
+
+# Extraction fidèle des photos (agent_conf_langchain.py, lignes 39 à 233).
+# - Lignes 1 à 38 non visibles : imports repris de ta version précédente.
+# - Les annotations grisées affichées par Pylance (": Unknown", "-> Unknown", "hit: tuple[...]",
+#   "log: Logger", "timeout: Literal[60] | None"...) sont des indications de l'éditeur, pas du code :
+#   elles ne sont pas recopiées.
+import asyncio
+import json
+import logging
+import time
+import warnings
+from dataclasses import dataclass, field
+from functools import lru_cache
+
+import mcp.types as mt
+from deepagents import create_deep_agent
+from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
+from langchain.agents.middleware import AgentMiddleware
+from langchain.messages import ToolMessage
+from langchain.tools import BaseTool, ToolRuntime, tool
+from langchain_core._api import LangChainBetaWarning
+from langchain_openai import ChatOpenAI
+from langgraph.errors import GraphBubbleUp
+
+warnings.filterwarnings("ignore", category=LangChainBetaWarning)
+from langchain.mcp import MCPAdapter, as_langchain_tool
+
+from app.utils.config import get_settings
+
+log = logging.getLogger("agent")
+
+PROMPT = "Tu es un assistant "
+MCP_DOWN_NOTE = "(Service documentaire indisponible : signale-le si la réponse en dépend.)"
+
+MCP_DISCOVERY_TIMEOUT_S = 5   # connexion + list_tools
+MCP_TOOLS_TTL_S = 60          # durée de vie de la liste d'outils d'un utilisateur ; 0 = list_tools à chaque requête
+TOOL_TIMEOUT_S = 60           # par appel de tool (sauf sous-agent "task")
+RUN_TIMEOUT_S = 300           # run complet
+RECURSION_LIMIT = 60
+
+
+# ---------- découverte des outils MCP (réseau), avec cache par utilisateur
+def mcp_transport(deps: Deps) -> StreamableHttpTransport:  # ⚠ Deps est défini plus bas (voir réponse)
+    """Transport MCP portant le token de l'utilisateur. Le construire ne fait aucun appel réseau."""
+    URL_MCP = build_mcp  # ⚠ build_mcp : défini dans les lignes 1-38, non visibles
+    return StreamableHttpTransport(URL_MCP, auth=deps.token,
+                                   headers={"X-Bases": json.dumps(deps.bases)})
+
+
+@dataclass(frozen=True)
+class Deps:
+    user_id: str
+    token: str = field(repr=False)
+    bases: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.token:
+            raise ValueError(f"Pas de token pour l'utilisateur {self.user_id!r} : appel MCP impossible.")
+
+
+@dataclass
+class RunContext:
+    """Contexte d'UN run, passé à ainvoke(context=...) et lu par les outils et le middleware."""
+    deps: Deps
+    tools: dict[str, BaseTool] = field(default_factory=dict)  # outils MCP de cet utilisateur, par nom
+    mcp: Client | None = None                                 # client MCP portant son token
+    _held: bool = False
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    async def hold_mcp(self) -> None:
+        """Ouvre la session MCP au 1er appel d'outil MCP et la garde jusqu'à la fin du run.
+        Sinon chaque lot d'appels d'outils rouvrirait sa propre session (handshake compris)."""
+        async with self._lock:
+            if self.mcp is not None and not self._held:
+                await self.mcp.__aenter__()
+                self._held = True
+
+    async def aclose(self) -> None:
+        if self._held:
+            self._held = False
+            await self.mcp.__aexit__(None, None, None)
+
+
+class ToolSpecCache:
+    """Définitions des outils MCP (nom, description, schéma JSON) par utilisateur, avec TTL.
+
+    Seules les définitions sont mises en cache, jamais un outil instancié : les outils sont
+    reconstruits à chaque requête avec le token courant. Si le serveur ne répond pas alors
+    qu'une liste expirée existe, cette liste est servie quand même : le serveur revérifie de
+    toute façon les droits à chaque appel."""
+
+    def __init__(self, ttl_s: float, max_users: int = 10_000) -> None:
+        self.ttl_s, self.max_users = ttl_s, max_users
+        self._entries: dict[tuple, tuple[float, list[mt.Tool]]] = {}
+
+    @staticmethod
+    def key(deps: Deps) -> tuple:
+        # Tout ce qui détermine la liste renvoyée par le serveur doit être dans la clé.
+        return deps.user_id, deps.bases
+
+    async def get(self, deps: Deps) -> list[mt.Tool] | None:
+        """None = serveur injoignable et rien en cache ; [] = aucun outil autorisé."""
+        key, now = self.key(deps), time.monotonic()
+        hit = self._entries.get(key)
+        if hit is not None and hit[0] > now:
+            return hit[1]
+        try:
+            async with asyncio.timeout(MCP_DISCOVERY_TIMEOUT_S), Client(mcp_transport(deps)) as c:
+                specs = await c.list_tools()
+        except Exception:
+            log.warning("MCP indisponible (user=%s)", deps.user_id, exc_info=True)
+            return hit[1] if hit is not None else None
+        if len(self._entries) >= self.max_users:
+            self._entries = {k: v for k, v in self._entries.items() if v[0] > now}
+        self._entries[key] = (now + self.ttl_s, specs)
+        return specs
+
+    def invalidate(self, deps: Deps) -> None:
+        """À appeler si les droits d'un utilisateur changent et que ont ne veux pas attendre le TTL."""
+        self._entries.pop(self.key(deps), None)
+
+
+TOOL_SPECS = ToolSpecCache(MCP_TOOLS_TTL_S)
+
+
+# ---------- outils et middleware (sans état : partagés par toutes les requêtes)
+@tool
+def profil_utilisateur(runtime: ToolRuntime[RunContext]) -> str:
+    """Identifiant et bases autorisées de l'utilisateur courant."""
+    d = runtime.context.deps
+    return json.dumps({"user_id": d.user_id, "bases": d.bases})
+
+
+class RequestTools(AgentMiddleware):
+    """Branche les outils de la requête (runtime.context.tools) sur un graphe compilé sans eux."""
+
+    async def awrap_model_call(self, request, handler):
+        extra = request.runtime.context.tools
+        if extra:
+            taken = {t.name for t in request.tools if isinstance(t, BaseTool)}
+            for name in extra.keys() & taken:
+                log.warning("outil MCP %r ignoré : ce nom est déjà pris par un outil intégré", name)
+            request = request.override(tools=[*request.tools, *(t for n, t in extra.items() if n not in taken)])
+        return await handler(request)
+
+    async def awrap_tool_call(self, request, handler):
+        ctx: RunContext = request.runtime.context
+        mcp_tool = ctx.tools.get(request.tool_call["name"])
+        if mcp_tool is not None and request.tool is None:  # request.tool is None : pas un outil intégré
+            await ctx.hold_mcp()
+            request = request.override(tool=mcp_tool)
+        return await handler(request)
+
+
+class ToolErrorsAsMessages(AgentMiddleware):
+    """Un tool qui plante ou dépasse son délai renvoie un ToolMessage d'erreur au modèle
+    au lieu de faire échouer tout le run."""
+
+    async def awrap_tool_call(self, request, handler):
+        name = request.tool_call["name"]
+        # "task" = sous-agent deepagents : plusieurs tours LLM, il a besoin du budget du run.
+        timeout = None if name == "task" else TOOL_TIMEOUT_S
+        try:
+            async with asyncio.timeout(timeout):
+                return await handler(request)
+        except GraphBubbleUp:  # interrupts / commandes LangGraph : contrôle de flux, pas des erreurs
+            raise
+        except Exception as e:
+            log.warning("tool %s en échec", name, exc_info=True)  # pas les args : données métier
+            return ToolMessage(
+                f"Outil {name} indisponible ({type(e).__name__}). Ne le rappelle pas.",
+                tool_call_id=request.tool_call["id"], name=name, status="error",
+            )
+
+
+# ---------- partagé entre les requêtes (créé une fois)
+@lru_cache(maxsize=1)
+def get_model() -> ChatOpenAI:
+    s = get_settings()
+    return ChatOpenAI(model=s.MODEL_NAME, base_url=s.URL_LLM_RAG, api_key=s.API_KEY_RAG)
+
+
+@lru_cache(maxsize=1)
+def get_agent():
+    # 1er de la liste = le plus externe : il rattrape aussi les échecs d'ouverture de session MCP.
+    middleware = [ToolErrorsAsMessages(), RequestTools()]
+    return create_deep_agent(
+        model=get_model(),
+        tools=[profil_utilisateur],
+        system_prompt=PROMPT,
+        middleware=middleware,
+        context_schema=RunContext,
+        # Sous-agent "general-purpose" déclaré explicitement : celui créé par défaut ne reçoit pas
+        # le middleware utilisateur, donc il ne verrait pas les outils MCP de la requête.
+        subagents=[{**GENERAL_PURPOSE_SUBAGENT, "middleware": middleware}],
+    )
+
+
+# ---------- point d'entrée
+async def run_agent_langg(prompt: str, deps: Deps) -> dict:
+    specs = await TOOL_SPECS.get(deps)
+    if specs is None:
+        prompt = f"{MCP_DOWN_NOTE}\n{prompt}"
+
+    ctx = RunContext(deps)
+    if specs:
+        ctx.mcp = MCPAdapter(Client(mcp_transport(deps))).client  # MCPAdapter
+        ctx.tools = {t.name: t for t in [await as_langchain_tool(s, ctx.mcp) for s in specs]}
+
+    try:
+        async with asyncio.timeout(RUN_TIMEOUT_S):
+            return await get_agent().ainvoke(
+                {"messages": [{"role": "user", "content": prompt}]},
+                config={"recursion_limit": RECURSION_LIMIT},
+                context=ctx,
+            )
+    finally:
+        await ctx.aclose()
+
+
+
+
 """
 Agent back-office.
 
