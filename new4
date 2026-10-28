@@ -1,10 +1,5 @@
 
 
-# Extraction fidèle des photos (agent_conf_langchain.py, lignes 39 à 233).
-# - Lignes 1 à 38 non visibles : imports repris de ta version précédente.
-# - Les annotations grisées affichées par Pylance (": Unknown", "-> Unknown", "hit: tuple[...]",
-#   "log: Logger", "timeout: Literal[60] | None"...) sont des indications de l'éditeur, pas du code :
-#   elles ne sont pas recopiées.
 import asyncio
 import json
 import logging
