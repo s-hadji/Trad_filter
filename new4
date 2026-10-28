@@ -1,4 +1,227 @@
 
+# %% [markdown]
+# # LLM-as-judge — Chatbot SCALP
+# Entrée : df_valide (Question | Réponse attendue | Data Module -référence | Unnamed: 3)
+# 1. On fait tourner l'agent sur chaque question (réponses mises en cache).
+# 2. Un LLM juge note la réponse de l'agent sur 5 critères, la "Réponse attendue" faisant foi.
+# 3. Si "Unnamed: 3" est rempli (= ancienne version de la réponse), le juge dit aussi si la
+#    nouvelle réponse est une amélioration, équivalente ou une régression.
+# Sortie : df_eval (notes + justifications + score global + verdict) et export Excel.
+
+# %% Imports
+import json
+from pathlib import Path
+from typing import Literal, Optional
+
+import pandas as pd
+from pydantic import BaseModel, Field, create_model
+from tqdm.auto import tqdm
+
+# %% 1. Préparation du DataFrame
+COL_Q, COL_REF, COL_DM = "Question", "Réponse attendue", "Data Module -référence"
+
+df = df_valide.copy()
+df.columns = df.columns.str.strip()
+df = df.rename(columns={"Unnamed: 3": "ancienne_reponse"})
+# NaN, "" ou "   " -> <NA> ; sinon texte nettoyé
+df["ancienne_reponse"] = df["ancienne_reponse"].astype("string").str.strip().replace("", pd.NA)
+
+# %% 2. Réponses de l'agent (cache JSON : re-juger ne relance pas l'agent)
+AGENT_VERSION = "v2"  # change-la quand tu modifies l'agent -> nouveau fichier de cache
+CACHE = Path(f"reponses_agent_{AGENT_VERSION}.json")
+
+
+def run_agent(question: str) -> str:
+    """À brancher sur ton agent. Exemple LangGraph :
+        out = graph.invoke({"messages": [("user", question)]})
+        return out["messages"][-1].content
+    """
+    raise NotImplementedError("Branche ton agent ici")
+
+
+cache = json.loads(CACHE.read_text(encoding="utf-8")) if CACHE.exists() else {}
+for q in tqdm(df[COL_Q].dropna().unique(), desc="Agent"):
+    if q in cache:
+        continue
+    try:
+        cache[q] = run_agent(q)
+    except Exception as e:  # les erreurs ne sont PAS mises en cache -> retentées au prochain run
+        print(f"[agent] échec sur {q[:60]!r} : {e!r}")
+        continue
+    CACHE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+df["reponse_agent"] = df[COL_Q].map(cache)
+
+# %% 3. Modèle juge
+# De préférence un modèle différent (et au moins aussi fort) que celui de l'agent :
+# un LLM a tendance à mieux noter ses propres formulations (self-preference bias).
+from langchain.chat_models import init_chat_model
+
+judge_llm = init_chat_model("openai:NOM_DU_MODELE", temperature=0)
+# Ou réutilise ton objet existant, ex. : judge_llm = AzureChatOpenAI(..., temperature=0)
+
+# %% 4. Critères, schéma de sortie, prompts
+# Critères : modifiables librement (nom -> consigne). Le schéma Pydantic est reconstruit à partir d'ici.
+CRITERES = {
+    "exactitude": (
+        "Les informations données (valeurs, unités, outils, durées, références) sont-elles correctes "
+        "par rapport à la réponse attendue ? 5 = tout est correct ; 3 = l'information principale est "
+        "correcte mais un détail secondaire est faux ; 1 = l'information principale est fausse."
+    ),
+    "completude": (
+        "Les informations de la réponse attendue sont-elles toutes présentes ? 5 = toutes ; "
+        "3 = l'information principale est là mais il manque des éléments secondaires ; "
+        "1 = l'information principale est absente."
+    ),
+    "fidelite": (
+        "La réponse évite-t-elle d'inventer ? 5 = rien de contradictoire ni d'inventé ; "
+        "3 = un ajout douteux mais sans conséquence ; 1 = affirmation contradictoire avec la référence "
+        "ou manifestement inventée. Un ajout cohérent mais absent de la référence n'est pas pénalisé."
+    ),
+    "clarte": (
+        "La réponse est-elle claire et directement exploitable par un technicien ? 5 = immédiatement "
+        "compréhensible et bien structurée ; 3 = compréhensible mais confuse par endroits ; "
+        "1 = difficile à comprendre."
+    ),
+    "pertinence": (
+        "La réponse répond-elle à la question posée, sans hors-sujet ni remplissage ? "
+        "5 = va droit au but ; 3 = contient du superflu ; 1 = à côté de la question."
+    ),
+}
+# Poids du score global (choix, pas une obligation). Somme = 1.
+POIDS = {"exactitude": 0.35, "completude": 0.25, "fidelite": 0.15, "clarte": 0.15, "pertinence": 0.10}
+SEUIL_BLOQUANT = 2  # si exactitude <= 2, le score global est plafonné à la note d'exactitude
+
+
+class NoteCritere(BaseModel):
+    # L'ordre des champs compte : le LLM génère la justification AVANT la note.
+    justification: str = Field(description="1 à 3 phrases : ce qui est juste, faux ou manquant.")
+    note: Literal[1, 2, 3, 4, 5] = Field(description="Note entière de 1 à 5.")
+
+
+class Comparaison(BaseModel):
+    points_corriges: list[str] = Field(
+        description="Ce que la nouvelle réponse corrige ou ajoute par rapport à l'ancienne (liste vide si rien)."
+    )
+    points_degrades: list[str] = Field(
+        description="Ce qui était correct dans l'ancienne réponse et est perdu ou faux dans la nouvelle (liste vide si rien)."
+    )
+    justification: str = Field(description="Synthèse en 1 à 3 phrases, AVANT le verdict.")
+    verdict: Literal["amelioration", "equivalent", "regression"]
+
+
+def build_schema(avec_comparaison: bool) -> type[BaseModel]:
+    champs = {nom: (NoteCritere, Field(description=desc)) for nom, desc in CRITERES.items()}
+    if avec_comparaison:
+        champs["comparaison"] = (Comparaison, Field(description="Comparaison avec l'ancienne version."))
+    nom = "JugementAvecComparaison" if avec_comparaison else "Jugement"
+    return create_model(nom, __doc__="Évaluation d'une réponse d'agent par critère.", **champs)
+
+
+SCHEMA_SIMPLE = build_schema(False)
+SCHEMA_COMP = build_schema(True)  # utilisé seulement si un ancien commentaire existe
+juge_simple = judge_llm.with_structured_output(SCHEMA_SIMPLE)
+juge_comp = judge_llm.with_structured_output(SCHEMA_COMP)
+
+SYSTEM = """Tu es un évaluateur expert des réponses d'un assistant de maintenance technique (documentation SCALP).
+Tu compares la RÉPONSE DE L'AGENT à la RÉPONSE ATTENDUE, qui fait foi.
+
+Règles :
+- La réponse attendue est la vérité de référence : ne note pas d'après tes propres connaissances.
+- Les équivalences de forme sont acceptées (5100 mm = 5,1 m ; « 30 min » = « 30 minutes ») ; une valeur différente est une erreur.
+- La longueur n'est pas une qualité : une réponse longue n'est pas meilleure qu'une réponse courte et exacte.
+- Une erreur sur l'information principale implique exactitude <= 2, même si la réponse est claire.
+- Pour chaque critère, écris la justification AVANT la note.
+
+Critères (note entière de 1 à 5) :
+"""
+
+BLOC_COMPARAISON = """
+Une ANCIENNE VERSION de la réponse est aussi fournie. Compare la nouvelle réponse à l'ancienne,
+toujours en prenant la réponse attendue comme référence :
+- amelioration : la nouvelle est plus proche de la réponse attendue (erreur corrigée, information ajoutée) sans rien perdre ;
+- equivalent : pas de différence significative de qualité ;
+- regression : la nouvelle perd ou fausse une information que l'ancienne donnait correctement.
+Si l'ancienne version est une remarque d'évaluateur plutôt qu'une réponse, vérifie si la nouvelle réponse corrige le problème signalé.
+L'ordre de présentation des deux réponses ne doit pas influencer ton verdict.
+"""
+
+
+def juger(question: str, attendue: str, reponse: str, ancienne: Optional[str] = None) -> BaseModel:
+    a_comparer = ancienne is not None
+    system = SYSTEM + "\n".join(f"- {c} : {d}" for c, d in CRITERES.items())
+    if a_comparer:
+        system += "\n" + BLOC_COMPARAISON
+
+    user = (
+        f"<question>\n{question}\n</question>\n\n"
+        f"<reponse_attendue>\n{attendue}\n</reponse_attendue>\n\n"
+    )
+    if a_comparer:
+        user += f"<ancienne_reponse>\n{ancienne}\n</ancienne_reponse>\n\n"
+    user += f"<reponse_agent>\n{reponse}\n</reponse_agent>"
+
+    juge = juge_comp if a_comparer else juge_simple
+    j = juge.invoke([("system", system), ("human", user)])
+    if j is None:
+        raise ValueError("sortie du juge non parsable")
+    return j
+
+
+def score_global(j: BaseModel) -> float:
+    """Moyenne pondérée calculée en Python (pas par le LLM), avec plafond si exactitude <= seuil."""
+    notes = {c: getattr(j, c).note for c in CRITERES}
+    s = sum(POIDS[c] * notes[c] for c in CRITERES) / sum(POIDS[c] for c in CRITERES)
+    if notes["exactitude"] <= SEUIL_BLOQUANT:
+        s = min(s, notes["exactitude"])
+    return round(s, 2)
+
+
+# %% 5. Boucle d'évaluation
+lignes = []
+for i, row in tqdm(df.iterrows(), total=len(df), desc="Juge"):
+    ancienne = row["ancienne_reponse"] if pd.notna(row["ancienne_reponse"]) else None
+    if pd.isna(row["reponse_agent"]):
+        lignes.append({"idx": i, "erreur": "pas de réponse agent"})
+        continue
+    try:
+        j = juger(row[COL_Q], row[COL_REF], row["reponse_agent"], ancienne)
+    except Exception as e:
+        lignes.append({"idx": i, "erreur": repr(e)})
+        continue
+
+    out = {"idx": i, "score_global": score_global(j), "jugement_json": j.model_dump_json()}
+    for c in CRITERES:
+        out[f"note_{c}"] = getattr(j, c).note
+        out[f"justif_{c}"] = getattr(j, c).justification
+    if ancienne is not None:
+        out["verdict_comparaison"] = j.comparaison.verdict
+        out["justif_comparaison"] = j.comparaison.justification
+        out["points_corriges"] = " ; ".join(j.comparaison.points_corriges)
+        out["points_degrades"] = " ; ".join(j.comparaison.points_degrades)
+    lignes.append(out)
+
+df_eval = df.join(pd.DataFrame(lignes).set_index("idx"))
+
+# %% 6. (Optionnel) Contrôle déterministe : l'agent cite-t-il le bon Data Module ?
+# Ce qui se vérifie par code ne passe pas par le juge : gratuit, exact, reproductible.
+df_eval["cite_bon_dm"] = [
+    pd.notna(rep) and str(dm).strip() in str(rep) for dm, rep in zip(df_eval[COL_DM], df_eval["reponse_agent"])
+]
+
+# %% 7. Synthèse + export
+cols_notes = [f"note_{c}" for c in CRITERES] + ["score_global"]
+print(df_eval[cols_notes].describe().round(2))
+if "verdict_comparaison" in df_eval:
+    print(df_eval["verdict_comparaison"].value_counts(dropna=True))
+if "erreur" in df_eval:
+    print(f"{df_eval['erreur'].notna().sum()} ligne(s) en erreur")
+
+df_eval.to_excel(f"evaluation_juge_{AGENT_VERSION}.xlsx", index=False)
+
+
+
+
 def extraire_reponse(result: dict) -> str:
     """Texte du DERNIER message IA sans appel d'outil : la réponse finale de l'agent.
     Le premier message IA est presque toujours un appel d'outil au contenu vide."""
