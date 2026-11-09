@@ -1,4 +1,18 @@
 
+
+from langchain.agents.middleware import AgentMiddleware
+
+class ToolLogger(AgentMiddleware):
+    def wrap_tool_call(self, request, handler):
+        logger.info("→ %s %s", request.tool_call["name"], request.tool_call["args"])
+        return handler(request)
+
+    async def awrap_tool_call(self, request, handler):
+        logger.info("→ %s %s", request.tool_call["name"], request.tool_call["args"])
+        return await handler(request)
+
+
+
 # %% [markdown]
 # # LLM-as-judge : réponses de l'agent vs réponses attendues
 # 1. L'agent répond à chaque question de df_valide (réponses sauvegardées dans reponses_agent.json).
