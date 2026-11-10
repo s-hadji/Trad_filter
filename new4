@@ -1,5 +1,9 @@
 
 
+from mlflow.tracing.processor.mlflow_v2 import MlflowV2SpanProcessor
+MlflowV2SpanProcessor._shutdown = False
+
+
 from langchain.agents.middleware import AgentMiddleware
 
 class ToolLogger(AgentMiddleware):
