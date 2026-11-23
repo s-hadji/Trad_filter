@@ -1,4 +1,23 @@
 
+from langchain_openai import ChatOpenAI
+
+common = dict(
+    model="<le nom renvoyé par /v1/models>",
+    base_url=...,
+    api_key=...,
+    temperature=1.0,
+    top_p=0.95,
+)
+
+# Résumé + reformulation : think désactivé
+llm_fast = ChatOpenAI(**common, extra_body={"chat_template_kwargs": {"enable_thinking": False}})
+
+# Agent : think réduit
+llm_agent = ChatOpenAI(**common, extra_body={"chat_template_kwargs": {"enable_thinking": True, "low_effort": True}})
+
+agent = create_agent(llm_agent, tools=..., system_prompt=...)
+
+
 import json
 
 async def response_stream(inputs: dict, config: dict):
