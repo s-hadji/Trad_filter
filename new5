@@ -1,0 +1,30 @@
+
+import json
+
+async def response_stream(inputs: dict, config: dict):
+    async for mode, chunk in graph.astream(
+        inputs, config, stream_mode=["messages", "updates"]
+    ):
+        if mode == "messages":
+            msg, meta = chunk
+            # Seulement les tokens de l'agent (pas ceux du reformulator ni du résumé)
+            if meta.get("langgraph_node") == "langg_agent" and msg.content:
+                yield f"data: {json.dumps({'type': 'token', 'content': msg.content})}\n\n"
+
+        elif mode == "updates" and "langg_agent" in chunk:
+            # Le nœud agent a fini : la réponse est complète
+            answer = chunk["langg_agent"]["messages"][-1].content  # adapte à ce que ton nœud renvoie
+            yield f"data: {json.dumps({'type': 'done', 'answer': answer})}\n\n"
+    # La boucle continue ensuite pour le résumé, sans rien envoyer : la réponse est déjà partie
+
+
+from fastapi.responses import StreamingResponse
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest):
+    config = {"configurable": {"thread_id": req.thread_id}}
+    inputs = {"question": req.question}  # adapte à tes clés
+    return StreamingResponse(response_stream(inputs, config), media_type="text/event-stream")
+
+
+
