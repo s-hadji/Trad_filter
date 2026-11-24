@@ -1,5 +1,163 @@
 
 
+"""Agent Gemma 4 (vLLM via ChatOpenAI) avec sortie structurée en 3 champs :
+  - sources      : passages copiés mot pour mot, chacun associé à son id_document
+  - id_documents : liste sans doublon des documents qui ont servi (et seulement eux)
+  - reponse      : la réponse
+"""
+import json
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+from langchain.agents import create_agent
+from langchain.agents.structured_output import ToolStrategy
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+
+
+# ---------------------------------------------------------------------------
+# 1. Schéma de sortie
+#    Les descriptions des Field sont envoyées au modèle : ce sont des consignes.
+# ---------------------------------------------------------------------------
+class Passage(BaseModel):
+    id_document: str = Field(description="id_document du document d'où vient le passage, recopié exactement.")
+    passage: str = Field(
+        min_length=1,
+        description="Passage copié mot pour mot depuis ce document, réellement utilisé pour écrire la réponse.",
+    )
+
+
+class ReponseSourcee(BaseModel):
+    """Réponse finale, avec uniquement les passages et documents qui ont servi."""
+
+    sources: list[Passage] = Field(
+        description=(
+            "Passages copiés mot pour mot qui ont servi à la réponse, chacun avec son id_document. "
+            "N'inclus aucun document trouvé mais non utilisé. Liste vide si rien n'a servi."
+        )
+    )
+    id_documents: list[str] = Field(
+        description="Liste sans doublon des id_document présents dans sources, et aucun autre."
+    )
+    reponse: str = Field(description="Réponse à la question, fondée uniquement sur les passages de sources.")
+
+    @field_validator("id_documents")
+    @classmethod
+    def sans_doublon(cls, ids: list[str]) -> list[str]:
+        # Doublon = erreur sans gravité : on corrige en gardant l'ordre.
+        return list(dict.fromkeys(ids))
+
+    @model_validator(mode="after")
+    def coherence(self) -> "ReponseSourcee":
+        # Définition opérationnelle de « document utile » : au moins un passage cité.
+        # Un id sans passage est donc inutile ; un passage sans id dans la liste est un oubli.
+        ids_passages = {p.id_document for p in self.sources}
+        sans_passage = set(self.id_documents) - ids_passages
+        oublies = ids_passages - set(self.id_documents)
+        if sans_passage or oublies:
+            # ValueError -> ToolStrategy renvoie l'erreur au modèle et le fait réessayer.
+            raise ValueError(
+                "id_documents doit contenir exactement les id_document de sources. "
+                f"Sans passage (à retirer) : {sorted(sans_passage)}. Oubliés (à ajouter) : {sorted(oublies)}."
+            )
+        return self
+
+
+# ---------------------------------------------------------------------------
+# 2. Outil de recherche : renvoie tes documents avec leur id_document.
+# ---------------------------------------------------------------------------
+FAKE_DB = [  # ← à remplacer par ta vraie recherche
+    {"id_document": "D1", "content": "Le 24 novembre, il fait 8 °C à Paris avec de la pluie."},
+    {"id_document": "D2", "content": "Le 24 novembre, il fait 5 °C à Lyon, ciel dégagé."},
+    {"id_document": "D3", "content": "À Paris, la pluie doit cesser en fin de soirée."},
+]
+
+
+def my_search(query: str) -> list[dict]:
+    return FAKE_DB
+
+
+@tool
+def search_docs(query: str) -> str:
+    """Cherche des documents pertinents. Renvoie une liste JSON de documents (id_document, content)."""
+    return json.dumps(my_search(query), ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# 3. Modèle + agent
+# ---------------------------------------------------------------------------
+model = ChatOpenAI(
+    model="google/gemma-4-31B-it",
+    base_url="http://localhost:8000/v1",
+    api_key="EMPTY",
+    extra_body={"chat_template_kwargs": {"enable_thinking": True}},
+)
+
+SYSTEM_PROMPT = (
+    "Tu réponds uniquement à partir des documents renvoyés par search_docs. "
+    "Dans sources, recopie mot pour mot les passages que tu as utilisés, avec leur id_document. "
+    "Dans id_documents, mets une seule fois chaque id_document présent dans sources, et aucun autre : "
+    "un document trouvé mais non utilisé ne doit apparaître nulle part. "
+    "Si les documents ne permettent pas de répondre, dis-le et laisse sources et id_documents vides."
+)
+
+agent = create_agent(
+    model=model,
+    tools=[search_docs],
+    system_prompt=SYSTEM_PROMPT,
+    response_format=ToolStrategy(ReponseSourcee),  # handle_errors=True : réessaie si un validateur échoue
+)
+
+
+# ---------------------------------------------------------------------------
+# 4. Vérification après coup (le schéma ne peut pas voir les documents) :
+#    on garde un passage seulement si son id_document a vraiment été renvoyé
+#    par la recherche ET si le passage figure mot pour mot dans ce document.
+# ---------------------------------------------------------------------------
+def _norm(s: str) -> str:
+    return " ".join(s.split()).lower()
+
+
+def documents_vus(messages) -> dict[str, dict]:
+    """id_document -> document, pour tout ce que search_docs a renvoyé pendant l'exécution."""
+    docs: dict[str, dict] = {}
+    for m in messages:
+        if isinstance(m, ToolMessage) and m.name == "search_docs":
+            try:
+                for d in json.loads(m.text):
+                    docs[d["id_document"]] = d
+            except (json.JSONDecodeError, KeyError, TypeError):
+                pass
+    return docs
+
+
+def verifier(result: dict) -> tuple[ReponseSourcee, list[Passage]]:
+    """Retourne (réponse nettoyée, passages rejetés). id_documents est recalculé après filtrage."""
+    rep: ReponseSourcee = result["structured_response"]
+    docs = documents_vus(result["messages"])
+    gardes, rejetes = [], []
+    for p in rep.sources:
+        doc = docs.get(p.id_document)
+        if doc and _norm(p.passage) in _norm(doc["content"]):
+            gardes.append(p)
+        else:
+            rejetes.append(p)
+    ids = list(dict.fromkeys(p.id_document for p in gardes))
+    return ReponseSourcee(sources=gardes, id_documents=ids, reponse=rep.reponse), rejetes
+
+
+if __name__ == "__main__":
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": "Quel temps fait-il à Paris le 24 novembre ?"}]}
+    )
+    rep, rejetes = verifier(result)
+    print(rep.model_dump_json(indent=2))
+    if rejetes:
+        print("Passages rejetés (id inconnu ou texte introuvable) :", rejetes)
+
+
+
+
 #!/bin/bash
 set -uo pipefail
 
