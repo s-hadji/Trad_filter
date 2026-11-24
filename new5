@@ -1,4 +1,32 @@
 
+
+#!/bin/bash
+set -uo pipefail
+
+LOG_DIR="${LOG_DIR:-./logs}"   # relatif au dossier où tourne start.sh
+mkdir -p "$LOG_DIR"
+export PYTHONUNBUFFERED=1
+
+pids=()
+run() {
+  local name=$1; shift
+  "$@" > >(tee -a "$LOG_DIR/$name.log" | sed -u "s/^/[$name] /") 2>&1 &
+  pids+=($!)
+}
+trap 'kill "${pids[@]}" 2>/dev/null' SIGTERM SIGINT
+
+# MCP Generic
+run generic uv run uvicorn rag_generic_mcp.main:app --host 0.0.0.0 --port 8000
+
+# MCP CSS
+run css uv run uvicorn rag_css_mcp.main:app --host 0.0.0.0 --port 8001
+
+# Si un serveur s'arrête, on arrête l'autre puis le conteneur
+wait -n
+kill "${pids[@]}" 2>/dev/null
+wait
+
+
 from langchain_openai import ChatOpenAI
 
 common = dict(
