@@ -1,5 +1,10 @@
 
 
+def keep_valid_documents(docs: list[Document], report: dict) -> list[Document]:
+    valid = set(report["valid"])
+    return [d for d in docs if d.metadata.get("id_passage") in valid]
+
+
 from langchain_core.documents import Document
 
 def passages_of(obj) -> list:
