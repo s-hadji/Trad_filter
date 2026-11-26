@@ -1,6 +1,12 @@
 
 
 
+
+def final_answer(out: dict) -> str:
+    return next((m.text for m in reversed(out["messages"])
+                 if isinstance(m, AIMessage) and not m.tool_calls), "")
+
+
 from langchain_core.messages import ToolMessage
 from rag_generic_mcp.schemas import (
     SearchResults, PassageContext, DocumentReading, DocumentListing, TitleMatches,
