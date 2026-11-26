@@ -1,5 +1,33 @@
 
 
+from pydantic import TypeAdapter
+from langchain_core.messages import AIMessage, ToolMessage
+
+SCHEMAS: dict[str, TypeAdapter] = {name: TypeAdapter(t) for name, t in {
+    "search": SearchResults,
+    "read_passage_context": PassageContext,
+    "read_document": DocumentReading,
+    "list_documents": DocumentListing,
+    "search_titles": TitleMatches,
+    "search_content": SearchResults,
+    "search_content_text": list[Passage],
+    "get_chunks_by_dm_code": list[Passage],
+    "navigate_procedure_section": list[Passage],
+}.items()}
+
+def extract_tool_results(messages) -> list[tuple[str, object]]:
+    names = {c["id"]: c["name"] for m in messages if isinstance(m, AIMessage) for c in m.tool_calls}
+    return [
+        (names[m.tool_call_id], SCHEMAS[names[m.tool_call_id]].validate_json(m.text))
+        for m in messages
+        if isinstance(m, ToolMessage) and names.get(m.tool_call_id) in SCHEMAS and m.status == "success"
+    ]
+
+def extract_passage_ids(tool_results) -> set[str]:
+    return {p.id_passage for _, obj in tool_results
+            for p in (obj if isinstance(obj, list) else getattr(obj, "results", []))}
+
+
 
 import re
 
