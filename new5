@@ -1,6 +1,29 @@
 
 
 
+import re
+
+SOURCE_RE = re.compile(r"""<source\b[^>]*?\bid\s*=\s*["']([^"']+)["']""", re.I)
+
+def extract_cited_ids(text: str) -> list[str]:
+    """Ids cités par le modèle, dans l'ordre d'apparition."""
+    return [i.strip() for i in SOURCE_RE.findall(text)]
+
+def extract_passage_ids(tool_results) -> set[str]:
+    """Tous les id_passage renvoyés par les outils."""
+    return {p.id_passage for _, obj in tool_results for p in getattr(obj, "results", [])}
+
+def check_citations(answer: str, tool_results) -> dict:
+    cited = list(dict.fromkeys(extract_cited_ids(answer)))  # sans doublons, ordre gardé
+    known = extract_passage_ids(tool_results)
+    return {
+        "valid": [i for i in cited if i in known],
+        "invented": [i for i in cited if i not in known],  # hallucinations
+        "unused": known - set(cited),                      # récupérés mais pas cités
+    }
+
+
+
 
 def final_answer(out: dict) -> str:
     return next((m.text for m in reversed(out["messages"])
