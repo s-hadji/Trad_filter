@@ -1,5 +1,24 @@
 
 
+from langchain_core.documents import Document
+
+def passages_of(obj) -> list:
+    """Les passages d'une réponse, que ce soit une liste nue ou un objet avec .results."""
+    return obj if isinstance(obj, list) else getattr(obj, "results", [])
+
+def to_document(p, tool: str) -> Document:
+    meta = p.model_dump()
+    content = meta.pop("page_content", None) or meta.pop("excerpt", "")
+    return Document(page_content=content, metadata={**meta, "tool": tool})
+
+def to_documents(tool_results) -> list[Document]:
+    return [to_document(p, name) for name, obj in tool_results for p in passages_of(obj)]
+
+def extract_passage_ids(tool_results) -> set[str]:
+    return {p.id_passage for _, obj in tool_results for p in passages_of(obj)}
+
+
+
 from pydantic import TypeAdapter
 from langchain_core.messages import AIMessage, ToolMessage
 
