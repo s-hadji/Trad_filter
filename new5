@@ -1,4 +1,14 @@
 
+def extract_tool_results(messages) -> list[tuple[str, object]]:
+    names = {c["id"]: c["name"] for m in messages if isinstance(m, AIMessage) for c in m.tool_calls}
+    return [
+        (names[m.tool_call_id], SCHEMAS[names[m.tool_call_id]].validate_json(m.text))
+        for m in messages
+        if isinstance(m, ToolMessage) and names.get(m.tool_call_id) in SCHEMAS
+        and m.status == "success" and m.text.strip()
+    ]
+
+
 
 def keep_valid_documents(docs: list[Document], report: dict) -> list[Document]:
     valid = set(report["valid"])
