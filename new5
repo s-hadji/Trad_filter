@@ -1,5 +1,28 @@
 
 
+
+from langchain_core.messages import ToolMessage
+from rag_generic_mcp.schemas import (
+    SearchResults, PassageContext, DocumentReading, DocumentListing, TitleMatches,
+)
+
+SCHEMAS = {
+    "search": SearchResults,
+    "read_passage_context": PassageContext,
+    "read_document": DocumentReading,
+    "list_documents": DocumentListing,
+    "search_titles": TitleMatches,
+}
+
+def extract_tool_results(messages):
+    return [
+        (m.name, SCHEMAS[m.name].model_validate_json(m.text))
+        for m in messages
+        if isinstance(m, ToolMessage) and m.name in SCHEMAS and m.status == "success"
+    ]
+
+
+
 """Agent Gemma 4 (vLLM via ChatOpenAI) avec sortie structurée en 3 champs :
   - sources      : passages copiés mot pour mot, chacun associé à son id_document
   - id_documents : liste sans doublon des documents qui ont servi (et seulement eux)
