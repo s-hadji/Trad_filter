@@ -1,4 +1,15 @@
 
+
+SOURCE_TAG_RE = re.compile(
+    r"""<source\b[^>]*?\bid\s*=\s*["']([^"']+)["'][^>]*>(?:(?!<source\b).)*?</source\s*>""",
+    re.S | re.I,
+)
+
+def number_citations(answer: str, valid: list[str]) -> str:
+    num = {id_: i for i, id_ in enumerate(valid, 1)}
+    return SOURCE_TAG_RE.sub(lambda m: f"[{num[k]}]" if (k := m[1].strip()) in num else "", answer)
+
+
 graph_a = build_graph_a().compile()      # StateGraph(GraphState), sans checkpointer
 graph_b = build_graph_b().compile()      # StateGraph(GraphState), sans checkpointer
 
