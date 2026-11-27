@@ -1,5 +1,9 @@
 
 
+def strip_think(text: str) -> str:
+    return text.rpartition("</think>")[2].strip()
+
+
 SOURCE_TAG_RE = re.compile(
     r"""<source\b[^>]*?\bid\s*=\s*["']([^"']+)["'][^>]*>(?:(?!<source\b).)*?</source\s*>""",
     re.S | re.I,
